@@ -139,75 +139,75 @@ func evaluateCompiled(code []ByteCode, features [][]float32, t int) bool {
 			aVal := fa[t]
 			result := false
 
-		switch kind {
-		case LeafGT:
-			result = aVal > instr.X
-		case LeafLT:
-			result = aVal < instr.X
-		case LeafBetween:
-			// Check if value is between X (low) and Y (high)
-			low := instr.X
-			high := instr.Y
-			if low > high {
-				low, high = high, low
+			switch kind {
+			case LeafGT:
+				result = aVal > instr.X
+			case LeafLT:
+				result = aVal < instr.X
+			case LeafBetween:
+				// Check if value is between X (low) and Y (high)
+				low := instr.X
+				high := instr.Y
+				if low > high {
+					low, high = high, low
+				}
+				result = aVal >= low && aVal <= high
+			case LeafAbsGT:
+				absVal := aVal
+				if absVal < 0 {
+					absVal = -absVal
+				}
+				result = absVal > instr.X
+			case LeafAbsLT:
+				absVal := aVal
+				if absVal < 0 {
+					absVal = -absVal
+				}
+				result = absVal < instr.X
+			case LeafSlopeGT:
+				lb := int(instr.Lookback)
+				if lb > 0 && t >= lb {
+					slope := (aVal - fa[t-lb]) / float32(lb)
+					result = slope > instr.X
+				}
+			case LeafSlopeLT:
+				lb := int(instr.Lookback)
+				if lb > 0 && t >= lb {
+					slope := (aVal - fa[t-lb]) / float32(lb)
+					result = slope < instr.X
+				}
+			case LeafCrossUp:
+				bVal := fb[t]
+				prevA := float32(0)
+				prevB := float32(0)
+				if t >= 1 {
+					prevA = fa[t-1]
+					prevB = fb[t-1]
+				}
+				result = prevA <= prevB && aVal > bVal
+			case LeafCrossDown:
+				bVal := fb[t]
+				prevA := float32(0)
+				prevB := float32(0)
+				if t >= 1 {
+					prevA = fa[t-1]
+					prevB = fb[t-1]
+				}
+				result = prevA >= prevB && aVal < bVal
+			case LeafRising:
+				lb := int(instr.Lookback)
+				if lb > 0 && t >= lb {
+					result = aVal > fa[t-lb]
+				}
+			case LeafFalling:
+				lb := int(instr.Lookback)
+				if lb > 0 && t >= lb {
+					result = aVal < fa[t-lb]
+				}
+			default:
+				// Unknown leaf kind - treat as false
+				result = false
 			}
-			result = aVal >= low && aVal <= high
-		case LeafAbsGT:
-			absVal := aVal
-			if absVal < 0 {
-				absVal = -absVal
-			}
-			result = absVal > instr.X
-		case LeafAbsLT:
-			absVal := aVal
-			if absVal < 0 {
-				absVal = -absVal
-			}
-			result = absVal < instr.X
-		case LeafSlopeGT:
-			lb := int(instr.Lookback)
-			if lb > 0 && t >= lb {
-				slope := (aVal - fa[t-lb]) / float32(lb)
-				result = slope > instr.X
-			}
-		case LeafSlopeLT:
-			lb := int(instr.Lookback)
-			if lb > 0 && t >= lb {
-				slope := (aVal - fa[t-lb]) / float32(lb)
-				result = slope < instr.X
-			}
-		case LeafCrossUp:
-			bVal := fb[t]
-			prevA := float32(0)
-			prevB := float32(0)
-			if t >= 1 {
-				prevA = fa[t-1]
-				prevB = fb[t-1]
-			}
-			result = prevA <= prevB && aVal > bVal
-		case LeafCrossDown:
-			bVal := fb[t]
-			prevA := float32(0)
-			prevB := float32(0)
-			if t >= 1 {
-				prevA = fa[t-1]
-				prevB = fb[t-1]
-			}
-			result = prevA >= prevB && aVal < bVal
-		case LeafRising:
-			lb := int(instr.Lookback)
-			if lb > 0 && t >= lb {
-				result = aVal > fa[t-lb]
-			}
-		case LeafFalling:
-			lb := int(instr.Lookback)
-			if lb > 0 && t >= lb {
-				result = aVal < fa[t-lb]
-			}
-		default:
-			// Unknown leaf kind - treat as false
-			result = false
-		}
 
 			if sp >= len(stack) {
 				stack = append(stack, result)

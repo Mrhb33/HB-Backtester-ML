@@ -26,8 +26,6 @@ const (
 	LeafBetween
 	LeafAbsGT
 	LeafAbsLT
-	LeafZScoreGT
-	LeafZScoreLT
 	LeafSlopeGT
 	LeafSlopeLT
 )
@@ -67,20 +65,23 @@ type TrailModel struct {
 }
 
 type Strategy struct {
-	Seed           uint64
-	FeeBps         float32
-	SlippageBps    float32
-	RiskPct        float32
-	Direction      int
-	EntryRule      RuleTree
-	EntryCompiled  CompiledRule
-	ExitRule       RuleTree
-	ExitCompiled   CompiledRule
-	StopLoss       StopModel
-	TakeProfit     TPModel
-	Trail          TrailModel
-	RegimeFilter   RuleTree
-	RegimeCompiled CompiledRule
+	Seed            uint64
+	FeeBps          float32
+	SlippageBps     float32
+	RiskPct         float32
+	Direction       int
+	EntryRule       RuleTree
+	EntryCompiled   CompiledRule
+	ExitRule        RuleTree
+	ExitCompiled    CompiledRule
+	StopLoss        StopModel
+	TakeProfit      TPModel
+	Trail           TrailModel
+	RegimeFilter    RuleTree
+	RegimeCompiled  CompiledRule
+	MaxHoldBars     int // time-based exit: max bars to hold a position
+	MaxConsecLosses int // busted trades protection: stop after N consecutive losses
+	CooldownBars    int // optional: pause after busted streak (0 = no cooldown, stop completely)
 }
 
 // Fingerprint creates a unique string representation of the strategy (excluding seed)
@@ -91,7 +92,8 @@ func (s Strategy) Fingerprint() string {
 		ruleTreeToString(s.RegimeFilter.Root) + "|" +
 		stopModelToString(s.StopLoss) + "|" +
 		tpModelToString(s.TakeProfit) + "|" +
-		trailModelToString(s.Trail)
+		trailModelToString(s.Trail) + "|" +
+		fmt.Sprintf("hold=%d|loss=%d|cd=%d", s.MaxHoldBars, s.MaxConsecLosses, s.CooldownBars)
 }
 
 // SkeletonFingerprint creates a structure-only fingerprint (ignores numeric thresholds)
@@ -102,7 +104,8 @@ func (s Strategy) SkeletonFingerprint() string {
 		ruleTreeToSkeleton(s.RegimeFilter.Root) + "|" +
 		stopModelToSkeleton(s.StopLoss) + "|" +
 		tpModelToSkeleton(s.TakeProfit) + "|" +
-		trailModelToSkeleton(s.Trail)
+		trailModelToSkeleton(s.Trail) + "|" +
+		fmt.Sprintf("hold|loss|cd")
 }
 
 type RuleTree struct {
@@ -132,20 +135,23 @@ func randomStrategy(rng *rand.Rand, feats Features) Strategy {
 	}
 
 	s := Strategy{
-		Seed:           uint64(rng.Int63()),
-		FeeBps:         40, // 0.4% fee per trade
-		SlippageBps:    40, // 0.4% slippage per trade (total 0.8% per trade)
-		RiskPct:        0.01,
-		Direction:      direction,
-		EntryRule:      RuleTree{Root: entryRoot},
-		EntryCompiled:  compileRuleTree(entryRoot),
-		ExitRule:       RuleTree{Root: exitRoot},
-		ExitCompiled:   compileRuleTree(exitRoot),
-		StopLoss:       randomStopModel(rng),
-		TakeProfit:     randomTPModel(rng),
-		Trail:          randomTrailModel(rng),
-		RegimeFilter:   RuleTree{Root: regimeRoot},
-		RegimeCompiled: compileRuleTree(regimeRoot),
+		Seed:            uint64(rng.Int63()),
+		FeeBps:          40, // 0.4% fee per trade
+		SlippageBps:     40, // 0.4% slippage per trade (total 0.8% per trade)
+		RiskPct:         0.01,
+		Direction:       direction,
+		EntryRule:       RuleTree{Root: entryRoot},
+		EntryCompiled:   compileRuleTree(entryRoot),
+		ExitRule:        RuleTree{Root: exitRoot},
+		ExitCompiled:    compileRuleTree(exitRoot),
+		StopLoss:        randomStopModel(rng),
+		TakeProfit:      randomTPModel(rng),
+		Trail:           randomTrailModel(rng),
+		RegimeFilter:    RuleTree{Root: regimeRoot},
+		RegimeCompiled:  compileRuleTree(regimeRoot),
+		MaxHoldBars:     30 + rng.Intn(300), // 30..329 bars (searchable/evolved)
+		MaxConsecLosses: 20,                 // stop after 20 consecutive losses
+		CooldownBars:    200,                // pause for 200 bars after busted (realistic)
 	}
 	return s
 }
@@ -264,21 +270,10 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 				threshold = 0
 			}
 		}
-	case LeafZScoreGT, LeafZScoreLT:
-		// Z-score comparison (threshold is in standard deviations)
-		b = a
-		threshold = float32(rng.NormFloat64() * 1.5) // -1.5 to 1.5 std devs by default
-		// Clamp to reasonable range
-		if threshold < -3.0 {
-			threshold = -3.0
-		}
-		if threshold > 3.0 {
-			threshold = 3.0
-		}
 	case LeafSlopeGT, LeafSlopeLT:
 		// Slope comparison over lookback period
 		b = a
-		lookback = rng.Intn(16) + 5 // 5-20 bars
+		lookback = rng.Intn(16) + 5                  // 5-20 bars
 		threshold = float32(rng.NormFloat64() * 0.1) // Small slope values
 	default:
 		// For GT/LT, use feature-specific statistics for realistic threshold
@@ -397,17 +392,16 @@ func randomTPModel(rng *rand.Rand) TPModel {
 }
 
 func randomTrailModel(rng *rand.Rand) TrailModel {
-	// Prefer ATR-based trails or no trail (70% none, 30% loose ATR)
-	// Removed swing trails since they're not implemented in backtest logic
+	// Prefer ATR-based trails or no trail (60% none, 30% loose ATR, 10% swing)
 	// Avoid tight trails that stop winners too early
 	kind := rng.Intn(10)
-	if kind < 7 { // 70% no trail
+	if kind < 6 { // 60% no trail
 		return TrailModel{
 			Kind:    "none",
 			ATRMult: 0,
 			Active:  false,
 		}
-	} else { // 30% loose ATR trail
+	} else if kind < 9 { // 30% loose ATR trail
 		atr := rng.NormFloat64()*1.0 + 2.5 // Looser: mean 2.5 (was 1.5)
 		if atr < 1.5 {
 			atr = 1.5
@@ -418,6 +412,12 @@ func randomTrailModel(rng *rand.Rand) TrailModel {
 		return TrailModel{
 			Kind:    "atr",
 			ATRMult: float32(atr),
+			Active:  true,
+		}
+	} else { // 10% swing trail
+		return TrailModel{
+			Kind:    "swing",
+			ATRMult: 0,
 			Active:  true,
 		}
 	}
@@ -466,7 +466,7 @@ func leafToSkeleton(leaf *Leaf) string {
 
 	// Include feature IDs but ignore numeric thresholds
 	switch leaf.Kind {
-	case LeafGT, LeafLT, LeafAbsGT, LeafAbsLT, LeafZScoreGT, LeafZScoreLT:
+	case LeafGT, LeafLT, LeafAbsGT, LeafAbsLT:
 		return "(" + kindName + " F[" + fmt.Sprint(leaf.A) + " THRESH)"
 	case LeafBetween:
 		return "(" + kindName + " F[" + fmt.Sprint(leaf.A) + " THRESH THRESH)"

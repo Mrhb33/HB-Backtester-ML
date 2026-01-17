@@ -88,9 +88,9 @@ func compareSignals(parent, child Strategy, series Series, feats Features, sampl
 // Returns: (isSafe, penaltyMultiplier)
 // penaltyMultiplier: 1.0 = no penalty, 0.5 = heavy penalty, 0.0 = reject
 func isMutationSafe(sim SignalSimilarityResult) (bool, float32) {
-	const minAgreement = 0.60  // 60% minimum agreement
-	const dangerousAgreement = 0.40  // Below 40% = catastrophic change
-	const maxDiffBars = 50  // Max consecutive bars of disagreement
+	const minAgreement = 0.60       // 60% minimum agreement
+	const dangerousAgreement = 0.40 // Below 40% = catastrophic change
+	const maxDiffBars = 50          // Max consecutive bars of disagreement
 
 	// Check for catastrophic behavior jumps
 	if sim.AgreementPct < dangerousAgreement {

@@ -14,19 +14,19 @@ type CPCVFold struct {
 
 // CPCVResult holds results across all folds
 type CPCVResult struct {
-	Scores       []float32
-	Returns      []float32
-	MaxDDs       []float32
-	WinRates     []float32
-	Trades       []int
-	MeanScore    float32
-	MedianScore  float32 // NEW: median score for stability
-	MedianReturn float32 // NEW: median return
-	WorstScore   float32
-	MinFoldScore float32 // Simple min score without DSR penalty
-	PassingCount int
+	Scores          []float32
+	Returns         []float32
+	MaxDDs          []float32
+	WinRates        []float32
+	Trades          []int
+	MeanScore       float32
+	MedianScore     float32 // NEW: median score for stability
+	MedianReturn    float32 // NEW: median return
+	WorstScore      float32
+	MinFoldScore    float32 // Simple min score without DSR penalty
+	PassingCount    int
 	ProfitableFolds int // NEW: count of profitable folds
-	Stability    float32
+	Stability       float32
 }
 
 // generateCPCVFolds creates purged walk-forward folds

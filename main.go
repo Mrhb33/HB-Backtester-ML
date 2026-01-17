@@ -981,12 +981,12 @@ func main() {
 						continue
 					}
 
-				// Fixed validation threshold: rely on profit sanity gates instead of dynamic score
-				// Use score only for ranking, not for pass/fail, until scale stabilizes
-				minValScore := float32(0.0) // Fixed threshold - accept all that pass profit gates
-				// Thresholds are set based on scoring mode at top of main()
+					// Fixed validation threshold: rely on profit sanity gates instead of dynamic score
+					// Use score only for ranking, not for pass/fail, until scale stabilizes
+					minValScore := float32(0.0) // Fixed threshold - accept all that pass profit gates
+					// Thresholds are set based on scoring mode at top of main()
 
-				// Track stagnation per checkpoint, not per candidate
+					// Track stagnation per checkpoint, not per candidate
 					improved := false
 					passedThisBatch := int64(0) // Track how many passed validation this batch
 
@@ -1854,8 +1854,6 @@ func leafToString(leaf *Leaf) string {
 	case LeafBetween:
 		return fmt.Sprintf("(%s F[%d] %.2f %.2f)", kindName, leaf.A, leaf.X, leaf.Y)
 	case LeafAbsGT, LeafAbsLT:
-		return fmt.Sprintf("(%s F[%d] %.2f)", kindName, leaf.A, leaf.X)
-	case LeafZScoreGT, LeafZScoreLT:
 		return fmt.Sprintf("(%s F[%d] %.2f)", kindName, leaf.A, leaf.X)
 	case LeafSlopeGT, LeafSlopeLT:
 		return fmt.Sprintf("(%s F[%d] %.2f %d)", kindName, leaf.A, leaf.X, leaf.Lookback)

@@ -115,8 +115,8 @@ func (p *BufferPool) Put(buf []float32) {
 
 // Global pool instances (can be shared across workers)
 var (
-	tradePool  = NewTradePool(100)  // 100 trade arrays in pool
-	bufferPool = NewBufferPool(50)  // 50 buffers of each size
+	tradePool  = NewTradePool(100) // 100 trade arrays in pool
+	bufferPool = NewBufferPool(50) // 50 buffers of each size
 )
 
 // GetTradeBuffer gets a reusable trade buffer

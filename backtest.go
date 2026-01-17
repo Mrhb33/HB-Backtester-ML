@@ -14,7 +14,8 @@ type Result struct {
 	Expectancy   float32
 	ProfitFactor float32
 	Trades       int
-	ValResult    *Result  // Optional validation result from multi-fidelity
+	SmoothVol    float32 // EMA volatility of equity changes (lower = smoother)
+	ValResult    *Result // Optional validation result from multi-fidelity
 }
 
 type PositionState int
@@ -94,6 +95,16 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 	totalWinPnL := float32(0)
 	totalLossPnL := float32(0)
 
+	// Busted trades protection: track consecutive losses and cooldown
+	consecLosses := 0
+	cooldownUntil := -1
+
+	// Smoothness metric: EMA volatility of equity changes
+	prevMarkEquity := float32(1.0)
+	ema := float32(0.0)
+	emaVar := float32(0.0)
+	alpha := float32(2.0 / (50.0 + 1.0)) // EMA period 50 bars
+
 	// Execution delay: pending entry/exit signals
 	pendingEntry := false
 	pendingExit := false
@@ -154,6 +165,21 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 			rawMaxDD = rawDD
 		}
 
+		// Compute EMA volatility for smoothness metric (using raw equity for consistency with raw scoring)
+		if t > 0 {
+			// Bar return (percent change) - use raw equity to match raw scoring
+			r := (rawMarkEquity - prevMarkEquity) / prevMarkEquity
+
+			// EMA mean
+			diff := r - ema
+			ema += alpha * diff
+
+			// EMA variance (approx)
+			emaVar += alpha * (diff*diff - emaVar)
+
+			prevMarkEquity = rawMarkEquity
+		}
+
 		// Update peak and DD every bar (not just on exit)
 		if markEquity > peakMarkEquity {
 			peakMarkEquity = markEquity
@@ -179,6 +205,11 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 		if position.State == Flat {
 			// Don't allow entries before trade start window
 			if t < tradeStartLocal {
+				continue
+			}
+
+			// Block new entries during cooldown (busted trades protection)
+			if cooldownUntil >= 0 && t < cooldownUntil {
 				continue
 			}
 
@@ -308,19 +339,55 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 				pendingExit = true
 			}
 
-			// Only apply ATR-based trailing (swing is not implemented)
-			if st.Trail.Active && st.Trail.Kind == "atr" {
-				atr := getATR(t)
-				if atr > 0 {
-					if position.Direction == 1 {
-						trailStop := closePrice - atr*st.Trail.ATRMult
-						if trailStop > position.StopPrice {
-							position.StopPrice = trailStop
+			// Time-based exit: if held too long, trigger exit
+			if st.MaxHoldBars > 0 && (t-position.EntryTime) >= st.MaxHoldBars {
+				pendingExit = true
+			}
+
+			// Apply trailing stop (ATR or swing)
+			if st.Trail.Active {
+				switch st.Trail.Kind {
+				case "atr":
+					atr := getATR(t)
+					if atr > 0 {
+						if position.Direction == 1 {
+							trailStop := closePrice - atr*st.Trail.ATRMult
+							if trailStop > position.StopPrice {
+								position.StopPrice = trailStop
+							}
+						} else {
+							trailStop := closePrice + atr*st.Trail.ATRMult
+							if trailStop < position.StopPrice {
+								position.StopPrice = trailStop
+							}
 						}
-					} else {
-						trailStop := closePrice + atr*st.Trail.ATRMult
-						if trailStop < position.StopPrice {
-							position.StopPrice = trailStop
+					}
+				case "swing":
+					// Swing trailing: move stop to recent swing low/high
+					lookback := 10 // you can evolve this later
+					if t > lookback {
+						if position.Direction == 1 {
+							// Long: stop moves up to highest recent swing low
+							best := position.StopPrice
+							for i := t - lookback; i <= t; i++ {
+								if s.Low[i] > best {
+									best = s.Low[i]
+								}
+							}
+							if best > position.StopPrice {
+								position.StopPrice = best
+							}
+						} else {
+							// Short: stop moves down to lowest recent swing high
+							best := position.StopPrice
+							for i := t - lookback; i <= t; i++ {
+								if s.High[i] < best {
+									best = s.High[i]
+								}
+							}
+							if best < position.StopPrice {
+								position.StopPrice = best
+							}
 						}
 					}
 				}
@@ -337,72 +404,72 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 				hitTP = lowPrice <= position.TPPrice
 			}
 
-		if hitSL || hitTP || pendingExitExec {
-			// Determine exit price based on how we're exiting
-			exitPrice := closePrice
-			exitOnOpen := false
+			if hitSL || hitTP || pendingExitExec {
+				// Determine exit price based on how we're exiting
+				exitPrice := closePrice
+				exitOnOpen := false
 
-			if hitSL {
-				exitPrice = position.StopPrice
-				// Apply slippage to SL (2x worse for stop fills - realistic)
-				slip := (st.SlippageBps * 2.0) / 10000 // 2x slippage for stops
-				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) {
-					volZ := f.F[volZIdx][t]
-					// Low volume = higher slippage
-					if volZ < -2.0 {
-						slip *= 4.0 // Very low volume: 4x slippage
-					} else if volZ < -1.0 {
-						slip *= 2.0 // Low volume: 2x slippage
+				if hitSL {
+					exitPrice = position.StopPrice
+					// Apply slippage to SL (2x worse for stop fills - realistic)
+					slip := (st.SlippageBps * 2.0) / 10000 // 2x slippage for stops
+					if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) {
+						volZ := f.F[volZIdx][t]
+						// Low volume = higher slippage
+						if volZ < -2.0 {
+							slip *= 4.0 // Very low volume: 4x slippage
+						} else if volZ < -1.0 {
+							slip *= 2.0 // Low volume: 2x slippage
+						}
 					}
-				}
-				if position.Direction == 1 {
-					exitPrice *= (1 - slip) // Long SL: worse exit price
-				} else {
-					exitPrice *= (1 + slip) // Short SL: worse exit price
-				}
-			} else if hitTP {
-				exitPrice = position.TPPrice
-				// TP also gets slippage (1x normal, not 2x like stops)
-				slip := st.SlippageBps / 10000
-				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) {
-					volZ := f.F[volZIdx][t]
-					if volZ < -2.0 {
-						slip *= 4.0
-					} else if volZ < -1.0 {
-						slip *= 2.0
+					if position.Direction == 1 {
+						exitPrice *= (1 - slip) // Long SL: worse exit price
+					} else {
+						exitPrice *= (1 + slip) // Short SL: worse exit price
 					}
-				}
-				if position.Direction == 1 {
-					exitPrice *= (1 - slip)
-				} else {
-					exitPrice *= (1 + slip)
-				}
-			} else if pendingExitExec {
-				// Rule-based exit: execute at THIS bar's open (signaled on previous bar)
-				// This makes entry and exit symmetric - both execute at next bar's open
-				exitPrice = openPrice
-				exitOnOpen = true
-			}
-
-			// Apply slippage for rule-based exits (executed at open)
-			if exitOnOpen {
-				slip := st.SlippageBps / 10000
-				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) {
-					volZ := f.F[volZIdx][t]
-					// Low volume = higher slippage
-					if volZ < -2.0 {
-						slip *= 4.0 // Very low volume: 4x slippage
-					} else if volZ < -1.0 {
-						slip *= 2.0 // Low volume: 2x slippage
+				} else if hitTP {
+					exitPrice = position.TPPrice
+					// TP also gets slippage (1x normal, not 2x like stops)
+					slip := st.SlippageBps / 10000
+					if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) {
+						volZ := f.F[volZIdx][t]
+						if volZ < -2.0 {
+							slip *= 4.0
+						} else if volZ < -1.0 {
+							slip *= 2.0
+						}
 					}
+					if position.Direction == 1 {
+						exitPrice *= (1 - slip)
+					} else {
+						exitPrice *= (1 + slip)
+					}
+				} else if pendingExitExec {
+					// Rule-based exit: execute at THIS bar's open (signaled on previous bar)
+					// This makes entry and exit symmetric - both execute at next bar's open
+					exitPrice = openPrice
+					exitOnOpen = true
 				}
 
-				if position.Direction == 1 {
-					exitPrice *= (1 - slip)
-				} else {
-					exitPrice *= (1 + slip)
+				// Apply slippage for rule-based exits (executed at open)
+				if exitOnOpen {
+					slip := st.SlippageBps / 10000
+					if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) {
+						volZ := f.F[volZIdx][t]
+						// Low volume = higher slippage
+						if volZ < -2.0 {
+							slip *= 4.0 // Very low volume: 4x slippage
+						} else if volZ < -1.0 {
+							slip *= 2.0 // Low volume: 2x slippage
+						}
+					}
+
+					if position.Direction == 1 {
+						exitPrice *= (1 - slip)
+					} else {
+						exitPrice *= (1 + slip)
+					}
 				}
-			}
 
 				// Fixed: Flip PnL for short trades (profit when price goes down)
 				rawPnL := (exitPrice - position.EntryPrice) / position.EntryPrice
@@ -410,47 +477,58 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 					rawPnL = -rawPnL
 				}
 
-			feeRate := st.FeeBps / 10000
-			feePnL := feeRate * 2
-			pnl := rawPnL - feePnL
+				feeRate := st.FeeBps / 10000
+				feePnL := feeRate * 2
+				pnl := rawPnL - feePnL
 
-			// Apply position sizing (RiskPct) for realized equity
-			equity *= (1 + pnl*st.RiskPct)
+				// Apply position sizing (RiskPct) for realized equity
+				equity *= (1 + pnl*st.RiskPct)
 
-			// Raw equity: no RiskPct scaling (RiskPct=1.0) - for scoring only
-			rawEquity *= (1 + pnl)
+				// Raw equity: no RiskPct scaling (RiskPct=1.0) - for scoring only
+				rawEquity *= (1 + pnl)
 
-			// Update realized equity tracking
-			if equity > peakEquity {
-				peakEquity = equity
-			}
-			if equity < troughEquity {
-				troughEquity = equity
-			}
-			// Update raw equity peak
-			if rawEquity > rawPeakEquity {
-				rawPeakEquity = rawEquity
-			}
+				// Update realized equity tracking
+				if equity > peakEquity {
+					peakEquity = equity
+				}
+				if equity < troughEquity {
+					troughEquity = equity
+				}
+				// Update raw equity peak
+				if rawEquity > rawPeakEquity {
+					rawPeakEquity = rawEquity
+				}
 
-			// Use mark-to-market for DD tracking (captures intratrade dips)
-			dd := (peakMarkEquity - markEquity) / peakMarkEquity
-			if dd > maxDD {
-				maxDD = dd
-			}
-			// Raw drawdown: worst peak-to-trough percentage using consistent mark-to-market trough
-			ddRaw := (peakMarkEquity - markTroughEquity) / peakMarkEquity
-			if ddRaw > maxDDRaw {
-				maxDDRaw = ddRaw
-			}
+				// Use mark-to-market for DD tracking (captures intratrade dips)
+				dd := (peakMarkEquity - markEquity) / peakMarkEquity
+				if dd > maxDD {
+					maxDD = dd
+				}
+				// Raw drawdown: worst peak-to-trough percentage using consistent mark-to-market trough
+				ddRaw := (peakMarkEquity - markTroughEquity) / peakMarkEquity
+				if ddRaw > maxDDRaw {
+					maxDDRaw = ddRaw
+				}
 
 				// Track risk-adjusted PnL for expectancy calculation (scaled by RiskPct)
 				riskAdjPnL := pnl * st.RiskPct
 				if pnl > 0 {
 					wins++
 					totalWinPnL += riskAdjPnL
+					consecLosses = 0 // Reset consecutive losses on win
 				} else {
 					losses++
 					totalLossPnL += -riskAdjPnL
+					consecLosses++
+					// Busted trades protection: trigger cooldown after consecutive losses
+					if st.MaxConsecLosses > 0 && consecLosses >= st.MaxConsecLosses {
+						if st.CooldownBars > 0 {
+							cooldownUntil = t + st.CooldownBars
+						} else {
+							// No cooldown = stop trading completely
+							cooldownUntil = endLocal + 999999
+						}
+					}
 				}
 
 				position.State = Flat
@@ -484,12 +562,15 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 	}
 
 	if rawReturn > 10 || rawReturn < -0.9 || math.IsNaN(float64(rawReturn)) || math.IsInf(float64(rawReturn), 0) {
-		return Result{Strategy: st, Score: -1e30, Return: rawReturn, MaxDD: rawMaxDD, MaxDDRaw: maxDDRaw, WinRate: 0, Trades: 0}
+		return Result{Strategy: st, Score: -1e30, Return: rawReturn, MaxDD: rawMaxDD, MaxDDRaw: maxDDRaw, WinRate: 0, Trades: 0, SmoothVol: 0}
 	}
 
-	// Use DSR-lite (no penalty for train phase - only apply in validation)
+	// Compute smoothness metric BEFORE score (needed for scoring)
+	smoothVol := float32(math.Sqrt(float64(emaVar)))
+
+	// Use DSR-lite with smoothness penalty (no penalty for train phase - only apply in validation)
 	// Score using raw metrics (RiskPct=1.0) to prevent score inflation from tiny returns
-	score := computeScore(rawReturn, rawMaxDD, expectancy, totalTrades, 0)
+	score := computeScoreWithSmoothness(rawReturn, rawMaxDD, expectancy, smoothVol, totalTrades, 0)
 
 	// If no trades, set score to very low number
 	if totalTrades == 0 {
@@ -503,6 +584,7 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 			Expectancy:   0,
 			ProfitFactor: 0,
 			Trades:       0,
+			SmoothVol:    0,
 		}
 	}
 
@@ -511,13 +593,14 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 	return Result{
 		Strategy:     st,
 		Score:        score,
-		Return:       rawReturn,    // Raw return (RiskPct=1.0)
-		MaxDD:        rawMaxDD,    // Raw max DD (RiskPct=1.0)
-		MaxDDRaw:     maxDDRaw,    // Keep raw maxDDRaw as is
+		Return:       rawReturn, // Raw return (RiskPct=1.0)
+		MaxDD:        rawMaxDD,  // Raw max DD (RiskPct=1.0)
+		MaxDDRaw:     maxDDRaw,  // Keep raw maxDDRaw as is
 		WinRate:      winRate,
 		Expectancy:   expectancy,
 		ProfitFactor: profitFactor,
 		Trades:       totalTrades,
+		SmoothVol:    smoothVol,
 	}
 }
 
@@ -560,7 +643,7 @@ func computeScore(ret, dd, expectancy float32, trades int, testedCount int64) fl
 	ddPenalty := 6.0 * dd
 
 	// Return is important (log to reduce outliers)
-	logReturn := float32(math.Log(float64(1 + ret))) * 6.0
+	logReturn := float32(math.Log(float64(1+ret))) * 6.0
 
 	baseScore := logReturn + 2.0*calmar + expReward + tradesReward - ddPenalty + tradePenalty + retPenalty
 
@@ -570,8 +653,18 @@ func computeScore(ret, dd, expectancy float32, trades int, testedCount int64) fl
 	// k = 0.5 means after 10000 strategies, bar increases by ~0.5 points
 	if testedCount > 0 {
 		deflationPenalty := float32(0.5 * math.Log(float64(1.0+testedCount)/10000.0))
-		return baseScore - deflationPenalty
+		baseScore -= deflationPenalty
 	}
 
 	return baseScore
+}
+
+// computeScoreWithSmoothness applies a smoothness penalty to strategies with volatile equity curves
+func computeScoreWithSmoothness(ret, dd, expectancy, smoothVol float32, trades int, testedCount int64) float32 {
+	baseScore := computeScore(ret, dd, expectancy, trades, testedCount)
+
+	// Apply smoothness penalty: higher volatility = lower score
+	// smoothVol is the standard deviation of equity changes (lower = smoother)
+	smoothPenalty := smoothVol * 20.0 // tune weight
+	return baseScore - smoothPenalty
 }

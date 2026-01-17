@@ -9,8 +9,8 @@ type FidelityLevel int
 
 const (
 	FidelityScreen FidelityLevel = iota // Fast screen (3-6 months)
-	FidelityFull                     // Full train window
-	FidelityVal                      // Full validation
+	FidelityFull                        // Full train window
+	FidelityVal                         // Full validation
 )
 
 // evaluateMultiFidelity runs strategy through multi-fidelity pipeline
@@ -31,8 +31,8 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 	// Quick filter: screen must pass basic criteria
 	// Less strict than full criteria (we just want to filter obvious junk)
 	minScreenScore := float32(0.0) // Very permissive at screen stage
-	minScreenTrades := 30 // Reduced from 50 to let more candidates through
-	maxScreenDD := float32(0.70) // Increased from 0.60 for aggressive exploration
+	minScreenTrades := 30          // Reduced from 50 to let more candidates through
+	maxScreenDD := float32(0.70)   // Increased from 0.60 for aggressive exploration
 
 	if screenScore < minScreenScore || screenResult.Trades < minScreenTrades || screenResult.MaxDD >= maxScreenDD {
 		return false, false, screenResult, Result{}

@@ -36,13 +36,13 @@ type SlimElite struct {
 }
 
 type Checkpoint struct {
-	Version          int         `json:"version"`
-	SavedAtUnix      int64       `json:"saved_at_unix"`
-	Seed             int64       `json:"seed"`
+	Version     int   `json:"version"`
+	SavedAtUnix int64 `json:"saved_at_unix"`
+	Seed        int64 `json:"seed"`
 
-	PassedCount      int64       `json:"passed_count"`
-	ValidatedLabels  int64       `json:"validated_labels"`
-	BestValSeen      float32     `json:"best_val_seen"`
+	PassedCount     int64   `json:"passed_count"`
+	ValidatedLabels int64   `json:"validated_labels"`
+	BestValSeen     float32 `json:"best_val_seen"`
 
 	HOFElites        []SlimElite `json:"hof_elites"`
 	ArchiveElites    []SlimElite `json:"archive_elites"` // Archive elites for diversity preservation
@@ -85,7 +85,7 @@ func slimToElite(se SlimElite, rng *rand.Rand) Elite {
 		FeeBps:      se.FeeBps,
 		SlippageBps: se.SlippageBps,
 		RiskPct:     se.RiskPct,
-		Direction:    se.Direction,
+		Direction:   se.Direction,
 		EntryRule: RuleTree{
 			Root: parseRuleTree(se.EntryRule),
 		},
@@ -105,7 +105,7 @@ func slimToElite(se SlimElite, rng *rand.Rand) Elite {
 	s.RegimeCompiled = compileRuleTree(s.RegimeFilter.Root)
 
 	return Elite{
-		Strat:    s,
+		Strat: s,
 		Train: Result{
 			Score:    se.TrainScore,
 			Return:   se.TrainReturn,

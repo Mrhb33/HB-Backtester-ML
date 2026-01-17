@@ -19,7 +19,7 @@ type Series struct {
 	Open, High, Low, Close []float32
 
 	Volume, QuoteVolume, TakerBuyBase, TakerBuyQuote []float32
-	Trades []int32
+	Trades                                           []int32
 }
 
 func LoadBinanceKlinesCSV(path string) (Series, error) {
