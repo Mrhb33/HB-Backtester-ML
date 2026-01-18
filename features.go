@@ -117,10 +117,10 @@ func computeAllFeatures(s Series) Features {
 			buyRatio[i] = s.TakerBuyBase[i] / s.Volume[i]
 			sellBase := s.Volume[i] - s.TakerBuyBase[i]
 			imbalance[i] = (s.TakerBuyBase[i] - sellBase) / s.Volume[i]
+			active[i] = 1 // Active based on Volume, not Trades (more reliable)
 		}
 		if s.Trades[i] > 0 {
 			volPerTrade[i] = s.Volume[i] / float32(s.Trades[i])
-			active[i] = 1
 		}
 	}
 

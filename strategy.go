@@ -65,7 +65,7 @@ type TrailModel struct {
 }
 
 type Strategy struct {
-	Seed            uint64
+	Seed            int64
 	FeeBps          float32
 	SlippageBps     float32
 	RiskPct         float32
@@ -113,14 +113,20 @@ type RuleTree struct {
 }
 
 func randomStrategy(rng *rand.Rand, feats Features) Strategy {
+	return randomStrategyWithCosts(rng, feats, 30, 8) // Default production costs
+}
+
+// randomStrategyWithCosts creates a strategy with specified fee and slippage costs
+// This allows consistent costs across train/val/test for realistic evaluation
+func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps float32) Strategy {
 	entryRoot := randomRuleNode(rng, feats, 0, 4)
 	exitRoot := randomRuleNode(rng, feats, 0, 3)
 
-	// Regime filter: make it more likely to be non-empty to reduce noise entries
-	// 85% chance of having a regime filter (increased from 70% for rarer, higher-quality entries)
+	// Regime filter: 65% chance of having a regime filter (reduced from 85%)
+	// Fewer regime filters = more trades = better chance to pass gates
 	regimeRoot := randomRuleNode(rng, feats, 0, 2)
-	if rng.Float32() < 0.15 {
-		// 15% chance to disable regime filter (nil = always true)
+	if rng.Float32() < 0.35 {
+		// 35% chance to disable regime filter (nil = always true)
 		regimeRoot = nil
 	}
 
@@ -135,9 +141,9 @@ func randomStrategy(rng *rand.Rand, feats Features) Strategy {
 	}
 
 	s := Strategy{
-		Seed:            uint64(rng.Int63()),
-		FeeBps:          40, // 0.4% fee per trade
-		SlippageBps:     40, // 0.4% slippage per trade (total 0.8% per trade)
+		Seed:            rng.Int63(),
+		FeeBps:          feeBps,   // Use specified production costs
+		SlippageBps:     slipBps,  // Use specified production costs
 		RiskPct:         0.01,
 		Direction:       direction,
 		EntryRule:       RuleTree{Root: entryRoot},
@@ -149,7 +155,7 @@ func randomStrategy(rng *rand.Rand, feats Features) Strategy {
 		Trail:           randomTrailModel(rng),
 		RegimeFilter:    RuleTree{Root: regimeRoot},
 		RegimeCompiled:  compileRuleTree(regimeRoot),
-		MaxHoldBars:     30 + rng.Intn(300), // 30..329 bars (searchable/evolved)
+		MaxHoldBars:     150 + rng.Intn(180), // 150..329 bars (searchable/evolved, reduced early exits)
 		MaxConsecLosses: 20,                 // stop after 20 consecutive losses
 		CooldownBars:    200,                // pause for 200 bars after busted (realistic)
 	}

@@ -403,7 +403,7 @@ func replaceRandomSubtree(rng *rand.Rand, root *RuleNode, replacement *RuleNode)
 
 func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	child := parent
-	child.Seed = uint64(rng.Int63())
+	child.Seed = rng.Int63()
 
 	// clone trees so we don't mutate the parent in HOF
 	child.EntryRule.Root = cloneRule(parent.EntryRule.Root)
@@ -469,7 +469,7 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 
 func crossover(rng *rand.Rand, a, b Strategy) Strategy {
 	child := a
-	child.Seed = uint64(rng.Int63())
+	child.Seed = rng.Int63()
 
 	// mix parts
 	if rng.Float32() < 0.5 {
@@ -517,7 +517,7 @@ func crossover(rng *rand.Rand, a, b Strategy) Strategy {
 // Mutates 4-6 parts simultaneously with larger step sizes
 func bigMutation(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	child := parent
-	child.Seed = uint64(rng.Int63())
+	child.Seed = rng.Int63()
 
 	// clone trees so we don't mutate parent in HOF
 	child.EntryRule.Root = cloneRule(parent.EntryRule.Root)

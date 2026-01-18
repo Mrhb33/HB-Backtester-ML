@@ -2,7 +2,22 @@ package main
 
 import (
 	"math"
+	"sync/atomic"
 )
+
+// Global screen relax level (0=strict, 1=normal, 2=relaxed, 3=very_relaxed)
+// Accessed atomically for thread-safe reads from workers
+var globalScreenRelaxLevel int32 = 3 // Default to very relaxed (unblock mode)
+
+// getScreenRelaxLevel returns the current screen relax level (thread-safe)
+func getScreenRelaxLevel() int {
+	return int(atomic.LoadInt32(&globalScreenRelaxLevel))
+}
+
+// setScreenRelaxLevel sets the screen relax level (thread-safe)
+func setScreenRelaxLevel(level int) {
+	atomic.StoreInt32(&globalScreenRelaxLevel, int32(level))
+}
 
 // FidelityLevel represents evaluation depth
 type FidelityLevel int
@@ -16,24 +31,72 @@ const (
 // evaluateMultiFidelity runs strategy through multi-fidelity pipeline
 // Returns: (passedScreen, passedFull, trainResult, valResult)
 func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, trainW, valW Window, testedCount int64) (bool, bool, Result, Result) {
+	// Get relax level from meta (0=strict, 1=normal, 2=relaxed, 3=very_relaxed)
+	// Default to very relaxed (3) to unblock candidate flow
+	relaxLevel := getScreenRelaxLevel()
+
+	// Set gates based on relax level
+	var minScreenScore float32
+	var minScreenTrades int
+	var maxScreenDD float32
+	var minTrainScore float32
+	var minTrainTrades int
+	var maxTrainDD float32
+
+	switch relaxLevel {
+	case 0: // Strict
+		minScreenScore = 0.0
+		minScreenTrades = 30
+		maxScreenDD = 0.70
+		minTrainScore = -0.20
+		minTrainTrades = 80
+		maxTrainDD = 0.50
+	case 1: // Normal
+		minScreenScore = 0.0
+		minScreenTrades = 20
+		maxScreenDD = 0.80
+		minTrainScore = -0.20
+		minTrainTrades = 60
+		maxTrainDD = 0.55
+	case 2: // Relaxed
+		minScreenScore = 0.0
+		minScreenTrades = 15
+		maxScreenDD = 0.85
+		minTrainScore = -0.20
+		minTrainTrades = 40
+		maxTrainDD = 0.60
+	case 3: // Very Relaxed (unblock mode)
+		minScreenScore = 0.0
+		minScreenTrades = 10
+		maxScreenDD = 0.90
+		minTrainScore = -0.20
+		minTrainTrades = 30
+		maxTrainDD = 0.65
+	default: // Default to very relaxed
+		minScreenScore = 0.0
+		minScreenTrades = 10
+		maxScreenDD = 0.90
+		minTrainScore = -0.20
+		minTrainTrades = 30
+		maxTrainDD = 0.65
+	}
+
 	// Stage 1: Fast screen (quick filter)
 	screenResult := evaluateStrategyWindow(full, fullF, st, screenW)
 
-	// Compute DSR-lite score for screen
-	screenScore := computeScore(
+	// Compute DSR-lite score for screen with smoothness
+	screenScore := computeScoreWithSmoothness(
 		screenResult.Return,
 		screenResult.MaxDD,
 		screenResult.Expectancy,
+		screenResult.SmoothVol,
+		screenResult.DownsideVol,
 		screenResult.Trades,
 		0, // No deflation penalty for screen
 	)
 
 	// Quick filter: screen must pass basic criteria
 	// Less strict than full criteria (we just want to filter obvious junk)
-	minScreenScore := float32(0.0) // Very permissive at screen stage
-	minScreenTrades := 30          // Reduced from 50 to let more candidates through
-	maxScreenDD := float32(0.70)   // Increased from 0.60 for aggressive exploration
-
 	if screenScore < minScreenScore || screenResult.Trades < minScreenTrades || screenResult.MaxDD >= maxScreenDD {
 		return false, false, screenResult, Result{}
 	}
@@ -41,20 +104,18 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 	// Stage 2: Full train window evaluation
 	trainResult := evaluateStrategyWindow(full, fullF, st, trainW)
 
-	// Compute DSR-lite score for train (no penalty)
-	trainScore := computeScore(
+	// Compute DSR-lite score for train with smoothness (no penalty)
+	trainScore := computeScoreWithSmoothness(
 		trainResult.Return,
 		trainResult.MaxDD,
 		trainResult.Expectancy,
+		trainResult.SmoothVol,
+		trainResult.DownsideVol,
 		trainResult.Trades,
 		0, // No deflation penalty for train phase
 	)
 
-	// Basic train filter
-	minTrainScore := float32(0.0)
-	minTrainTrades := 80
-	maxTrainDD := float32(0.50)
-
+	// Basic train filter (relaxed to get candidates flowing to validation)
 	if trainScore < minTrainScore || trainResult.Trades < minTrainTrades || trainResult.MaxDD >= maxTrainDD {
 		return true, false, trainResult, Result{}
 	}
@@ -62,11 +123,13 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 	// Stage 3: Validation (only if passed train)
 	valResult := evaluateStrategyWindow(full, fullF, st, valW)
 
-	// Compute DSR-lite score for validation (WITH deflation penalty)
-	valScore := computeScore(
+	// Compute DSR-lite score for validation with smoothness (WITH deflation penalty)
+	valScore := computeScoreWithSmoothness(
 		valResult.Return,
 		valResult.MaxDD,
 		valResult.Expectancy,
+		valResult.SmoothVol,
+		valResult.DownsideVol,
 		valResult.Trades,
 		testedCount, // Apply DSR-lite penalty here!
 	)

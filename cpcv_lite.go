@@ -25,6 +25,7 @@ type CPCVResult struct {
 	WorstScore      float32
 	MinFoldScore    float32 // Simple min score without DSR penalty
 	PassingCount    int
+	WeakFoldCount   int // NEW: count of weak folds (trades 20-29)
 	ProfitableFolds int // NEW: count of profitable folds
 	Stability       float32
 }
@@ -136,11 +137,13 @@ func evaluateCPCV(full Series, fullF Features, st Strategy, trainStart, trainEnd
 			result.MinFoldScore = simpleFoldScore
 		}
 
-		// Compute DSR-lite score for this fold
-		foldScore := computeScore(
+		// Compute DSR-lite score for this fold with smoothness
+		foldScore := computeScoreWithSmoothness(
 			testResult.Return,
 			testResult.MaxDD,
 			testResult.Expectancy,
+			testResult.SmoothVol,
+			testResult.DownsideVol,
 			testResult.Trades,
 			testedCount, // Apply DSR-lite penalty
 		)
@@ -157,8 +160,27 @@ func evaluateCPCV(full Series, fullF Features, st Strategy, trainStart, trainEnd
 		}
 
 		// Check if this fold passes threshold
-		if foldScore >= minScoreThreshold && testResult.MaxDD < 0.45 && testResult.Trades >= 30 {
-			result.PassingCount++
+		// FINAL-MODE STRICT: Use production DD limits matching test mode
+		// Level 3 (unblock): 0.45, Level 0-2: 0.35 (matching test mode)
+		cpcvMaxDDThreshold := float32(0.35) // Strict: matches test mode MaxDD<=0.35
+		if getScreenRelaxLevel() >= 3 {
+			cpcvMaxDDThreshold = 0.45 // Slightly relaxed during unblock mode
+		}
+
+		// Fold passing logic with final-mode trade requirements
+		// Require minTrades >= 50 for passing fold (matching test mode)
+		minTradesPerFold := 50
+		if getScreenRelaxLevel() >= 3 {
+			minTradesPerFold = 30 // Relaxed during unblock mode
+		}
+
+		if foldScore >= minScoreThreshold && testResult.MaxDD < cpcvMaxDDThreshold {
+			if testResult.Trades >= minTradesPerFold {
+				result.PassingCount++ // Fully passing fold (meets final requirements)
+			} else if testResult.Trades >= 30 {
+				result.WeakFoldCount++ // Weak fold (trades 30-49)
+			}
+			// Trades < 30: don't count at all (insufficient signal)
 		}
 	}
 
@@ -201,14 +223,17 @@ func evaluateCPCV(full Series, fullF Features, st Strategy, trainStart, trainEnd
 		}
 		result.MedianReturn = sortedReturns[len(sortedReturns)/2]
 
-		// Stability: % of profitable folds (more realistic than score-based)
-		result.Stability = float32(result.ProfitableFolds) / float32(len(folds))
+		// Stability: % of profitable folds with weak fold penalty
+		// Weak folds (trades 20-29) count as 0.5 instead of 1.0
+		effectiveProfitableFolds := float32(result.ProfitableFolds) - float32(result.WeakFoldCount)*0.5
+		result.Stability = effectiveProfitableFolds / float32(len(folds))
 	}
 
 	return result
 }
 
 // CPCVPassCriteria checks if CPCV results are acceptable
+// Uses final production requirements to match test-mode gates
 func CPCVPassCriteria(cpcv CPCVResult, minMeanScore float32, minStability float32) bool {
 	if len(cpcv.Scores) == 0 {
 		return false
@@ -230,12 +255,27 @@ func CPCVPassCriteria(cpcv CPCVResult, minMeanScore float32, minStability float3
 	}
 
 	// Must have minimum stability (at least 2/3 folds profitable)
+	// minStability is passed from caller (0.66 for normal, 0.30 for unblock mode)
 	if cpcv.Stability < minStability {
 		return false
 	}
 
 	// Worst fold shouldn't be catastrophic
 	if cpcv.WorstScore < minMeanScore*0.7 {
+		return false
+	}
+
+	// FINAL-MODE STRICT: Ensure trades meet minimum threshold
+	// Count folds with minimum trades (at least half of folds should have >= 50 trades)
+	minTradesFolds := 0
+	minTradesRequired := 50
+	for _, trades := range cpcv.Trades {
+		if trades >= minTradesRequired {
+			minTradesFolds++
+		}
+	}
+	// Require at least half of folds to have sufficient trades
+	if minTradesFolds < len(cpcv.Trades)/2 {
 		return false
 	}
 

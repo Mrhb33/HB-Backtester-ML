@@ -10,7 +10,7 @@ import (
 // SlimElite is a minimal serializable version of Elite for checkpoints
 // It stores rule trees as strings instead of compiled bytecode
 type SlimElite struct {
-	Seed         uint64  `json:"seed"`
+	Seed         int64   `json:"seed"`
 	FeeBps       float32 `json:"fee_bps"`
 	SlippageBps  float32 `json:"slippage_bps"`
 	Direction    int     `json:"direction"`

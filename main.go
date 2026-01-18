@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"sort"
@@ -24,7 +26,7 @@ type BatchMsg struct {
 }
 
 type EliteLog struct {
-	Seed         uint64  `json:"seed"`
+	Seed         int64   `json:"seed"`
 	FeeBps       float32 `json:"fee_bps"`
 	SlippageBps  float32 `json:"slippage_bps"`
 	Direction    int     `json:"direction"`
@@ -59,7 +61,7 @@ type ReportLine struct {
 	FeeBps         float32 `json:"fee_bps"`
 	SlippageBps    float32 `json:"slippage_bps"`
 	Direction      int     `json:"direction"`
-	Seed           uint64  `json:"seed"`
+	Seed           int64   `json:"seed"`
 	EntryRuleDesc  string  `json:"entry_rule"`
 	ExitRuleDesc   string  `json:"exit_rule"`
 	StopLossDesc   string  `json:"stop_loss"`
@@ -87,6 +89,9 @@ type MetaState struct {
 	MinValExpect float32 `json:"min_val_expect"`
 	MinValTrades int     `json:"min_val_trades"`
 
+	// Multi-fidelity gate control (0=strict, 1=normal, 2=relaxed, 3=very_relaxed)
+	ScreenRelaxLevel int `json:"screen_relax_level"`
+
 	// Telemetry
 	Batches              int64   `json:"batches"`
 	BestVal              float32 `json:"best_val"`
@@ -110,13 +115,29 @@ func main() {
 	fmt.Println("HB Backtest Strategy Search Engine")
 	fmt.Println("====================================")
 
-	mode := flag.String("mode", "search", "search or test")
+	mode := flag.String("mode", "search", "search|test|golden|trace")
 	scoringMode := flag.String("scoring", "balanced", "scoring mode: balanced or aggressive")
 	seedFlag := flag.Int64("seed", 0, "random seed (0 = time-based, nonzero = reproducible)")
 	resumePath := flag.String("resume", "", "checkpoint file to resume from (ex: checkpoint.json)")
 	checkpointPath := flag.String("checkpoint", "checkpoint.json", "checkpoint output path")
 	checkpointEverySec := flag.Int("checkpoint_every", 300, "auto-save checkpoint every N seconds")
+	// Cost override flags for production-level realism
+	feeBpsFlag := flag.Float64("fee_bps", 30, "transaction fee in basis points (0.01% per bps, default 30 = 0.3%)")
+	slipBpsFlag := flag.Float64("slip_bps", 8, "slippage in basis points (default 8 = 0.08%)")
+	// Golden mode flags
+	goldenSeed := flag.Int64("golden_seed", 0, "seed of winner strategy to run in golden mode")
+	goldenN := flag.Int("golden_print_trades", 10, "how many trades to print in golden mode")
+	// Trace mode flags
+	traceSeed := flag.Int64("trace_seed", 0, "seed of strategy to trace (outputs per-bar states)")
+	traceCSVPath := flag.String("trace_csv", "trace.csv", "output CSV path for trace mode")
+	traceManual := flag.String("trace_manual", "", "manual debug strategy (ema20x50, etc.)")
+	traceOpenCSV := flag.Bool("trace_open", false, "open CSV after trace (Windows)")
+	traceWindow := flag.String("trace_window", "test", "trace window: train | val | test")
 	flag.Parse()
+
+	// Convert flag values to float32
+	feeBps := float32(*feeBpsFlag)
+	slipBps := float32(*slipBpsFlag)
 
 	// Define scoring thresholds based on mode
 	var maxValDD, minValReturn, minValPF, minValExpect float32
@@ -141,19 +162,30 @@ func main() {
 
 	// Initialize MetaState for self-improving search
 	meta := MetaState{
-		RadicalP:     0.10,
-		SurExploreP:  0.10,
-		SurThreshold: 0.0,
-		MaxValDD:     maxValDD,
-		MinValReturn: minValReturn,
-		MinValPF:     minValPF,
-		MinValExpect: minValExpect,
-		MinValTrades: minValTrades,
+		RadicalP:         0.10,
+		SurExploreP:      0.10,
+		SurThreshold:     0.0,
+		MaxValDD:         maxValDD,
+		MinValReturn:     minValReturn,
+		MinValPF:         minValPF,
+		MinValExpect:     minValExpect,
+		MinValTrades:     minValTrades,
+		ScreenRelaxLevel: 3, // Default to very relaxed (unblock mode)
 	}
 
-	if *mode == "test" {
-		runTestMode()
+	// Mode dispatch
+	switch *mode {
+	case "trace":
+		runTraceMode(*traceSeed, *traceCSVPath, *traceManual, *traceOpenCSV, *feeBpsFlag, *slipBpsFlag, *traceWindow)
 		return
+	case "golden":
+		runGoldenMode(*goldenSeed, *goldenN, *feeBpsFlag, *slipBpsFlag)
+		return
+	case "test":
+		runTestMode(feeBps, slipBps)
+		return
+	default: // search mode
+		// Continue to search logic
 	}
 
 	// Define print helper at the top to avoid using builtin print
@@ -279,16 +311,40 @@ func main() {
 	// Load meta.json if exists and apply to runtime knobs (must be after vars declared)
 	if b, err := os.ReadFile("meta.json"); err == nil {
 		if err := json.Unmarshal(b, &meta); err == nil {
-			fmt.Printf("Loaded meta.json: Batches=%d, BestVal=%.4f, RadicalP=%.2f, SurExploreP=%.2f\n",
-				meta.Batches, meta.BestVal, meta.RadicalP, meta.SurExploreP)
-			// Apply loaded meta into runtime knobs
+			fmt.Printf("Loaded meta.json: Batches=%d, BestVal=%.4f, RadicalP=%.2f, SurExploreP=%.2f, ScreenRelaxLevel=%d\n",
+				meta.Batches, meta.BestVal, meta.RadicalP, meta.SurExploreP, meta.ScreenRelaxLevel)
+			// Apply loaded meta into runtime knobs with TRUE CLAMPS (not reset)
+			// Clamp prevents oscillation, doesn't hard-reset to defaults
+			meta.MaxValDD = clampf(meta.MaxValDD, 0.25, 0.60)
+			meta.MinValReturn = clampf(meta.MinValReturn, 0.02, 0.15)
+			meta.MinValPF = clampf(meta.MinValPF, 1.05, 1.50)
+			// Allow MinValExpect to go negative but clamp extreme values
+			meta.MinValExpect = clampf(meta.MinValExpect, -0.001, 0.01)
+			// MinValTrades has reasonable bounds
+			if meta.MinValTrades < 10 {
+				meta.MinValTrades = 10
+			} else if meta.MinValTrades > 100 {
+				meta.MinValTrades = 100
+			}
+			// ScreenRelaxLevel must be 0-3
+			if meta.ScreenRelaxLevel < 0 {
+				meta.ScreenRelaxLevel = 0
+			} else if meta.ScreenRelaxLevel > 3 {
+				meta.ScreenRelaxLevel = 3
+			}
+
 			maxValDD, minValReturn, minValPF, minValExpect = meta.MaxValDD, meta.MinValReturn, meta.MinValPF, meta.MinValExpect
 			minValTrades = meta.MinValTrades
 			surThreshold = float64(meta.SurThreshold)
 			stagnationMu.Lock()
 			radicalP, surExploreP = meta.RadicalP, meta.SurExploreP
 			stagnationMu.Unlock()
+			// Sync global screen relax level
+			setScreenRelaxLevel(meta.ScreenRelaxLevel)
 		}
+	} else {
+		// Initialize global screen relax level to default
+		setScreenRelaxLevel(meta.ScreenRelaxLevel)
 	}
 
 	// Track seen fingerprints to avoid retesting strategies
@@ -429,10 +485,11 @@ func main() {
 
 	// Function to save meta state
 	saveMeta := func() {
-		meta.MaxValDD = maxValDD
-		meta.MinValReturn = minValReturn
-		meta.MinValPF = minValPF
-		meta.MinValExpect = minValExpect
+		// Apply clamps before saving to prevent drift
+		meta.MaxValDD = clampf(maxValDD, 0.25, 0.60)
+		meta.MinValReturn = clampf(minValReturn, 0.02, 0.15)
+		meta.MinValPF = clampf(minValPF, 1.05, 1.50)
+		meta.MinValExpect = clampf(minValExpect, -0.001, 0.01)
 		meta.MinValTrades = minValTrades
 		meta.SurThreshold = float32(surThreshold)
 		stagnationMu.RLock()
@@ -568,7 +625,7 @@ func main() {
 			}
 			if log.ValScore >= loadMinScore && log.ValMaxDD < loadMaxDD && log.ValTrades >= loadMinTrades && log.ValReturn >= loadMinReturn {
 				s := Strategy{
-					Seed:        uint64(rng.Int63()),
+					Seed:        rng.Int63(),
 					FeeBps:      log.FeeBps,
 					SlippageBps: log.SlippageBps,
 					RiskPct:     0.01,
@@ -634,6 +691,9 @@ func main() {
 	batchResults := make(chan BatchMsg, workers*4)
 
 	var tested uint64
+
+	// Track generation types for diversity monitoring
+	var immigrantCount, heavyMutCount, crossCount, normalMutCount int64
 
 	f, err := os.OpenFile("best_every_10000.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -755,66 +815,48 @@ func main() {
 		for {
 			select {
 			case <-ctx.Done():
-				// Final test evaluation on shutdown - only test winners from winners.jsonl
-				loadedLogs, err := loadRecentElites("winners.jsonl", 1000)
-				if err != nil || len(loadedLogs) == 0 {
-					print("\n\nNo winners to test.\n")
+				// Final test evaluation on shutdown - test top 20 strategies from Hall of Fame
+				hof.mu.RLock()
+				numToTest := 20
+				if len(hof.Elites) < numToTest {
+					numToTest = len(hof.Elites)
+				}
+				elitesToTest := make([]Elite, numToTest)
+				copy(elitesToTest, hof.Elites[:numToTest])
+				hof.mu.RUnlock()
+
+				if numToTest == 0 {
+					print("\n\nNo strategies in Hall of Fame to test.\n")
 				} else {
-					print("\n\nRunning final test evaluation on %d winners from winners.jsonl...\n", len(loadedLogs))
+					print("\n\nRunning final test evaluation on top %d strategies from Hall of Fame...\n", numToTest)
 					print(strings.Repeat("=", 80))
 					print("\n")
 
-					w.WriteString("\n// FINAL TEST RESULTS\n")
-					for i, log := range loadedLogs {
-						// Rebuild strategy from saved log
-						strategy := Strategy{
-							Seed:        log.Seed,
-							FeeBps:      log.FeeBps,
-							SlippageBps: log.SlippageBps,
-							RiskPct:     0.01,
-							Direction:   log.Direction,
-							EntryRule: RuleTree{
-								Root: parseRuleTree(log.EntryRule),
-							},
-							ExitRule: RuleTree{
-								Root: parseRuleTree(log.ExitRule),
-							},
-							RegimeFilter: RuleTree{
-								Root: parseRuleTree(log.RegimeFilter),
-							},
-							StopLoss:   parseStopModel(log.StopLoss),
-							TakeProfit: parseTPModel(log.TakeProfit),
-							Trail:      parseTrailModel(log.Trail),
-						}
-
-						// Compile rules
-						strategy.EntryCompiled = compileRuleTree(strategy.EntryRule.Root)
-						strategy.ExitCompiled = compileRuleTree(strategy.ExitRule.Root)
-						strategy.RegimeCompiled = compileRuleTree(strategy.RegimeFilter.Root)
-
-						testR := evaluateStrategyWindow(series, feats, strategy, testW)
+					w.WriteString("\n// FINAL TEST RESULTS (Top %d from HOF)\n" + fmt.Sprint(numToTest))
+					for i, elite := range elitesToTest {
+						testR := evaluateStrategyWindow(series, feats, elite.Strat, testW)
 						print("Test %d/%d: Score=%.4f Return=%.2f%% WinRate=%.1f%% Trades=%d\n",
-							i+1, len(loadedLogs), testR.Score, testR.Return*100, testR.WinRate*100, testR.Trades)
+							i+1, numToTest, testR.Score, testR.Return*100, testR.WinRate*100, testR.Trades)
 
 						testLine := ReportLine{
 							Batch:          batchID + 1000 + int64(i), // Use batch ID > 1000 for test results
 							Tested:         int64(atomic.LoadUint64(&tested)),
-							Score:          log.TrainScore,
-							Return:         log.TrainReturn,
-							MaxDD:          log.TrainMaxDD,
-							WinRate:        log.TrainWinRate,
-							Expectancy:     0, // Not in EliteLog
-							ProfitFactor:   0, // Not in EliteLog
-							Trades:         log.TrainTrades,
-							FeeBps:         log.FeeBps,
-							SlippageBps:    log.SlippageBps,
-							Direction:      log.Direction,
-							Seed:           log.Seed,
-							EntryRuleDesc:  log.EntryRule,
-							ExitRuleDesc:   log.ExitRule,
-							StopLossDesc:   log.StopLoss,
-							TakeProfitDesc: log.TakeProfit,
-							TrailDesc:      log.Trail,
+							Score:          elite.Train.Score,
+							Return:         elite.Train.Return,
+							MaxDD:          elite.Train.MaxDD,
+							WinRate:        elite.Train.WinRate,
+							Expectancy:     elite.Train.Expectancy,
+							ProfitFactor:   elite.Train.ProfitFactor,
+							Trades:         elite.Train.Trades,
+							FeeBps:         elite.Strat.FeeBps,
+							SlippageBps:    elite.Strat.SlippageBps,
+							Direction:      elite.Strat.Direction,
+							Seed:           elite.Strat.Seed,
+							EntryRuleDesc:  ruleTreeToString(elite.Strat.EntryRule.Root),
+							ExitRuleDesc:   ruleTreeToString(elite.Strat.ExitRule.Root),
+							StopLossDesc:   stopModelToString(elite.Strat.StopLoss),
+							TakeProfitDesc: tpModelToString(elite.Strat.TakeProfit),
+							TrailDesc:      trailModelToString(elite.Strat.Trail),
 							// Test metrics
 							ValScore:   testR.Score,
 							ValReturn:  testR.Return,
@@ -923,6 +965,7 @@ func main() {
 					bestValR.Score = -1e30
 					var bestTrainResult Result
 					var bestPassesValidation bool
+					var bestQuickTestR Result // Track best quick test result for reporting
 
 					// Diversity selection: top 10 by score + 10 diverse fingerprints
 					// This reduces overfitting to one "family" of strategies
@@ -1004,10 +1047,11 @@ func main() {
 
 						// Apply DSR-lite deflation: recompute scores with actual tested count
 						// This prevents "celebrating lucky finds" as search grows
+						// CRITICAL: Use computeScoreWithSmoothness to select for smooth equity curves
 						testedNow := int64(atomic.LoadUint64(&tested))
-						valR.Score = computeScore(valR.Return, valR.MaxDD, valR.Expectancy, valR.Trades, testedNow)
+						valR.Score = computeScoreWithSmoothness(valR.Return, valR.MaxDD, valR.Expectancy, valR.SmoothVol, valR.DownsideVol, valR.Trades, testedNow)
 						// Also deflate train scores for fair comparison
-						candidate.Score = computeScore(candidate.Return, candidate.MaxDD, candidate.Expectancy, candidate.Trades, testedNow)
+						candidate.Score = computeScoreWithSmoothness(candidate.Return, candidate.MaxDD, candidate.Expectancy, candidate.SmoothVol, candidate.DownsideVol, candidate.Trades, testedNow)
 
 						// Anti-stagnation: track if any candidate improved this batch
 						if valR.Score > lastBestValScore {
@@ -1073,7 +1117,13 @@ func main() {
 							if cpcv.MinFoldScore < 0.0 {
 								continue // reject unstable "lucky" strategy
 							}
-							if !CPCVPassCriteria(cpcv, minValScore, 0.66) {
+							// Dynamic stability threshold based on screen relax level (unblock mode support)
+							// Level 3 (unblock): 0.30, Level 0-2: 0.66
+							minStability := float32(0.66)
+							if getScreenRelaxLevel() >= 3 {
+								minStability = 0.30 // Relax during unblock mode
+							}
+							if !CPCVPassCriteria(cpcv, minValScore, minStability) {
 								continue // reject unstable "lucky" strategy
 							}
 
@@ -1089,6 +1139,11 @@ func main() {
 								Warmup: testW.Warmup,
 							}
 							quickTestR := evaluateStrategyWindow(series, feats, candidate.Strategy, quickTestW)
+
+							// Track best quick test result for reporting (best score among all candidates)
+							if quickTestR.Score > bestQuickTestR.Score {
+								bestQuickTestR = quickTestR
+							}
 
 							// Apply same profit gates to quick test (use slightly looser meta gates)
 							quickTestProfitOK := quickTestR.Return >= minValReturn*0.8 && // 80% of meta gate
@@ -1283,9 +1338,42 @@ func main() {
 						// Reject overtrading strategies from passing validation
 						bestPassesValidation = bestPassesValidation && !overtrading
 
-						print("Batch %d: Tested %d | Train: %.4f | Val: %.4f | Ret: %.2f%% | WR: %.1f%% | Trds: %d | Rate: %.0f/s %s [fp: %s] [crit: score>%.2f, trds>=%d, DD<%.2f, ret>%.1f%%, exp>%.4f, pf>%.2f, stab>%.0f%%] [val: score=%.4f dd=%.3f trds=%d%s]\n",
-							batchID, atomic.LoadUint64(&tested), bestTrainResult.Score, bestValR.Score, bestValR.Return*100, bestValR.WinRate*100, bestValR.Trades, rate, checkmark, fingerprint, minValScore, minValTrades, maxValDD, minValReturn*100, minValExpect, minValPF, stabilityThreshold*100,
+						// Build human-readable entry/exit story with feature names
+						entryRuleNamed := ruleTreeToStringNamed(bestTrainResult.Strategy.EntryRule.Root, feats.Names)
+						exitRuleNamed := ruleTreeToStringNamed(bestTrainResult.Strategy.ExitRule.Root, feats.Names)
+						regimeRuleNamed := ruleTreeToStringNamed(bestTrainResult.Strategy.RegimeFilter.Root, feats.Names)
+
+						// Print summary line
+						print("Batch %d: Tested %d | Train: %.4f | Val: %.4f | Ret: %.2f%% | WR: %.1f%% | Trds: %d | Rate: %.0f/s %s [fp: %s]\n",
+							batchID, atomic.LoadUint64(&tested), bestTrainResult.Score, bestValR.Score, bestValR.Return*100, bestValR.WinRate*100, bestValR.Trades, rate, checkmark, fingerprint)
+
+						// Print criteria summary
+						print("  [crit: score>%.2f, trds>=%d, DD<%.2f, ret>%.1f%%, exp>%.4f, pf>%.2f, stab>%.0f%%]\n",
+							minValScore, minValTrades, maxValDD, minValReturn*100, minValExpect, minValPF, stabilityThreshold*100)
+
+						// Print validation details with quick test
+						print("  [val: score=%.4f dd=%.3f trds=%d%s]\n",
 							bestValR.Score, bestValR.MaxDD, bestValR.Trades, reasonStr)
+						print("  [QuickTest: Score=%.4f Ret=%.2f%% DD=%.3f Trds=%d]\n",
+							bestQuickTestR.Score, bestQuickTestR.Return*100, bestQuickTestR.MaxDD, bestQuickTestR.Trades)
+
+						// Print entry/exit story with feature names (indented)
+						print("  [ENTRY STORY]\n")
+						if regimeRuleNamed != "" && regimeRuleNamed != "(NOT )" {
+							print("    Regime Filter (must be true): %s\n", formatIndentedRule(regimeRuleNamed, "    "))
+						} else {
+							print("    Regime Filter: (Always Active - No Filter)\n")
+						}
+						print("    Entry Signal (candle t close): %s\n", formatIndentedRule(entryRuleNamed, "    "))
+						print("    Entry Execution (candle t+1 open): pending entry enters at next bar open\n")
+						print("    Exit Signal: %s\n", formatIndentedRule(exitRuleNamed, "    "))
+
+						// Print risk management
+						print("  [RISK MANAGEMENT]\n")
+						print("    StopLoss: %s\n", stopModelToString(bestTrainResult.Strategy.StopLoss))
+						print("    TakeProfit: %s\n", tpModelToString(bestTrainResult.Strategy.TakeProfit))
+						print("    Trail: %s\n", trailModelToString(bestTrainResult.Strategy.Trail))
+						print("\n")
 					}
 
 					// Track in topK based on validation score (only if passes)
@@ -1309,6 +1397,33 @@ func main() {
 					}
 
 					batchBest = Result{Score: -1e30}
+
+					// Auto-adjust screen relax level based on candidate count
+					const minCandidatesPerCheckpoint = 5     // Minimum candidates before tightening
+					const maxCandidatesBeforeTightening = 50 // Maximum candidates before forcing tightening
+					candidateCount := len(globalTopCandidates)
+					currentRelaxLevel := meta.ScreenRelaxLevel
+
+					if candidateCount < minCandidatesPerCheckpoint && currentRelaxLevel < 3 {
+						// Too few candidates - loosen gates
+						meta.mu.Lock()
+						meta.ScreenRelaxLevel = currentRelaxLevel + 1
+						newLevel := meta.ScreenRelaxLevel
+						meta.mu.Unlock()
+						setScreenRelaxLevel(newLevel)
+						print(" [AUTO-ADJUST: Too few candidates (%d), ScreenRelaxLevel=%d->%d]\n",
+							candidateCount, currentRelaxLevel, newLevel)
+					} else if candidateCount > maxCandidatesBeforeTightening && currentRelaxLevel > 0 {
+						// Plenty of candidates - tighten gates gradually
+						meta.mu.Lock()
+						meta.ScreenRelaxLevel = currentRelaxLevel - 1
+						newLevel := meta.ScreenRelaxLevel
+						meta.mu.Unlock()
+						setScreenRelaxLevel(newLevel)
+						print(" [AUTO-ADJUST: Many candidates (%d), ScreenRelaxLevel=%d->%d]\n",
+							candidateCount, currentRelaxLevel, newLevel)
+					}
+
 					globalTopCandidates = globalTopCandidates[:0] // Reset to empty slice (keep capacity)
 					globalFingerprints = make(map[string]bool)    // Reset fingerprints map
 					nextCheckpoint += uint64(batchSize)
@@ -1421,26 +1536,41 @@ func main() {
 			var s Strategy
 
 			// ratios for diversity injection (random immigrants approach)
-			// 30%: random immigrants (completely fresh strategies)
+			// Dynamic immigration based on stagnation:
+			// - Base: 10% when improving
+			// - Increase to 25% when stagnating (keeps exploration when needed)
 			// adaptive: heavy mutations (big jumps to escape local maxima)
 			// 20%: crossover (mix two parents)
 			// remaining: normal mutation (small threshold tweaks)
-			const immigrantP = 0.30
+
+			// Dynamic immigration based on stagnation
+			meta.mu.RLock()
+			stagnationCount := meta.Batches - meta.LastImprovementBatch
+			meta.mu.RUnlock()
+
+			immigrantP := float32(0.10) // Base: 10% when improving
+			if stagnationCount > 3 {
+				immigrantP = 0.25 // Increase to 25% when stagnating
+			}
 
 			// Get adaptive parameters (thread-safe)
 			stagnationMu.RLock()
 			currentRadicalP := radicalP
 			stagnationMu.RUnlock()
 
-			heavyMutP := immigrantP + currentRadicalP // adaptive: 0.40 (base) to 0.60 (stagnation)
-			crossP := heavyMutP + 0.20                // adaptive: 0.60 (base) to 0.80 (stagnation)
-			// normal mutation = 1.0 - crossP (adaptive: 0.40 to 0.20)
+			heavyMutP := immigrantP + 0.50*currentRadicalP // was + currentRadicalP
+			crossP := heavyMutP + 0.20
+			if crossP > 0.95 {
+				crossP = 0.95
+			} // keep at least 5% normal mutation
+			// normal mutation = 1.0 - crossP
 
 			x := rng.Float32()
 
-			// Random immigrants: 30% completely fresh strategies
+			// Random immigrants: dynamic (10-25%) completely fresh strategies
 			if hof.Len() == 0 || x < immigrantP {
-				s = randomStrategy(rng, feats)
+				s = randomStrategyWithCosts(rng, feats, feeBps, slipBps)
+				atomic.AddInt64(&immigrantCount, 1)
 			} else if x < heavyMutP && hof.Len() > 0 {
 				// Heavy mutation: big jump to escape local maxima (adaptive %)
 				// Use archive sampling for diversity (30% chance)
@@ -1453,6 +1583,7 @@ func main() {
 					parent = hofParent.Strat
 				}
 				s = bigMutation(rng, parent, feats)
+				atomic.AddInt64(&heavyMutCount, 1)
 			} else if x < crossP && hof.Len() >= 2 {
 				// Crossover: mix two parents (20% total)
 				var a, b Strategy
@@ -1473,6 +1604,7 @@ func main() {
 				if rng.Float32() < 0.7 {
 					s = mutateStrategy(rng, s, feats)
 				}
+				atomic.AddInt64(&crossCount, 1)
 			} else {
 				// Normal mutation: small tweaks (remaining %)
 				// Use uniform bin sampling for diversity
@@ -1483,11 +1615,12 @@ func main() {
 				} else {
 					parent, ok := SampleUniformFromHOF(hof, archive, rng)
 					if !ok {
-						s = randomStrategy(rng, feats)
+						s = randomStrategyWithCosts(rng, feats, feeBps, slipBps)
 					} else {
 						s = mutateStrategy(rng, parent.Strat, feats)
 					}
 				}
+				atomic.AddInt64(&normalMutCount, 1)
 			}
 
 			// Use surrogate to filter out obviously bad strategies
@@ -1570,6 +1703,32 @@ func main() {
 		}
 	}()
 
+	// Generation type stats ticker (every 30s)
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				imm := atomic.LoadInt64(&immigrantCount)
+				hm := atomic.LoadInt64(&heavyMutCount)
+				cr := atomic.LoadInt64(&crossCount)
+				nm := atomic.LoadInt64(&normalMutCount)
+				total := imm + hm + cr + nm
+				if total > 0 {
+					print("[gen-types] immigrant=%d(%.1f%%) heavyMut=%d(%.1f%%) crossover=%d(%.1f%%) normalMut=%d(%.1f%%) total=%d\n",
+						imm, 100.0*float64(imm)/float64(total),
+						hm, 100.0*float64(hm)/float64(total),
+						cr, 100.0*float64(cr)/float64(total),
+						nm, 100.0*float64(nm)/float64(total),
+						total)
+				}
+			}
+		}
+	}()
+
 	// Save checkpoint periodically
 	go func() {
 		t := time.NewTicker(time.Duration(*checkpointEverySec) * time.Second)
@@ -1616,9 +1775,11 @@ func main() {
 	print("Results saved to: best_every_10000.txt")
 }
 
-func runTestMode() {
+func runTestMode(feeBps, slipBps float32) {
 	fmt.Println("Running in TEST mode - evaluating saved winners on test data")
 	fmt.Println("=============================================================")
+	fmt.Printf("Cost overrides: Fee=%.1f bps (%.2f%%), Slippage=%.1f bps (%.2f%%)\n", feeBps, feeBps/100, slipBps, slipBps/100)
+	fmt.Println()
 
 	// Load data (same as search mode)
 	fmt.Println("Loading data...")
@@ -1682,6 +1843,15 @@ func runTestMode() {
 	var parseErrors int
 	var noTradeStrategies int
 
+	// STRICT TEST FILTERS - These are the gates for passing test mode
+	// Match production reality: Return>0, MaxDD<=0.35, Trades>=50
+	minTrades := 50
+	maxDD := float32(0.35)
+	minReturn := float32(0.0)
+
+	fmt.Printf("STRICT TEST GATES: Trades>=%d, MaxDD<=%.2f, Return>%.1f%%\n", minTrades, maxDD, minReturn*100)
+	fmt.Println()
+
 	fmt.Println("Evaluating strategies on test window...")
 	for i, log := range loadedLogs {
 		// Rebuild strategy from saved log
@@ -1698,8 +1868,8 @@ func runTestMode() {
 
 			strategy = Strategy{
 				Seed:        log.Seed,
-				FeeBps:      log.FeeBps,      // Use original fee from winner log
-				SlippageBps: log.SlippageBps, // Use original slippage from winner log
+				FeeBps:      feeBps,  // OVERRIDE: Use specified production fee for testing
+				SlippageBps: slipBps, // OVERRIDE: Use specified production slippage for testing
 				RiskPct:     0.01,
 				Direction:   log.Direction,
 				EntryRule: RuleTree{
@@ -1769,40 +1939,200 @@ func runTestMode() {
 
 	w.Flush()
 
-	// Sort results by test score, but only include strategies with trades
-	var rankedResults []TestResult
+	// Apply STRICT TEST FILTERS - Only pass strategies that meet production gates
+	var passed []TestResult
 	for _, r := range allResults {
-		if r.TestTrades > 0 {
-			rankedResults = append(rankedResults, r)
+		if r.TestTrades < minTrades {
+			continue
 		}
+		if r.TestMaxDD > maxDD {
+			continue
+		}
+		if r.TestReturn <= minReturn {
+			continue
+		}
+		passed = append(passed, r)
 	}
-	sort.Slice(rankedResults, func(i, j int) bool {
-		return rankedResults[i].TestScore > rankedResults[j].TestScore
+
+	// Rank PASSED strategies by TEST performance (not validation)
+	// Primary: TestScore desc, Secondary: TestMaxDD asc, Tertiary: TestReturn desc
+	sort.Slice(passed, func(i, j int) bool {
+		if passed[i].TestScore != passed[j].TestScore {
+			return passed[i].TestScore > passed[j].TestScore
+		}
+		if passed[i].TestMaxDD != passed[j].TestMaxDD {
+			return passed[i].TestMaxDD < passed[j].TestMaxDD
+		}
+		return passed[i].TestReturn > passed[j].TestReturn
 	})
 
-	// Print top 20 leaderboard
+	// Print top 20 leaderboard (PASSED strategies only)
 	fmt.Println("\n" + strings.Repeat("=", 80))
-	fmt.Println("TOP 20 STRATEGIES BY TEST SCORE")
+	fmt.Println("TOP 20 STRATEGIES BY TEST SCORE (STRICT FILTERS APPLIED)")
 	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("Gates: Trades>=%d, MaxDD<=%.2f, Return>%.1f%%\n", minTrades, maxDD, minReturn*100)
 	fmt.Println()
 
 	numToPrint := 20
-	if len(rankedResults) < numToPrint {
-		numToPrint = len(rankedResults)
+	if len(passed) < numToPrint {
+		numToPrint = len(passed)
 	}
 
-	for i := 0; i < numToPrint; i++ {
-		r := rankedResults[i]
-		fmt.Printf("#%2d | Test Score: %.4f | Test Return: %6.2f%% | Test WinRate: %5.1f%% | Test Trades: %4d | Val Score: %.4f\n",
-			i+1, r.TestScore, r.TestReturn*100, r.TestWinRate*100, r.TestTrades, r.ValScore)
+	if numToPrint == 0 {
+		fmt.Println("NO STRATEGIES PASSED THE STRICT TEST GATES!")
+		fmt.Println()
+		fmt.Println("Try adjusting gates: -mode test -fee_bps=30 -slip_bps=8")
+	} else {
+		for i := 0; i < numToPrint; i++ {
+			r := passed[i]
+			fmt.Printf("#%2d | Test Score: %.4f | Test Return: %6.2f%% | Test WinRate: %5.1f%% | Test Trades: %4d | Test DD: %.2f%% | Val Score: %.4f\n",
+				i+1, r.TestScore, r.TestReturn*100, r.TestWinRate*100, r.TestTrades, r.TestMaxDD*100, r.ValScore)
+		}
 	}
 
-	fmt.Printf("\nTotal strategies loaded: %d\n", len(loadedLogs))
-	fmt.Printf("Tested successfully: %d\n", len(allResults)-parseErrors)
-	fmt.Printf("Skipped parse errors: %d\n", parseErrors)
-	fmt.Printf("No-trade on test: %d\n", noTradeStrategies)
-	fmt.Printf("Strategies with trades: %d\n", len(rankedResults))
+	fmt.Println("\n" + strings.Repeat("-", 80))
+	fmt.Printf("Total strategies loaded:     %d\n", len(loadedLogs))
+	fmt.Printf("Tested successfully:         %d\n", len(allResults)-parseErrors)
+	fmt.Printf("Skipped parse errors:        %d\n", parseErrors)
+	fmt.Printf("No-trade on test:            %d\n", noTradeStrategies)
+	fmt.Printf("Strategies with trades:      %d\n", len(allResults))
+	fmt.Printf("PASSED strict test gates:    %d (%.1f%%)\n", len(passed), float32(len(passed))*100/float32(len(allResults)))
+	fmt.Println(strings.Repeat("-", 80))
 	fmt.Println("Results saved to: winners_tested.jsonl")
+
+	// Create detailed text files for TOP 20 passing strategies only
+	fmt.Println("\nCreating detailed strategy files...")
+	os.MkdirAll("test_results", 0755)
+	numFiles := 20
+	if len(passed) < numFiles {
+		numFiles = len(passed)
+	}
+	for i := 0; i < numFiles; i++ {
+		r := passed[i]
+		createStrategyDetailsFile(i+1, &r.EliteLog, r.TestScore, r.TestReturn, r.TestMaxDD, r.TestWinRate, r.TestTrades, r.ValScore, r.ValReturn, r.TrainScore, r.TrainReturn, feats.Names, series, feeBps, slipBps, r.Direction)
+	}
+	fmt.Printf("Created %d detailed strategy files in test_results/ folder (top %d only)\n", numFiles, numFiles)
+}
+
+// createStrategyDetailsFile creates a detailed text file for a single strategy
+func createStrategyDetailsFile(rank int, log *EliteLog, testScore, testReturn, testMaxDD, testWinRate float32, testTrades int, valScore, valReturn, trainScore, trainReturn float32, featureNames []string, series Series, feeBps, slipBps float32, direction int) {
+	var buf strings.Builder
+
+	// Header
+	buf.WriteString("=" + strings.Repeat("=", 78) + "\n")
+	buf.WriteString(fmt.Sprintf("STRATEGY #%d - TEST RESULTS\n", rank))
+	buf.WriteString("=" + strings.Repeat("=", 78) + "\n\n")
+
+	// Test Results Summary
+	buf.WriteString("TEST PERFORMANCE METRICS\n")
+	buf.WriteString("-" + strings.Repeat("-", 78) + "\n")
+	buf.WriteString(fmt.Sprintf("  Test Score:      %.4f\n", testScore))
+	buf.WriteString(fmt.Sprintf("  Test Return:     %.2f%%\n", testReturn*100))
+	buf.WriteString(fmt.Sprintf("  Test Win Rate:   %.1f%%\n", testWinRate*100))
+	buf.WriteString(fmt.Sprintf("  Test Trades:     %d\n", testTrades))
+	buf.WriteString(fmt.Sprintf("  Test Max DD:     %.2f%%\n", testMaxDD*100))
+	buf.WriteString(fmt.Sprintf("  Validation Score: %.4f\n", valScore))
+	buf.WriteString(fmt.Sprintf("  Validation Ret:   %.2f%%\n", valReturn*100))
+	buf.WriteString(fmt.Sprintf("  Train Score:      %.4f\n", trainScore))
+	buf.WriteString(fmt.Sprintf("  Train Return:     %.2f%%\n", trainReturn*100))
+	buf.WriteString("\n")
+
+	// Strategy Parameters
+	buf.WriteString("STRATEGY PARAMETERS\n")
+	buf.WriteString("-" + strings.Repeat("-", 78) + "\n")
+	buf.WriteString(fmt.Sprintf("  Direction:       %s\n", directionToString(direction)))
+	buf.WriteString(fmt.Sprintf("  Fee BPS:         %.1f (%.3f%%)\n", feeBps, feeBps/100))
+	buf.WriteString(fmt.Sprintf("  Slippage BPS:    %.1f (%.3f%%)\n", slipBps, slipBps/100))
+	buf.WriteString(fmt.Sprintf("  Risk Per Trade:  %.1f%%\n", 1.0))
+	buf.WriteString(fmt.Sprintf("  Seed:            %d\n", log.Seed))
+	buf.WriteString("\n")
+
+	// Risk Management
+	buf.WriteString("RISK MANAGEMENT\n")
+	buf.WriteString("-" + strings.Repeat("-", 78) + "\n")
+	buf.WriteString(fmt.Sprintf("  Stop Loss:       %s\n", log.StopLoss))
+	buf.WriteString(fmt.Sprintf("  Take Profit:     %s\n", log.TakeProfit))
+	buf.WriteString(fmt.Sprintf("  Trailing Stop:   %s\n", formatTrail(log.Trail)))
+	buf.WriteString("\n")
+
+	// Entry Rule
+	buf.WriteString("ENTRY CONDITIONS\n")
+	buf.WriteString("-" + strings.Repeat("-", 78) + "\n")
+	buf.WriteString("Entry Rule:\n")
+	entryRule := formatRuleWithNames(log.EntryRule, featureNames)
+	buf.WriteString(formatIndentedRule(entryRule, "  "))
+	buf.WriteString("\n")
+
+	// Exit Rule
+	buf.WriteString("EXIT CONDITIONS\n")
+	buf.WriteString("-" + strings.Repeat("-", 78) + "\n")
+	buf.WriteString("Exit Rule:\n")
+	exitRule := formatRuleWithNames(log.ExitRule, featureNames)
+	buf.WriteString(formatIndentedRule(exitRule, "  "))
+	buf.WriteString("\n")
+
+	// Regime Filter
+	buf.WriteString("REGIME FILTER\n")
+	buf.WriteString("-" + strings.Repeat("-", 78) + "\n")
+	buf.WriteString("Regime Filter:\n")
+	regimeRule := formatRuleWithNames(log.RegimeFilter, featureNames)
+	buf.WriteString(formatIndentedRule(regimeRule, "  "))
+	buf.WriteString("\n")
+
+	// Footer
+	buf.WriteString("=" + strings.Repeat("=", 78) + "\n")
+	buf.WriteString("Generated by HB Backtest Strategy Search Engine\n")
+	buf.WriteString(fmt.Sprintf("Data: %d candles from %s to %s\n", series.T,
+		formatTimestamp(series.OpenTimeMs[0]), formatTimestamp(series.OpenTimeMs[series.T-1])))
+	buf.WriteString("=" + strings.Repeat("=", 78) + "\n")
+
+	// Write to file
+	filename := fmt.Sprintf("test_results/strategy_%03d_rank_%.0f.txt", rank, testScore)
+	err := os.WriteFile(filename, []byte(buf.String()), 0644)
+	if err != nil {
+		fmt.Printf("Warning: Could not write file %s: %v\n", filename, err)
+	}
+}
+
+// Helper functions for formatting
+func directionToString(d int) string {
+	if d == 1 {
+		return "LONG ONLY"
+	}
+	return "SHORT ONLY"
+}
+
+func formatTrail(trail string) string {
+	if trail == "" || trail == "none" {
+		return "Disabled"
+	}
+	return trail
+}
+
+func formatRuleWithNames(rule string, featureNames []string) string {
+	// Replace feature indices with names
+	result := rule
+	for i, name := range featureNames {
+		// Replace F[i] with the actual feature name
+		result = strings.ReplaceAll(result, fmt.Sprintf("F[%d]", i), name)
+	}
+	return result
+}
+
+func formatIndentedRule(rule string, indent string) string {
+	if rule == "" || rule == "nil" {
+		return indent + "(Always Active - No Filter)"
+	}
+	lines := strings.Split(rule, "\n")
+	for i, line := range lines {
+		lines[i] = indent + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatTimestamp(ms int64) string {
+	t := time.Unix(ms/1000, 0)
+	return t.Format("2006-01-02 15:04:05")
 }
 
 func ruleTreeToString(node *RuleNode) string {
@@ -1863,6 +2193,79 @@ func leafToString(leaf *Leaf) string {
 		return fmt.Sprintf("(%s F[%d] %d)", kindName, leaf.A, leaf.Lookback)
 	default:
 		return fmt.Sprintf("(%s F[%d])", kindName, leaf.A)
+	}
+}
+
+// leafToStringNamed returns a string representation of a leaf with feature names
+func leafToStringNamed(leaf *Leaf, names []string) string {
+	kindNames := map[LeafKind]string{
+		LeafGT:        "GT",
+		LeafLT:        "LT",
+		LeafCrossUp:   "CrossUp",
+		LeafCrossDown: "CrossDown",
+		LeafRising:    "Rising",
+		LeafFalling:   "Falling",
+		LeafBetween:   "Between",
+		LeafAbsGT:     "AbsGT",
+		LeafAbsLT:     "AbsLT",
+		LeafSlopeGT:   "SlopeGT",
+		LeafSlopeLT:   "SlopeLT",
+	}
+	kindName, ok := kindNames[leaf.Kind]
+	if !ok {
+		kindName = "UNKNOWN"
+	}
+
+	nameA := fmt.Sprintf("F[%d]", leaf.A)
+	if leaf.A >= 0 && leaf.A < len(names) {
+		nameA = fmt.Sprintf("%s(F[%d])", names[leaf.A], leaf.A)
+	}
+
+	nameB := fmt.Sprintf("F[%d]", leaf.B)
+	if leaf.B >= 0 && leaf.B < len(names) {
+		nameB = fmt.Sprintf("%s(F[%d])", names[leaf.B], leaf.B)
+	}
+
+	switch leaf.Kind {
+	case LeafGT, LeafLT:
+		return fmt.Sprintf("(%s %s %.2f)", kindName, nameA, leaf.X)
+	case LeafBetween:
+		return fmt.Sprintf("(%s %s %.2f %.2f)", kindName, nameA, leaf.X, leaf.Y)
+	case LeafAbsGT, LeafAbsLT:
+		return fmt.Sprintf("(%s %s %.2f)", kindName, nameA, leaf.X)
+	case LeafSlopeGT, LeafSlopeLT:
+		return fmt.Sprintf("(%s %s %.2f %d)", kindName, nameA, leaf.X, leaf.Lookback)
+	case LeafCrossUp, LeafCrossDown:
+		return fmt.Sprintf("(%s %s %s)", kindName, nameA, nameB)
+	case LeafRising, LeafFalling:
+		return fmt.Sprintf("(%s %s %d)", kindName, nameA, leaf.Lookback)
+	default:
+		return fmt.Sprintf("(%s %s)", kindName, nameA)
+	}
+}
+
+// ruleTreeToStringNamed returns a string representation of a rule tree with feature names
+func ruleTreeToStringNamed(node *RuleNode, names []string) string {
+	if node == nil {
+		return ""
+	}
+
+	if node.Op == OpLeaf {
+		return leafToStringNamed(&node.Leaf, names)
+	}
+
+	leftStr := ruleTreeToStringNamed(node.L, names)
+	rightStr := ruleTreeToStringNamed(node.R, names)
+
+	switch node.Op {
+	case OpAnd:
+		return fmt.Sprintf("(AND %s %s)", leftStr, rightStr)
+	case OpOr:
+		return fmt.Sprintf("(OR %s %s)", leftStr, rightStr)
+	case OpNot:
+		return fmt.Sprintf("(NOT %s)", leftStr)
+	default:
+		return ""
 	}
 }
 
@@ -2138,4 +2541,630 @@ func parseTrailModel(s string) TrailModel {
 		return TrailModel{Kind: "swing", Active: true}
 	}
 	return TrailModel{Active: false}
+}
+
+// WinnerRow represents a single winner from winners.jsonl or winners_tested.jsonl
+type WinnerRow struct {
+	Seed         int64   `json:"seed"`
+	FeeBps       float32 `json:"fee_bps"`
+	SlippageBps  float32 `json:"slippage_bps"`
+	Direction    int     `json:"direction"`
+	StopLoss     string  `json:"stop_loss"`
+	TakeProfit   string  `json:"take_profit"`
+	Trail        string  `json:"trail"`
+	EntryRule    string  `json:"entry_rule"`
+	ExitRule     string  `json:"exit_rule"`
+	RegimeFilter string  `json:"regime_filter"`
+	TrainScore   float32 `json:"train_score,omitempty"`
+	ValScore     float32 `json:"val_score,omitempty"`
+	TestScore    float32 `json:"test_score,omitempty"`
+}
+
+// loadWinnerBySeed loads a specific winner by seed from winners_tested.jsonl or winners.jsonl
+func loadWinnerBySeed(path string, seed int64) (*WinnerRow, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var w WinnerRow
+		if err := json.Unmarshal(sc.Bytes(), &w); err != nil {
+			continue
+		}
+		if w.Seed == seed {
+			return &w, nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("seed %d not found in %s", seed, path)
+}
+
+// loadFirstWinner loads the first (best) winner from the file
+func loadFirstWinner(path string) (*WinnerRow, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	if sc.Scan() {
+		var w WinnerRow
+		if err := json.Unmarshal(sc.Bytes(), &w); err != nil {
+			return nil, err
+		}
+		return &w, nil
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("no winners found in %s", path)
+}
+
+// runGoldenMode runs a single winner strategy with detailed trade logging
+func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64) {
+	fmt.Println("Running in GOLDEN mode - single strategy with trade logging")
+	fmt.Println("================================================================")
+	fmt.Printf("Seed: %d, FeeBps: %.1f, SlippageBps: %.1f\n", seed, feeBps, slipBps)
+	fmt.Println()
+
+	// Load data (same as test mode)
+	fmt.Println("Loading data...")
+	series, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	if err != nil {
+		fmt.Printf("Error loading CSV: %v\n", err)
+		return
+	}
+	fmt.Printf("Loaded %d candles\n", series.T)
+
+	fmt.Println("Computing features...")
+	feats := computeAllFeatures(series)
+	fmt.Printf("Computed %d features\n", len(feats.F))
+
+	// Split data into train/validation/test windows
+	trainStart, trainEnd, valEnd := GetSplitIndices(series.OpenTimeMs)
+	_, _, testW := GetSplitWindows(trainStart, trainEnd, valEnd, series.T, 500)
+
+	// Recompute feature stats on train window only
+	computeStatsOnWindow(&feats, trainStart, trainEnd)
+	fmt.Printf("Feature stats computed on train window (%d candles)\n", trainEnd-trainStart)
+
+	fmt.Printf("\nTest window: %d candles (indices %d -> %d)\n\n", testW.End-testW.Start, testW.Start, testW.End)
+
+	// Load winner from winners_tested.jsonl or winners.jsonl
+	var w *WinnerRow
+	if seed > 0 {
+		w, err = loadWinnerBySeed("winners_tested.jsonl", seed)
+		if err != nil {
+			// Try winners.jsonl as fallback
+			w, err = loadWinnerBySeed("winners.jsonl", seed)
+			if err != nil {
+				fmt.Printf("Error loading winner with seed %d: %v\n", seed, err)
+				return
+			}
+		}
+		fmt.Printf("Loaded winner with seed %d from tested results\n", seed)
+	} else {
+		w, err = loadFirstWinner("winners_tested.jsonl")
+		if err != nil {
+			// Try winners.jsonl as fallback
+			w, err = loadFirstWinner("winners.jsonl")
+			if err != nil {
+				fmt.Printf("Error loading first winner: %v\n", err)
+				return
+			}
+		}
+		fmt.Printf("Loaded first winner (seed=%d) from tested results\n", w.Seed)
+		seed = w.Seed
+	}
+
+	// Rebuild strategy from winner
+	st := Strategy{
+		Seed:        w.Seed,
+		FeeBps:      float32(feeBps),
+		SlippageBps: float32(slipBps),
+		RiskPct:     0.01,
+		Direction:   w.Direction,
+		EntryRule: RuleTree{
+			Root: parseRuleTree(w.EntryRule),
+		},
+		ExitRule: RuleTree{
+			Root: parseRuleTree(w.ExitRule),
+		},
+		RegimeFilter: RuleTree{
+			Root: parseRuleTree(w.RegimeFilter),
+		},
+		StopLoss:   parseStopModel(w.StopLoss),
+		TakeProfit: parseTPModel(w.TakeProfit),
+		Trail:      parseTrailModel(w.Trail),
+	}
+
+	// Compile bytecode
+	st.EntryCompiled = compileRuleTree(st.EntryRule.Root)
+	st.ExitCompiled = compileRuleTree(st.ExitRule.Root)
+	st.RegimeCompiled = compileRuleTree(st.RegimeFilter.Root)
+
+	// Run backtest with trade logging on TEST window
+	fmt.Println("\nRunning backtest on TEST window...")
+	result := evaluateStrategyWithTrades(series, feats, st, testW)
+
+	// Print golden results
+	printGoldenResult(result, printTrades)
+}
+
+// printGoldenResult prints detailed trade information for golden mode
+func printGoldenResult(result GoldenResult, printTrades int) {
+	fmt.Println("\n" + strings.Repeat("=", 80))
+	fmt.Println("GOLDEN MODE RESULTS")
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("\nStrategy Summary:\n")
+	fmt.Printf("  Total Trades:     %d\n", result.TotalTrades)
+	fmt.Printf("  Return (raw):     %.2f%%  [matches HB reports/winner files]\n", result.RawReturnPct*100)
+	fmt.Printf("  Return (risk-adj): %.2f%%  [uses RiskPct=1%%]\n", result.ReturnPct*100)
+	fmt.Printf("  Max DD:           %.2f%%  [mark-to-market, raw]\n", result.MaxDDPct*100)
+	fmt.Printf("  Win Rate:         %.2f%%\n", result.WinRate*100)
+	fmt.Printf("  Expectancy:       %.4f\n", result.Expectancy)
+	fmt.Printf("  Profit Factor:    %.2f\n", result.ProfitFactor)
+
+	if len(result.Trades) == 0 {
+		fmt.Println("\nNo trades to display.")
+		return
+	}
+
+	// Print first N trades
+	n := printTrades
+	if n > len(result.Trades) {
+		n = len(result.Trades)
+	}
+
+	fmt.Printf("\nFirst %d trades:\n", n)
+	fmt.Println(strings.Repeat("-", 80))
+	for i := 0; i < n; i++ {
+		tr := result.Trades[i]
+		fmt.Printf("#%2d ", i+1)
+
+		direction := "LONG"
+		if tr.Direction == -1 {
+			direction = "SHORT"
+		}
+
+		fmt.Printf("[%s] ", direction)
+
+		entryTS := formatTimestamp(seriesTimeToMs(tr.EntryTime))
+		exitTS := formatTimestamp(seriesTimeToMs(tr.ExitTime))
+
+		// Print trade details with new fields
+		fmt.Printf("Entry[%d %s] %.6f -> Exit[%d %s] %.6f ",
+			tr.EntryIdx, entryTS, tr.EntryPrice,
+			tr.ExitIdx, exitTS, tr.ExitPrice)
+		fmt.Printf("| PnL=%.4f%% ", tr.PnL*100)
+		if tr.PnL > 0 {
+			fmt.Printf("WIN [%s]", tr.Reason)
+		} else {
+			fmt.Printf("LOSS [%s]", tr.Reason)
+		}
+		if tr.HoldBars > 0 {
+			fmt.Printf(" | %d bars", tr.HoldBars)
+		}
+		fmt.Println()
+		// Print detailed levels on next line
+		fmt.Printf("    EntryPrice: %.6f | StopPrice: %.6f | TPPrice: %.6f | TrailActive: %v\n",
+			tr.EntryPrice, tr.StopPrice, tr.TPPrice, tr.TrailActive)
+		fmt.Printf("    ExitCandle: Open=%.6f High=%.6f Low=%.6f Close=%.6f\n",
+			tr.ExitOpen, tr.ExitHigh, tr.ExitLow, tr.ExitClose)
+		fmt.Println()
+	}
+	fmt.Println(strings.Repeat("=", 80))
+
+	// Print trade statistics
+	wins := 0
+	losses := 0
+	totalWinPnL := float32(0)
+	totalLossPnL := float32(0)
+	maxHoldBars := 0
+	for _, tr := range result.Trades {
+		if tr.PnL > 0 {
+			wins++
+			totalWinPnL += tr.PnL
+		} else {
+			losses++
+			totalLossPnL += -tr.PnL
+		}
+		if tr.HoldBars > maxHoldBars {
+			maxHoldBars = tr.HoldBars
+		}
+	}
+
+	fmt.Println("\nTrade Statistics:")
+	fmt.Printf("  Wins:             %d (%.1f%%)\n", wins, float32(wins)*100/float32(result.TotalTrades))
+	fmt.Printf("  Losses:           %d (%.1f%%)\n", losses, float32(losses)*100/float32(result.TotalTrades))
+	if wins > 0 {
+		fmt.Printf("  Avg Win:          %.4f%%\n", totalWinPnL/float32(wins)*100)
+	}
+	if losses > 0 {
+		fmt.Printf("  Avg Loss:         %.4f%%\n", totalLossPnL/float32(losses)*100)
+	}
+	fmt.Printf("  Max Hold Bars:    %d\n", maxHoldBars)
+	if result.TotalTrades > 0 {
+		fmt.Printf("  Avg Hold Bars:    %.1f\n", float32(result.TotalHoldBars)/float32(result.TotalTrades))
+	}
+
+	// Count exit reasons
+	fmt.Println("\nExit Reason Breakdown:")
+	for reason, count := range result.ExitReasons {
+		fmt.Printf("  %s: %d (%.1f%%)\n", reason, count, float32(count)*100/float32(result.TotalTrades))
+	}
+}
+
+// seriesTimeToMs converts a time.Time (seconds since epoch) to milliseconds
+func seriesTimeToMs(t time.Time) int64 {
+	return t.Unix() * 1000
+}
+
+// writeTraceCSV outputs per-bar states to CSV for a given strategy
+// Now includes detailed debug info for signal detection (EMA values, cross logic)
+func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st Strategy, testW Window) error {
+	// Calculate the offset: sliced series starts at (testW.Start - testW.Warmup)
+	sliceStartIdx := testW.Start - testW.Warmup
+	if sliceStartIdx < 0 {
+		sliceStartIdx = 0
+	}
+
+	// Default state: FLAT for every bar
+	states := make([]string, s.T)
+	for i := range states {
+		states[i] = "FLAT"
+	}
+
+	// Map to store signal details by bar index (in full series)
+	type signalDetails struct {
+		detailsStr string
+	}
+	signalDetailsMap := make(map[int]signalDetails)
+
+	// Mark ENTRY EXEC, HOLDING and exits
+	for _, tr := range trades {
+		// Convert local trade index to full series index
+		fullEntryIdx := sliceStartIdx + tr.EntryIdx
+		fullExitIdx := sliceStartIdx + tr.ExitIdx
+		sigIdx := fullEntryIdx - 1 // Signal is detected at entryIdx - 1
+
+		// Mark ENTRY EXEC at entry bar (when position is actually taken)
+		if fullEntryIdx >= 0 && fullEntryIdx < len(states) {
+			states[fullEntryIdx] = "ENTRY EXEC"
+		}
+
+		// Mark holding from entry+1 to exit-1
+		for t := fullEntryIdx + 1; t < fullExitIdx && t >= 0 && t < len(states); t++ {
+			states[t] = "HOLDING"
+		}
+
+		// Mark exit reason on exit bar
+		if fullExitIdx >= 0 && fullExitIdx < len(states) {
+			switch tr.Reason {
+			case "TP":
+				states[fullExitIdx] = "TP-HIT"
+			case "SL":
+				states[fullExitIdx] = "SL-HIT"
+			case "TRAIL":
+				states[fullExitIdx] = "SL-HIT" // TRAIL is a type of stop, show as SL-HIT for simplicity
+			case "MAX_HOLD":
+				states[fullExitIdx] = "MAX_HOLD"
+			default:
+				states[fullExitIdx] = "EXIT_RULE"
+			}
+		}
+
+		// Mark signal detect = entryIdx - 1 (because pendingEntry executes next bar open)
+		if sigIdx >= 0 && sigIdx < len(states) {
+			// Don't overwrite if something "stronger" is already there
+			if states[sigIdx] == "FLAT" {
+				states[sigIdx] = "SIGNAL DETECT"
+
+				// Capture signal details using full series index
+				closePrice := fmt.Sprintf("%.6f", s.Close[sigIdx])
+				openPrice := fmt.Sprintf("%.6f", s.Open[sigIdx])
+
+				// Build details string
+				detailsStr := fmt.Sprintf("Close=%s Open=%s", closePrice, openPrice)
+
+				// Get EMA values if available
+				var ema20Prev, ema50Prev, ema20Cur, ema50Cur string
+				if ema20Idx, ok20 := feats.Index["EMA20"]; ok20 && ema20Idx >= 0 && ema20Idx < len(feats.F) && sigIdx > 0 {
+					ema20 := feats.F[ema20Idx]
+					ema20Prev = fmt.Sprintf("%.6f", ema20[sigIdx-1])
+					ema20Cur = fmt.Sprintf("%.6f", ema20[sigIdx])
+				}
+				if ema50Idx, ok50 := feats.Index["EMA50"]; ok50 && ema50Idx >= 0 && ema50Idx < len(feats.F) && sigIdx > 0 {
+					ema50 := feats.F[ema50Idx]
+					ema50Prev = fmt.Sprintf("%.6f", ema50[sigIdx-1])
+					ema50Cur = fmt.Sprintf("%.6f", ema50[sigIdx])
+				}
+
+				if ema20Prev != "" && ema50Prev != "" {
+					detailsStr += fmt.Sprintf(" EMA20[t-1]=%s EMA50[t-1]=%s EMA20[t]=%s EMA50[t]=%s",
+						ema20Prev, ema50Prev, ema20Cur, ema50Cur)
+				}
+
+				// Get cross debug info
+				crossInfos := evaluateCrossDebug(st.EntryCompiled.Code, feats.F, feats.Names, sigIdx)
+				for _, ci := range crossInfos {
+					if ci.Result {
+						if ci.Kind == "CrossUp" {
+							prevLePrevB := ci.PrevA <= ci.PrevB
+							curAGtCurB := ci.CurA > ci.CurB
+							crossStr := fmt.Sprintf("CrossUp: prevA(%.6f)<=prevB(%.6f)=%v curA(%.6f)>curB(%.6f)=%v",
+								ci.PrevA, ci.PrevB, prevLePrevB, ci.CurA, ci.CurB, curAGtCurB)
+							detailsStr += " " + crossStr
+						} else if ci.Kind == "CrossDown" {
+							prevAGePrevB := ci.PrevA >= ci.PrevB
+							curALtCurB := ci.CurA < ci.CurB
+							crossStr := fmt.Sprintf("CrossDown: prevA(%.6f)>=prevB(%.6f)=%v curA(%.6f)<curB(%.6f)=%v",
+								ci.PrevA, ci.PrevB, prevAGePrevB, ci.CurA, ci.CurB, curALtCurB)
+							detailsStr += " " + crossStr
+						}
+					}
+				}
+
+				signalDetailsMap[sigIdx] = signalDetails{
+					detailsStr: detailsStr,
+				}
+			}
+		}
+	}
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	// No header (matches your example)
+	for i := 0; i < s.T; i++ {
+		ts := time.Unix(int64(s.OpenTimeMs[i])/1000, 0).UTC().Format(time.RFC3339)
+
+		// If this is a SIGNAL DETECT bar, include the details
+		if states[i] == "SIGNAL DETECT" {
+			if details, ok := signalDetailsMap[i]; ok {
+				row := []string{
+					fmt.Sprintf("%d", i),
+					ts,
+					states[i],
+					details.detailsStr,
+				}
+				if err := w.Write(row); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		// Normal row (no signal details)
+		if err := w.Write([]string{fmt.Sprintf("%d", i), ts, states[i]}); err != nil {
+			return err
+		}
+	}
+	return w.Error()
+}
+
+// buildManualEMA20x50 builds a deterministic EMA20x50 crossover strategy for manual debugging
+func buildManualEMA20x50(feats Features, feeBps, slipBps float32) Strategy {
+	// Find feature indices for EMA20 and EMA50
+	ema20Idx, ok20 := feats.Index["EMA20"]
+	ema50Idx, ok50 := feats.Index["EMA50"]
+
+	if !ok20 || !ok50 {
+		// Fall back to first two features if EMAs not found (should not happen)
+		fmt.Printf("Warning: EMA20/EMA50 not found, using first two features\n")
+		ema20Idx = 0
+		ema50Idx = 1
+	}
+
+	// Create CrossUp rule: EMA20 crosses above EMA50
+	entryRoot := &RuleNode{
+		Op: OpLeaf,
+		Leaf: Leaf{
+			Kind: LeafCrossUp,
+			A:    ema20Idx,
+			B:    ema50Idx,
+		},
+	}
+
+	// Empty exit rule (no exit signal - relies on SL/TP)
+	// Use LeafLT with impossible threshold to ensure it's never true
+	exitRoot := &RuleNode{
+		Op: OpLeaf,
+		Leaf: Leaf{
+			Kind: LeafLT,
+			A:    0,
+			X:    -1e9, // Never true - price will never be < -1 billion
+		},
+	}
+
+	// Empty regime filter (always active)
+	// Use LeafLT with very large threshold - price < 1e9 is always true for BTC
+	regimeRoot := &RuleNode{
+		Op: OpLeaf,
+		Leaf: Leaf{
+			Kind: LeafLT,
+			A:    0,
+			X:    1e9, // Always true - price will never exceed 1 billion
+		},
+	}
+
+	// Fixed SL = 1%, TP = 2%, Trail off
+	st := Strategy{
+		Seed:            0, // Deterministic seed for manual strategy
+		FeeBps:          feeBps,
+		SlippageBps:     slipBps,
+		RiskPct:         0.01,
+		Direction:       1, // Long only
+		EntryRule:       RuleTree{Root: entryRoot},
+		ExitRule:        RuleTree{Root: exitRoot},
+		RegimeFilter:    RuleTree{Root: regimeRoot},
+		StopLoss:        StopModel{Kind: "fixed", Value: 1.0},
+		TakeProfit:      TPModel{Kind: "fixed", Value: 2.0},
+		Trail:           TrailModel{Active: false},
+		MaxHoldBars:     150,
+		MaxConsecLosses: 0,
+		CooldownBars:    0,
+	}
+
+	// Compile rules
+	st.EntryCompiled = compileRuleTree(st.EntryRule.Root)
+	st.ExitCompiled = compileRuleTree(st.ExitRule.Root)
+	st.RegimeCompiled = compileRuleTree(st.RegimeFilter.Root)
+
+	return st
+}
+
+// runTraceMode runs a single strategy and outputs per-bar state CSV
+func runTraceMode(seed int64, csvPath, manual string, openCSV bool, feeBps, slipBps float64, traceWindow string) {
+	fmt.Println("Running in TRACE mode - per-bar state output")
+	fmt.Println("============================================")
+	fmt.Printf("Seed: %d, CSV: %s, Manual: %s, FeeBps: %.1f, SlippageBps: %.1f\n", seed, csvPath, manual, feeBps, slipBps)
+	fmt.Println()
+
+	// Load data
+	fmt.Println("Loading data...")
+	series, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	if err != nil {
+		fmt.Printf("Error loading CSV: %v\n", err)
+		return
+	}
+	fmt.Printf("Loaded %d candles\n", series.T)
+
+	fmt.Println("Computing features...")
+	feats := computeAllFeatures(series)
+	fmt.Printf("Computed %d features\n", len(feats.F))
+
+	// Split data into train/validation/test windows
+	trainStart, trainEnd, valEnd := GetSplitIndices(series.OpenTimeMs)
+	trainW, valW, testW := GetSplitWindows(trainStart, trainEnd, valEnd, series.T, 500)
+
+	// Select window based on trace_window flag
+	var w Window
+	switch traceWindow {
+	case "train":
+		w = trainW
+	case "val":
+		w = valW
+	case "test":
+		w = testW
+	default:
+		panic("invalid trace_window")
+	}
+
+	// Recompute feature stats on train window only
+	computeStatsOnWindow(&feats, trainStart, trainEnd)
+	fmt.Printf("Feature stats computed on train window (%d candles)\n", trainEnd-trainStart)
+
+	fmt.Printf("\n%s window: %d candles (indices %d -> %d)\n\n", strings.ToUpper(traceWindow), w.End-w.Start, w.Start, w.End)
+
+	// Load or build strategy
+	var st Strategy
+	if manual != "" {
+		// Only accept "ema20x50" as manual strategy
+		if manual != "ema20x50" {
+			fmt.Printf("Error: -trace_manual must be 'ema20x50', got '%s'\n", manual)
+			return
+		}
+		fmt.Printf("Using manual EMA20x50 strategy\n")
+		st = buildManualEMA20x50(feats, float32(feeBps), float32(slipBps))
+	} else {
+		// Load winner from winners_tested.jsonl or winners.jsonl
+		var w *WinnerRow
+		if seed > 0 {
+			w, err = loadWinnerBySeed("winners_tested.jsonl", seed)
+			if err != nil {
+				// Try winners.jsonl as fallback
+				w, err = loadWinnerBySeed("winners.jsonl", seed)
+				if err != nil {
+					fmt.Printf("Error loading winner with seed %d: %v\n", seed, err)
+					return
+				}
+			}
+			fmt.Printf("Loaded winner with seed %d\n", seed)
+		} else {
+			w, err = loadFirstWinner("winners_tested.jsonl")
+			if err != nil {
+				// Try winners.jsonl as fallback
+				w, err = loadFirstWinner("winners.jsonl")
+				if err != nil {
+					fmt.Printf("Error loading first winner: %v\n", err)
+					return
+				}
+			}
+			fmt.Printf("Loaded first winner (seed=%d)\n", w.Seed)
+		}
+
+		// Rebuild strategy from winner
+		st = Strategy{
+			Seed:        w.Seed,
+			FeeBps:      float32(feeBps),
+			SlippageBps: float32(slipBps),
+			RiskPct:     0.01,
+			Direction:   w.Direction,
+			EntryRule: RuleTree{
+				Root: parseRuleTree(w.EntryRule),
+			},
+			ExitRule: RuleTree{
+				Root: parseRuleTree(w.ExitRule),
+			},
+			RegimeFilter: RuleTree{
+				Root: parseRuleTree(w.RegimeFilter),
+			},
+			StopLoss:   parseStopModel(w.StopLoss),
+			TakeProfit: parseTPModel(w.TakeProfit),
+			Trail:      parseTrailModel(w.Trail),
+		}
+	}
+
+	// Compile bytecode
+	st.EntryCompiled = compileRuleTree(st.EntryRule.Root)
+	st.ExitCompiled = compileRuleTree(st.ExitRule.Root)
+	st.RegimeCompiled = compileRuleTree(st.RegimeFilter.Root)
+
+	// Run backtest with trade logging on TEST window
+	fmt.Printf("Running backtest on %s window...\n", strings.ToUpper(traceWindow))
+	result := evaluateStrategyWithTrades(series, feats, st, w)
+
+	// Write trace CSV
+	fmt.Printf("\nWriting trace CSV to %s...\n", csvPath)
+	if err := writeTraceCSV(series, result.Trades, csvPath, feats, st, w); err != nil {
+		fmt.Printf("Error writing trace CSV: %v\n", err)
+		return
+	}
+
+	// Auto-open CSV on Windows if requested
+	if openCSV {
+		exec.Command("cmd", "/c", "start", csvPath).Start()
+	}
+
+	// Print summary
+	fmt.Println("\n" + strings.Repeat("=", 80))
+	fmt.Println("TRACE MODE SUMMARY")
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("\nCSV Output: %s\n", csvPath)
+	fmt.Printf("Total Trades: %d\n", result.TotalTrades)
+	fmt.Printf("Total Bars: %d\n", series.T)
+	fmt.Printf("Test Window: %d -> %d\n", testW.Start, testW.End)
+	fmt.Println("\nPer-bar states:")
+	fmt.Println("  FLAT        - Not in position")
+	fmt.Println("  SIGNAL DETECT- Entry rule became true (bar before entry)")
+	fmt.Println("  HOLDING     - In position (from entry+1 until exit bar)")
+	fmt.Println("  TP-HIT      - Take profit hit on this bar")
+	fmt.Println("  SL-HIT      - Stop loss hit on this bar")
+	fmt.Println("  EXIT_RULE   - Exit rule triggered")
+	fmt.Println("  MAX_HOLD    - Max hold duration reached")
+	fmt.Println("\nCSV format: barIndex,timestamp,state")
+	fmt.Println("No header row (as requested)")
 }
