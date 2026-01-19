@@ -449,11 +449,11 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 				if child.Trail.Kind != "atr" && child.Trail.Kind != "swing" {
 					// Initialize with valid ATR trail if no valid kind
 					child.Trail.Kind = "atr"
-					child.Trail.ATRMult = 2.5 // Use looser default
+					child.Trail.ATRMult = 3.5 // Use looser default (was 2.5)
 				}
 				if child.Trail.Kind == "atr" && child.Trail.ATRMult <= 0 {
 					// Ensure valid ATR multiplier with looser default
-					child.Trail.ATRMult = 2.5
+					child.Trail.ATRMult = 3.5 // Use looser default (was 2.5)
 				}
 			}
 		}

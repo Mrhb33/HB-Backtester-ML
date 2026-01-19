@@ -126,9 +126,20 @@ func evaluateCompiled(code []ByteCode, features [][]float32, t int) bool {
 					continue
 				}
 				fb = features[instr.B]
+				// Validate B array has enough elements for t
+				if t >= len(fb) || (t >= 1 && t-1 >= len(fb)) {
+					if sp >= len(stack) {
+						stack = append(stack, false)
+					} else {
+						stack[sp] = false
+					}
+					sp++
+					continue
+				}
 			}
 
-			if t < int(instr.Lookback) {
+			// Validate time index bounds
+			if t < 0 || t >= len(fa) || t < int(instr.Lookback) {
 				if sp >= len(stack) {
 					stack = append(stack, false)
 				} else {
@@ -179,23 +190,63 @@ func evaluateCompiled(code []ByteCode, features [][]float32, t int) bool {
 					result = slope < instr.X
 				}
 			case LeafCrossUp:
-				bVal := fb[t]
-				prevA := float32(0)
-				prevB := float32(0)
-				if t >= 1 {
-					prevA = fa[t-1]
-					prevB = fb[t-1]
+				// CRITICAL FIX #1: Prevent fake CrossUp when one series is constant/zero
+				// CrossUp only valid if BOTH series are actually moving
+				if t < 1 {
+					result = false
+				} else {
+					// Epsilon check: require actual movement in BOTH series (use abs!)
+					// Block if EITHER series doesn't move (not just when both don't move)
+					const eps = 1e-6
+					aMove := fa[t] - fa[t-1]
+					bMove := fb[t] - fb[t-1]
+					// Use abs() because negative move still counts as no movement
+					if aMove < 0 {
+						aMove = -aMove
+					}
+					if bMove < 0 {
+						bMove = -bMove
+					}
+					if aMove < eps || bMove < eps {
+						// At least one series didn't move - can't be a real cross
+						result = false
+					} else {
+						// Require both sides straddle (real crossing)
+						bVal := fb[t]
+						prevA := fa[t-1]
+						prevB := fb[t-1]
+						result = (prevA <= prevB) && (fa[t] > bVal)
+					}
 				}
-				result = prevA <= prevB && aVal > bVal
 			case LeafCrossDown:
-				bVal := fb[t]
-				prevA := float32(0)
-				prevB := float32(0)
-				if t >= 1 {
-					prevA = fa[t-1]
-					prevB = fb[t-1]
+				// CRITICAL FIX #1: Prevent fake CrossDown when one series is constant/zero
+				// CrossDown only valid if BOTH series are actually moving
+				if t < 1 {
+					result = false
+				} else {
+					// Epsilon check: require actual movement in BOTH series (use abs!)
+					// Block if EITHER series doesn't move (not just when both don't move)
+					const eps = 1e-6
+					aMove := fa[t] - fa[t-1]
+					bMove := fb[t] - fb[t-1]
+					// Use abs() because negative move still counts as no movement
+					if aMove < 0 {
+						aMove = -aMove
+					}
+					if bMove < 0 {
+						bMove = -bMove
+					}
+					if aMove < eps || bMove < eps {
+						// At least one series didn't move - can't be a real cross
+						result = false
+					} else {
+						// Require both sides straddle (real crossing)
+						bVal := fb[t]
+						prevA := fa[t-1]
+						prevB := fb[t-1]
+						result = (prevA >= prevB) && (fa[t] < bVal)
+					}
 				}
-				result = prevA >= prevB && aVal < bVal
 			case LeafRising:
 				lb := int(instr.Lookback)
 				if lb > 0 && t >= lb {
@@ -355,7 +406,25 @@ func evaluateLeavesDebug(code []ByteCode, features [][]float32, t int) []bool {
 				prevA = fa[t-1]
 				prevB = fb[t-1]
 			}
-			result = prevA <= prevB && aVal > bVal
+			// CRITICAL FIX #1: Prevent fake CrossUp when one series is constant/zero
+			// Epsilon check: require actual movement in BOTH series (use abs!)
+			const eps = 1e-6
+			aMove := fa[t] - prevA
+			bMove := fb[t] - prevB
+			// Use abs() because negative move still counts as no movement
+			if aMove < 0 {
+				aMove = -aMove
+			}
+			if bMove < 0 {
+				bMove = -bMove
+			}
+			if aMove < eps || bMove < eps {
+				// At least one series didn't move - can't be a real cross
+				result = false
+			} else {
+				// Require both sides straddle (real crossing)
+				result = (prevA <= prevB) && (fa[t] > bVal)
+			}
 		case LeafCrossDown:
 			if instr.B < 0 || int(instr.B) >= len(features) {
 				results = append(results, false)
@@ -369,7 +438,25 @@ func evaluateLeavesDebug(code []ByteCode, features [][]float32, t int) []bool {
 				prevA = fa[t-1]
 				prevB = fb[t-1]
 			}
-			result = prevA >= prevB && aVal < bVal
+			// CRITICAL FIX #1: Prevent fake CrossDown when one series is constant/zero
+			// Epsilon check: require actual movement in BOTH series (use abs!)
+			const eps = 1e-6
+			aMove := fa[t] - prevA
+			bMove := fb[t] - prevB
+			// Use abs() because negative move still counts as no movement
+			if aMove < 0 {
+				aMove = -aMove
+			}
+			if bMove < 0 {
+				bMove = -bMove
+			}
+			if aMove < eps || bMove < eps {
+				// At least one series didn't move - can't be a real cross
+				result = false
+			} else {
+				// Require both sides straddle (real crossing)
+				result = (prevA >= prevB) && (fa[t] < bVal)
+			}
 		case LeafRising:
 			lb := int(instr.Lookback)
 			if lb > 0 && t >= lb {
@@ -440,10 +527,40 @@ func evaluateCrossDebug(code []ByteCode, features [][]float32, featureNames []st
 
 		if kind == LeafCrossUp {
 			kindName = "CrossUp"
-			result = prevA <= prevB && curA > curB
+			// CRITICAL FIX #1: Apply same checks as live evaluator (use abs!)
+			const eps = 1e-6
+			aMove := curA - prevA
+			bMove := curB - prevB
+			// Use abs() because negative move still counts as no movement
+			if aMove < 0 {
+				aMove = -aMove
+			}
+			if bMove < 0 {
+				bMove = -bMove
+			}
+			if aMove < eps || bMove < eps {
+				result = false // At least one series didn't move = fake cross
+			} else {
+				result = (prevA <= prevB) && (curA > curB)
+			}
 		} else { // LeafCrossDown
 			kindName = "CrossDown"
-			result = prevA >= prevB && curA < curB
+			// CRITICAL FIX #1: Apply same checks as live evaluator (use abs!)
+			const eps = 1e-6
+			aMove := curA - prevA
+			bMove := curB - prevB
+			// Use abs() because negative move still counts as no movement
+			if aMove < 0 {
+				aMove = -aMove
+			}
+			if bMove < 0 {
+				bMove = -bMove
+			}
+			if aMove < eps || bMove < eps {
+				result = false // At least one series didn't move = fake cross
+			} else {
+				result = (prevA >= prevB) && (curA < curB)
+			}
 		}
 
 		// Check if the result makes sense

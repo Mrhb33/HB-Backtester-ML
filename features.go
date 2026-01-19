@@ -12,11 +12,126 @@ type FeatureStats struct {
 	Std  float32
 }
 
+// FeatureType defines the semantic type/scale of a feature for operator validation
+// CRITICAL FIX #5: Typed features prevent nonsense operations like "CrossUp(Price, RSI)"
+type FeatureType uint8
+
+const (
+	FeatTypeUnknown FeatureType = iota
+	FeatTypePrice          // Price levels: EMA, BB_Lower, SwingHigh, SwingLow (3000-74000 for BTC)
+	FeatTypeOscillator     // 0-100 bounded: RSI, MFI, PlusDI, MinusDI, ADX
+	FeatTypeZScore         // Z-score normalized: VolZ20, VolZ50 (typically -3 to +3)
+	FeatTypeNormalized     // Normalized bounded: Imbalance [-1, +1], RangeWidth [0, 1]
+	FeatTypeEventFlag      // Binary/Event flags: BOS, FVG, Swings (0 or 1)
+	FeatTypeVolume         // Volume-related: OBV, Volume, VolPerTrade (absolute values)
+	FeatTypeATR            // Volatility: ATR (positive absolute values)
+	FeatTypeRateOfChange   // ROC, MACD (can be positive or negative)
+)
+
 type Features struct {
 	F     [][]float32
 	Names []string
 	Index map[string]int
 	Stats []FeatureStats // Per-feature statistics for scale-aware mutations
+	Types []FeatureType  // CRITICAL FIX #5: Feature type metadata for operator validation
+}
+
+// getFeatureType determines the semantic type of a feature from its name
+// CRITICAL FIX #5: This enables operator validation to prevent nonsense operations
+func getFeatureType(name string) FeatureType {
+	switch {
+	// Price-level features
+	case name == "EMA10" || name == "EMA20" || name == "EMA50" || name == "EMA100" || name == "EMA200":
+		return FeatTypePrice
+	case name == "BB_Lower20" || name == "BB_Lower50" || name == "BB_Upper20" || name == "BB_Upper50":
+		return FeatTypePrice
+	case name == "SwingHigh" || name == "SwingLow":
+		return FeatTypePrice
+
+	// Oscillator features (0-100 bounded)
+	case name == "RSI7" || name == "RSI14" || name == "RSI21":
+		return FeatTypeOscillator
+	case name == "MFI14":
+		return FeatTypeOscillator
+	case name == "ADX":
+		return FeatTypeOscillator
+	case name == "PlusDI" || name == "MinusDI":
+		return FeatTypeOscillator
+
+	// Z-score features
+	case name == "VolZ20" || name == "VolZ50":
+		return FeatTypeZScore
+
+	// Normalized bounded features
+	case name == "Imbalance":
+		return FeatTypeNormalized
+	case name == "RangeWidth":
+		return FeatTypeNormalized
+	case name == "BuyRatio":
+		return FeatTypeNormalized
+
+	// Event flag features (binary/discrete)
+	case name == "BOS" || name == "FVG":
+		return FeatTypeEventFlag
+
+	// Volume features
+	case name == "OBV":
+		return FeatTypeVolume
+	case name == "VolPerTrade":
+		return FeatTypeVolume
+
+	// ATR (volatility)
+	case name == "ATR7" || name == "ATR14":
+		return FeatTypeATR
+
+	// Rate of change / MACD
+	case name == "ROC10" || name == "ROC20":
+		return FeatTypeRateOfChange
+	case name == "MACD" || name == "MACD_Signal" || name == "MACD_Hist":
+		return FeatTypeRateOfChange
+
+	// BB_Width is price-based volatility
+	case name == "BB_Width20" || name == "BB_Width50":
+		return FeatTypePrice
+
+	// Body is price-based
+	case name == "Body":
+		return FeatTypePrice
+
+	// HighLowDiff is price-based
+	case name == "HighLowDiff":
+		return FeatTypePrice
+
+	// Active bars count
+	case name == "Active":
+		return FeatTypeEventFlag
+
+	default:
+		return FeatTypeUnknown
+	}
+}
+
+// canCrossFeatures returns true if two feature types are compatible for cross operations
+// CRITICAL FIX #5: Only allow crossing within same scale/type
+func canCrossFeatures(typeA, typeB FeatureType) bool {
+	// Same type always allowed
+	if typeA == typeB {
+		return true
+	}
+
+	// Price x RateOfChange allowed (trend vs momentum)
+	if (typeA == FeatTypePrice && typeB == FeatTypeRateOfChange) ||
+		(typeB == FeatTypePrice && typeA == FeatTypeRateOfChange) {
+		return true
+	}
+
+	// Oscillator x Oscillator-like features allowed
+	if (typeA == FeatTypeOscillator && typeB == FeatTypeRateOfChange) ||
+		(typeB == FeatTypeOscillator && typeA == FeatTypeRateOfChange) {
+		return true
+	}
+
+	return false
 }
 
 func computeAllFeatures(s Series) Features {
@@ -26,11 +141,13 @@ func computeAllFeatures(s Series) Features {
 	f.Names = make([]string, 0, 60)
 	f.F = make([][]float32, 0, 60)
 	f.Index = make(map[string]int, 60)
+	f.Types = make([]FeatureType, 0, 60) // CRITICAL FIX #5: Initialize types slice
 
 	addFeature := func(name string, arr []float32) {
 		f.Index[name] = len(f.F)
 		f.F = append(f.F, arr)
 		f.Names = append(f.Names, name)
+		f.Types = append(f.Types, getFeatureType(name)) // CRITICAL FIX #5: Set type
 	}
 
 	emaPeriods := []int{10, 20, 50, 100, 200}
@@ -151,26 +268,49 @@ func computeAllFeatures(s Series) Features {
 	fvgUp := make([]float32, n)
 	fvgDown := make([]float32, n)
 
-	leftLook := 3
-	rightLook := 3
-	for i := leftLook; i < n-rightLook; i++ {
-		isSwingHigh := true
-		isSwingLow := true
-		for j := i - leftLook; j <= i+rightLook; j++ {
-			if j != i {
-				if s.High[j] >= s.High[i] {
-					isSwingHigh = false
-				}
-				if s.Low[j] <= s.Low[i] {
-					isSwingLow = false
+	// CRITICAL FIX #2: SwingHigh should carry forward price levels, not act as a flag
+	// Use 20-bar window for swing detection (works well on 5m data)
+	// Each bar gets the current swing high price at that point in time
+	// Before first swing: use 0 (or could use NaN, but 0 is safer for Go)
+	leftLook := 10  // Half of 20-bar window
+	rightLook := 10
+	lastSwingHighPrice := float32(0)  // Start with 0 (no swing yet)
+	lastSwingLowPrice := float32(0)   // Start with 0 (no swing yet)
+
+	// Initialize arrays with 0 (meaning "no swing yet")
+	for i := 0; i < n; i++ {
+		swingHigh[i] = 0
+		swingLow[i] = 0
+	}
+
+	// Main loop: detect swings AND update per-bar with current last swing price
+	for i := 0; i < n; i++ {
+		// First, carry forward the last known swing price for this bar
+		swingHigh[i] = lastSwingHighPrice
+		swingLow[i] = lastSwingLowPrice
+
+		// Then check if this bar is a new swing (only when we have enough context)
+		if i >= leftLook && i < n-rightLook {
+			isSwingHigh := true
+			isSwingLow := true
+			for j := i - leftLook; j <= i+rightLook; j++ {
+				if j != i {
+					if s.High[j] >= s.High[i] {
+						isSwingHigh = false
+					}
+					if s.Low[j] <= s.Low[i] {
+						isSwingLow = false
+					}
 				}
 			}
-		}
-		if isSwingHigh {
-			swingHigh[i] = s.High[i]
-		}
-		if isSwingLow {
-			swingLow[i] = s.Low[i]
+			if isSwingHigh {
+				lastSwingHighPrice = s.High[i] // Update the swing high price
+				swingHigh[i] = lastSwingHighPrice  // Also update current bar
+			}
+			if isSwingLow {
+				lastSwingLowPrice = s.Low[i] // Update the swing low price
+				swingLow[i] = lastSwingLowPrice  // Also update current bar
+			}
 		}
 	}
 
@@ -185,12 +325,14 @@ func computeAllFeatures(s Series) Features {
 		}
 	}
 
-	lastSwingHigh := float32(-1)
+	// BOS: Break of Structure - use carried-forward swing high price
+	lastSwingHighForBOS := float32(-1)
 	for i := 0; i < n; i++ {
+		// Use the carried-forward swing high price
 		if swingHigh[i] > 0 {
-			lastSwingHigh = swingHigh[i]
+			lastSwingHighForBOS = swingHigh[i]
 		}
-		if lastSwingHigh > 0 && s.Close[i] > lastSwingHigh {
+		if lastSwingHighForBOS > 0 && s.Close[i] > lastSwingHighForBOS {
 			bos[i] = 1
 		}
 	}
@@ -403,6 +545,11 @@ func computeBollinger(src, upper, lower, width []float32, period int, stdDev flo
 		lower[i] = sma[i] - float32(stdDev)*std
 		if sma[i] > 0 {
 			width[i] = (upper[i] - lower[i]) / sma[i]
+		}
+		// CRITICAL FIX #3: BB_Width must never be 0 after warmup
+		// Add numerical floor to prevent division issues
+		if width[i] < 1e-9 {
+			width[i] = 1e-9
 		}
 	}
 }
