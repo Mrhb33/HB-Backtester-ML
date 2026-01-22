@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
+	"strings"
 )
 
 type FeatureStats struct {
@@ -18,14 +21,16 @@ type FeatureType uint8
 
 const (
 	FeatTypeUnknown FeatureType = iota
-	FeatTypePrice          // Price levels: EMA, BB_Lower, SwingHigh, SwingLow (3000-74000 for BTC)
-	FeatTypeOscillator     // 0-100 bounded: RSI, MFI, PlusDI, MinusDI, ADX
-	FeatTypeZScore         // Z-score normalized: VolZ20, VolZ50 (typically -3 to +3)
-	FeatTypeNormalized     // Normalized bounded: Imbalance [-1, +1], RangeWidth [0, 1]
-	FeatTypeEventFlag      // Binary/Event flags: BOS, FVG, Swings (0 or 1)
-	FeatTypeVolume         // Volume-related: OBV, Volume, VolPerTrade (absolute values)
-	FeatTypeATR            // Volatility: ATR (positive absolute values)
-	FeatTypeRateOfChange   // ROC, MACD (can be positive or negative)
+
+	FeatTypePriceLevel   // EMA*, BB_Upper/Lower*, SwingHigh/Low (same "price" units)
+	FeatTypePriceRange   // BB_Width*, Body, HighLowDiff (range/size units)
+	FeatTypeOscillator   // RSI*, ADX, PlusDI, MinusDI, MFI (bounded-ish)
+	FeatTypeZScore       // VolZ*
+	FeatTypeNormalized   // Imbalance, BuyRatio, RangeWidth (0..1-ish)
+	FeatTypeEventFlag    // BOS/FVG/Active style
+	FeatTypeVolume       // OBV, VolPerTrade, VolSMA/EMA (volume units)
+	FeatTypeATR          // ATR*
+	FeatTypeMomentum     // ROC*, MACD*, Hist (centered around 0)
 )
 
 type Features struct {
@@ -36,17 +41,50 @@ type Features struct {
 	Types []FeatureType  // CRITICAL FIX #5: Feature type metadata for operator validation
 }
 
+// ComputeFeatureMapHash creates a fingerprint of the feature ordering
+// Returns a sha256 hash of "0:Name1|1:Name2|..." format
+// This allows detection of feature order changes between strategy generation and execution
+func ComputeFeatureMapHash(f Features) string {
+	parts := make([]string, len(f.Names))
+	for i, name := range f.Names {
+		parts[i] = fmt.Sprintf("%d:%s", i, name)
+	}
+	combined := strings.Join(parts, "|")
+	hash := sha256.Sum256([]byte(combined))
+	return hex.EncodeToString(hash[:])[:16] // First 16 chars of SHA256 (enough for fingerprint)
+}
+
+// GetFeatureMapVersion returns a human-readable version string based on key features
+// This helps identify feature order changes without comparing full hashes
+func GetFeatureMapVersion(f Features) string {
+	// Sample a few key feature indices to detect major rearrangements
+	checkFeatures := []string{"EMA10", "EMA20", "EMA50", "VolSMA20", "MinusDI", "BB_Width50", "MACD", "SwingHigh"}
+	indices := make([]string, 0, len(checkFeatures))
+	for _, name := range checkFeatures {
+		if idx, ok := f.Index[name]; ok {
+			indices = append(indices, fmt.Sprintf("%s@F[%d]", name, idx))
+		}
+	}
+	return strings.Join(indices, ",")
+}
+
 // getFeatureType determines the semantic type of a feature from its name
 // CRITICAL FIX #5: This enables operator validation to prevent nonsense operations
 func getFeatureType(name string) FeatureType {
 	switch {
-	// Price-level features
+	// Price-level features (EMA*, BB_Upper/Lower*, SwingHigh/Low)
 	case name == "EMA10" || name == "EMA20" || name == "EMA50" || name == "EMA100" || name == "EMA200":
-		return FeatTypePrice
+		return FeatTypePriceLevel
 	case name == "BB_Lower20" || name == "BB_Lower50" || name == "BB_Upper20" || name == "BB_Upper50":
-		return FeatTypePrice
+		return FeatTypePriceLevel
 	case name == "SwingHigh" || name == "SwingLow":
-		return FeatTypePrice
+		return FeatTypePriceLevel
+
+	// Price-range features (in dollar units: Body, HighLowDiff)
+	case name == "Body":
+		return FeatTypePriceRange
+	case name == "HighLowDiff":
+		return FeatTypePriceRange
 
 	// Oscillator features (0-100 bounded)
 	case name == "RSI7" || name == "RSI14" || name == "RSI21":
@@ -62,45 +100,39 @@ func getFeatureType(name string) FeatureType {
 	case name == "VolZ20" || name == "VolZ50":
 		return FeatTypeZScore
 
-	// Normalized bounded features
-	case name == "Imbalance":
+	// Normalized bounded features (0..1 ratios)
+	case name == "BB_Width20" || name == "BB_Width50":
 		return FeatTypeNormalized
 	case name == "RangeWidth":
+		return FeatTypeNormalized
+	case name == "Imbalance":
 		return FeatTypeNormalized
 	case name == "BuyRatio":
 		return FeatTypeNormalized
 
 	// Event flag features (binary/discrete)
-	case name == "BOS" || name == "FVG":
+	case name == "BOS" || name == "Sweep" || name == "FVGUp" || name == "FVGDown":
 		return FeatTypeEventFlag
+	case name == "Displacement":
+		return FeatTypeNormalized // it's a 0..1 ratio
 
 	// Volume features
 	case name == "OBV":
 		return FeatTypeVolume
 	case name == "VolPerTrade":
 		return FeatTypeVolume
+	case name == "VolSMA20" || name == "VolSMA50" || name == "VolEMA20" || name == "VolEMA50":
+		return FeatTypeVolume
 
 	// ATR (volatility)
 	case name == "ATR7" || name == "ATR14":
 		return FeatTypeATR
 
-	// Rate of change / MACD
+	// Momentum / ROC-like features
 	case name == "ROC10" || name == "ROC20":
-		return FeatTypeRateOfChange
+		return FeatTypeMomentum
 	case name == "MACD" || name == "MACD_Signal" || name == "MACD_Hist":
-		return FeatTypeRateOfChange
-
-	// BB_Width is price-based volatility
-	case name == "BB_Width20" || name == "BB_Width50":
-		return FeatTypePrice
-
-	// Body is price-based
-	case name == "Body":
-		return FeatTypePrice
-
-	// HighLowDiff is price-based
-	case name == "HighLowDiff":
-		return FeatTypePrice
+		return FeatTypeMomentum
 
 	// Active bars count
 	case name == "Active":
@@ -112,26 +144,105 @@ func getFeatureType(name string) FeatureType {
 }
 
 // canCrossFeatures returns true if two feature types are compatible for cross operations
-// CRITICAL FIX #5: Only allow crossing within same scale/type
+// CRITICAL FIX #5: Only allow crossing within same semantic scale group.
+// This blocks nonsense like: CrossUp(BB_Upper50, MACD_Hist), CrossDown(BB_Width50, SwingHigh)
 func canCrossFeatures(typeA, typeB FeatureType) bool {
-	// Same type always allowed
+	// SAFETY: Unknown types can never cross (prevents "silent nonsense")
+	if typeA == FeatTypeUnknown || typeB == FeatTypeUnknown {
+		return false
+	}
+
+	// Only allow CrossUp/CrossDown inside the same semantic scale group.
 	if typeA == typeB {
+		// Disallow crossing binary/event flags even if same type
+		if typeA == FeatTypeEventFlag {
+			return false
+		}
 		return true
 	}
 
-	// Price x RateOfChange allowed (trend vs momentum)
-	if (typeA == FeatTypePrice && typeB == FeatTypeRateOfChange) ||
-		(typeB == FeatTypePrice && typeA == FeatTypeRateOfChange) {
+	// OPTIONAL: allow ATR to cross price-range features (both are "volatility magnitude")
+	if (typeA == FeatTypeATR && typeB == FeatTypePriceRange) ||
+		(typeB == FeatTypeATR && typeA == FeatTypePriceRange) {
 		return true
 	}
 
-	// Oscillator x Oscillator-like features allowed
-	if (typeA == FeatTypeOscillator && typeB == FeatTypeRateOfChange) ||
-		(typeB == FeatTypeOscillator && typeA == FeatTypeRateOfChange) {
-		return true
-	}
-
+	// Everything else: NO.
+	// This blocks nonsense like:
+	// - PriceLevel vs Momentum (BB_Upper50 vs MACD_Hist)
+	// - PriceRange vs PriceLevel (BB_Width50 vs SwingHigh)
+	// - Oscillator vs PriceLevel, etc.
 	return false
+}
+
+// validateCrossSanity checks all CrossUp/CrossDown nodes in a rule tree for feature type compatibility
+// Returns (isValid, invalidCount) - if invalidCount > 0, the tree has invalid cross operations
+func validateCrossSanity(root *RuleNode, feats Features) (bool, int) {
+	if root == nil {
+		return true, 0
+	}
+
+	invalidCount := 0
+
+	// Walk the tree and validate all cross nodes
+	var walk func(node *RuleNode)
+	walk = func(node *RuleNode) {
+		if node == nil {
+			return
+		}
+
+		if node.Op == OpLeaf {
+			leaf := node.Leaf
+			// Check CrossUp and CrossDown leaves
+			if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+				// Validate feature indices
+				if leaf.A >= 0 && leaf.A < len(feats.Types) && leaf.B >= 0 && leaf.B < len(feats.Types) {
+					typeA := feats.Types[leaf.A]
+					typeB := feats.Types[leaf.B]
+					if !canCrossFeatures(typeA, typeB) {
+						invalidCount++
+					}
+				} else {
+					// Invalid feature indices
+					invalidCount++
+				}
+			}
+			return
+		}
+
+		// Recurse into children
+		walk(node.L)
+		walk(node.R)
+	}
+
+	walk(root)
+	return invalidCount == 0, invalidCount
+}
+
+// validateLoadedStrategy checks all CrossUp/CrossDown operations in a complete strategy
+// Returns error if any invalid cross operations are found
+// Use this when loading strategies from disk/checkpoint to reject invalid ones
+func validateLoadedStrategy(s Strategy, feats *Features) error {
+	var totalInvalid int
+
+	// Validate all three rule trees
+	if s.EntryRule.Root != nil {
+		_, entryInvalid := validateCrossSanity(s.EntryRule.Root, *feats)
+		totalInvalid += entryInvalid
+	}
+	if s.ExitRule.Root != nil {
+		_, exitInvalid := validateCrossSanity(s.ExitRule.Root, *feats)
+		totalInvalid += exitInvalid
+	}
+	if s.RegimeFilter.Root != nil {
+		_, regimeInvalid := validateCrossSanity(s.RegimeFilter.Root, *feats)
+		totalInvalid += regimeInvalid
+	}
+
+	if totalInvalid > 0 {
+		return fmt.Errorf("strategy has %d invalid CrossUp/CrossDown operations", totalInvalid)
+	}
+	return nil
 }
 
 func computeAllFeatures(s Series) Features {
@@ -164,13 +275,6 @@ func computeAllFeatures(s Series) Features {
 		addFeature(fmt.Sprintf("RSI%d", p), arr)
 	}
 
-	atrPeriods := []int{7, 14}
-	for _, p := range atrPeriods {
-		arr := make([]float32, n)
-		computeATR(s.High, s.Low, s.Close, arr, p)
-		addFeature(fmt.Sprintf("ATR%d", p), arr)
-	}
-
 	for _, p := range []int{20, 50} {
 		upper := make([]float32, n)
 		lower := make([]float32, n)
@@ -193,6 +297,19 @@ func computeAllFeatures(s Series) Features {
 	computeOBV(s.Close, s.Volume, obv)
 	addFeature("OBV", obv)
 
+	for _, p := range []int{10, 20} {
+		roc := make([]float32, n)
+		computeROC(s.Close, roc, p)
+		addFeature(fmt.Sprintf("ROC%d", p), roc)
+	}
+
+	atrPeriods := []int{7, 14}
+	for _, p := range atrPeriods {
+		arr := make([]float32, n)
+		computeATR(s.High, s.Low, s.Close, arr, p)
+		addFeature(fmt.Sprintf("ATR%d", p), arr)
+	}
+
 	adxPeriods := []int{14}
 	for _, p := range adxPeriods {
 		adx, plusDI, minusDI := make([]float32, n), make([]float32, n), make([]float32, n)
@@ -205,12 +322,6 @@ func computeAllFeatures(s Series) Features {
 	mfi := make([]float32, n)
 	computeMFI(s.High, s.Low, s.Close, s.Volume, mfi, 14)
 	addFeature("MFI14", mfi)
-
-	for _, p := range []int{10, 20} {
-		roc := make([]float32, n)
-		computeROC(s.Close, roc, p)
-		addFeature(fmt.Sprintf("ROC%d", p), roc)
-	}
 
 	for _, p := range []int{20, 50} {
 		volSMA := make([]float32, n)

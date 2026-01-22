@@ -1,22 +1,26 @@
 package main
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 type Elite struct {
-	Strat    Strategy
-	Train    Result
-	Val      Result
-	ValScore float32
+	Strat     Strategy
+	Train     Result
+	Val       Result
+	ValScore  float32
+	IsPreElite bool // True if added via recovery mode (not fully validated)
 }
 
 type HallOfFame struct {
-	mu     sync.RWMutex
-	K      int
-	Elites []Elite
+	mu       sync.RWMutex
+	K        int
+	Elites   []Elite
+	snapshot atomic.Value // Stores []Elite for lock-free reads
 }
 
 func NewHallOfFame(k int) *HallOfFame {
@@ -27,16 +31,18 @@ func (h *HallOfFame) Add(e Elite) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	skeleton := e.Strat.SkeletonFingerprint()
+	// Use CoarseFingerprint for diversity tracking (threshold buckets)
+	// This allows more threshold variation than SkeletonFingerprint while preventing duplicates
+	fingerprint := e.Strat.CoarseFingerprint()
 
-	// Count elites with this skeleton and track worst one
-	skeletonCount := 0
+	// Count elites with this fingerprint and track worst one
+	fpCount := 0
 	worstIndex := -1
 	worstScore := e.ValScore
 
 	for i, elite := range h.Elites {
-		if elite.Strat.SkeletonFingerprint() == skeleton {
-			skeletonCount++
+		if elite.Strat.CoarseFingerprint() == fingerprint {
+			fpCount++
 			if elite.ValScore < worstScore {
 				worstScore = elite.ValScore
 				worstIndex = i
@@ -44,14 +50,17 @@ func (h *HallOfFame) Add(e Elite) {
 		}
 	}
 
-	// If skeleton is already at cap (2 elites), replace worst if new is better
-	// Reduced from 4 to 2 to force more diversity and prevent inbreeding
-	if skeletonCount >= 2 {
+	// If fingerprint is already at cap (2 elites), replace worst if new is better
+	// This allows up to 2 elites per coarse fingerprint family
+	if fpCount >= 2 {
 		if e.ValScore <= worstScore || worstIndex == -1 {
-			// Not better than worst or no skeleton found (shouldn't happen), reject
+			// DEBUG: Log why elite was rejected
+			fmt.Printf("[HOF-REJECT] fpCount=%d newScore=%.4f <= worstScore=%.4f\n",
+				fpCount, e.ValScore, worstScore)
+			// Not better than worst or no fingerprint found (shouldn't happen), reject
 			return
 		}
-		// Replace the worst elite of this skeleton
+		// Replace the worst elite of this fingerprint family
 		h.Elites[worstIndex] = e
 	} else {
 		// Under cap, add normally
@@ -65,31 +74,105 @@ func (h *HallOfFame) Add(e Elite) {
 	if len(h.Elites) > h.K {
 		h.Elites = h.Elites[:h.K]
 	}
+
+	// Update atomic snapshot AFTER modification
+	snapshot := make([]Elite, len(h.Elites))
+	copy(snapshot, h.Elites)
+	h.snapshot.Store(snapshot)
 }
 
 func (h *HallOfFame) Len() int {
+	if elites := h.snapshot.Load(); elites != nil {
+		return len(elites.([]Elite))
+	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.Elites)
 }
 
-// tournament selection (fast + good)
+// tournament selection (fast + good) - now lock-free
 func (h *HallOfFame) Sample(rng *rand.Rand) (Elite, bool) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	n := len(h.Elites)
+	// Lock-free read from atomic snapshot
+	elitesInterface := h.snapshot.Load()
+	var elites []Elite
+
+	if elitesInterface != nil {
+		elites = elitesInterface.([]Elite)
+	} else {
+		// Fallback for initialization
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+		elites = h.Elites
+	}
+
+	n := len(elites)
 	if n == 0 {
 		return Elite{}, false
 	}
 	k := 4
-	best := h.Elites[rng.Intn(n)]
+	best := elites[rng.Intn(n)]
 	for i := 1; i < k; i++ {
-		c := h.Elites[rng.Intn(n)]
+		c := elites[rng.Intn(n)]
 		if c.ValScore > best.ValScore {
 			best = c
 		}
 	}
 	return best, true
+}
+
+// InitSnapshot initializes the atomic snapshot after loading elites from checkpoint
+// This MUST be called after loading elites into HOF to enable lock-free reads
+func (h *HallOfFame) InitSnapshot() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	snapshot := make([]Elite, len(h.Elites))
+	copy(snapshot, h.Elites)
+	h.snapshot.Store(snapshot)
+}
+
+// minInt returns the smaller of two integers
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// SeedFromCandidates adds the best N candidates as elites when HOF is empty
+// This is an emergency recovery mechanism when population collapses
+// CHANGES SEARCH DYNAMICS: Results won't be comparable to runs without seeding
+func (h *HallOfFame) SeedFromCandidates(candidates []Elite, maxSeeds int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if len(h.Elites) > 0 {
+		return // Already has elites, don't seed
+	}
+
+	// Sort candidates by validation score
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].ValScore > candidates[j].ValScore
+	})
+
+	// CRITICAL FIX: Use h.Add() instead of direct append to respect fingerprint diversity caps
+	// This prevents seeding 5 identical fingerprints which would block progress
+	seedCount := minInt(maxSeeds, len(candidates))
+	seeded := 0
+	for i := 0; i < seedCount; i++ {
+		// Try to add via normal Add() path which enforces fingerprint diversity
+		beforeLen := len(h.Elites)
+		h.Add(candidates[i])
+		if len(h.Elites) > beforeLen {
+			seeded++
+		}
+	}
+
+	// Update atomic snapshot
+	snapshot := make([]Elite, len(h.Elites))
+	copy(snapshot, h.Elites)
+	h.snapshot.Store(snapshot)
+
+	fmt.Printf("[EMERGENCY-SEED] Seeded %d/%d elites from candidates (HOF was empty)\n", seeded, seedCount)
 }
 
 func cloneRule(node *RuleNode) *RuleNode {
@@ -128,25 +211,67 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 		}
 	case 1: // change feature A
 		leaf.A = rng.Intn(len(feats.F))
-		// Ensure B is valid for cross leaves
+		// SANITY CHECK: For cross leaves, ensure B is compatible with new A
 		if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
-			if leaf.B == leaf.A || leaf.B >= len(feats.F) {
-				leaf.B = (leaf.A + 1) % len(feats.F)
+			// Get type of new feature A
+			var typeA FeatureType
+			if leaf.A < len(feats.Types) {
+				typeA = feats.Types[leaf.A]
+			}
+			// Find a compatible B
+			maxAttempts := 50
+			found := false
+			for attempt := 0; attempt < maxAttempts; attempt++ {
+				leaf.B = rng.Intn(len(feats.F))
 				if leaf.B == leaf.A {
-					leaf.B = (leaf.B + 1) % len(feats.F)
+					continue
 				}
+				if leaf.B < len(feats.Types) {
+					typeB := feats.Types[leaf.B]
+					if canCrossFeatures(typeA, typeB) {
+						found = true
+						break // Found compatible B
+					}
+				}
+			}
+			// FIX: If no compatible B found, fall back to Rising
+			if !found {
+				leaf.Kind = LeafRising
+				leaf.Lookback = 5 + rng.Intn(16)
 			}
 		}
 	case 2: // change kind
 		kinds := []LeafKind{LeafGT, LeafLT, LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
 		leaf.Kind = kinds[rng.Intn(len(kinds))]
-		// Ensure B is valid for cross leaves
+		// SANITY CHECK: For new cross leaves, ensure A and B are compatible
 		if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
-			if leaf.B == leaf.A || leaf.B >= len(feats.F) {
-				leaf.B = (leaf.A + 1) % len(feats.F)
+			if leaf.A >= len(feats.F) {
+				leaf.A = rng.Intn(len(feats.F))
+			}
+			var typeA FeatureType
+			if leaf.A < len(feats.Types) {
+				typeA = feats.Types[leaf.A]
+			}
+			// Find a compatible B
+			maxAttempts := 50
+			found := false
+			for attempt := 0; attempt < maxAttempts; attempt++ {
+				leaf.B = rng.Intn(len(feats.F))
 				if leaf.B == leaf.A {
-					leaf.B = (leaf.B + 1) % len(feats.F)
+					continue
 				}
+				if leaf.B < len(feats.Types) {
+					typeB := feats.Types[leaf.B]
+					if canCrossFeatures(typeA, typeB) {
+						found = true
+						break // Found compatible B
+					}
+				}
+			}
+			// FIX: If no compatible B found, fall back to Rising
+			if !found {
+				leaf.Kind = LeafRising
+				leaf.Lookback = 5 + rng.Intn(16)
 			}
 		}
 	case 3: // tweak lookback (skip for CrossUp/CrossDown)
@@ -401,6 +526,74 @@ func replaceRandomSubtree(rng *rand.Rand, root *RuleNode, replacement *RuleNode)
 	return root
 }
 
+// sanitizeCrossOperations walks the tree and fixes invalid CrossUp/CrossDown operations
+// Returns the number of invalid cross operations found and fixed
+func sanitizeCrossOperations(rng *rand.Rand, root *RuleNode, feats Features) int {
+	if root == nil {
+		return 0
+	}
+
+	fixedCount := 0
+
+	var walk func(node *RuleNode)
+	walk = func(node *RuleNode) {
+		if node == nil {
+			return
+		}
+
+		if node.Op == OpLeaf {
+			leaf := &node.Leaf
+			// Check CrossUp and CrossDown leaves
+			if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+				// Validate feature indices
+				if leaf.A < 0 || leaf.A >= len(feats.Types) || leaf.B < 0 || leaf.B >= len(feats.Types) {
+					// Invalid indices - change to a safe leaf kind (Rising/Falling)
+					leaf.Kind = LeafRising
+					leaf.Lookback = 5 + rng.Intn(10)
+					fixedCount++
+					return
+				}
+
+				typeA := feats.Types[leaf.A]
+				typeB := feats.Types[leaf.B]
+
+				// Check if types are compatible
+				if !canCrossFeatures(typeA, typeB) {
+					// Try to find a compatible B for feature A
+					maxAttempts := 30
+					found := false
+					for attempt := 0; attempt < maxAttempts; attempt++ {
+						newB := rng.Intn(len(feats.Types))
+						if newB == leaf.A {
+							continue
+						}
+						if canCrossFeatures(typeA, feats.Types[newB]) {
+							leaf.B = newB
+							found = true
+							break
+						}
+					}
+
+					if !found {
+						// Couldn't find compatible B - change to a safe leaf kind
+						leaf.Kind = LeafRising
+						leaf.Lookback = 5 + rng.Intn(10)
+					}
+					fixedCount++
+				}
+			}
+			return
+		}
+
+		// Recurse into children
+		walk(node.L)
+		walk(node.R)
+	}
+
+	walk(root)
+	return fixedCount
+}
+
 func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	child := parent
 	child.Seed = rng.Int63()
@@ -459,7 +652,20 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 		}
 	}
 
-	// Recompile rules after mutation
+	// SANITY CHECK: Fix any invalid CrossUp/CrossDown operations after mutation
+	// This prevents nonsense operations from surviving mutations
+	fixedEntry := sanitizeCrossOperations(rng, child.EntryRule.Root, feats)
+	fixedExit := sanitizeCrossOperations(rng, child.ExitRule.Root, feats)
+	fixedRegime := sanitizeCrossOperations(rng, child.RegimeFilter.Root, feats)
+
+	// Track total fixes for debugging
+	totalFixed := fixedEntry + fixedExit + fixedRegime
+	if totalFixed > 0 {
+		// Increment counter for debugging
+		// (Note: we don't reject here, we fix - but tracking helps identify issues)
+	}
+
+	// Recompile rules after mutation and sanitization
 	child.EntryCompiled = compileRuleTree(child.EntryRule.Root)
 	child.ExitCompiled = compileRuleTree(child.ExitRule.Root)
 	child.RegimeCompiled = compileRuleTree(child.RegimeFilter.Root)
@@ -467,7 +673,7 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	return child
 }
 
-func crossover(rng *rand.Rand, a, b Strategy) Strategy {
+func crossover(rng *rand.Rand, a, b Strategy, feats Features) Strategy {
 	child := a
 	child.Seed = rng.Int63()
 
@@ -505,7 +711,13 @@ func crossover(rng *rand.Rand, a, b Strategy) Strategy {
 		child.Trail = b.Trail
 	}
 
-	// Recompile rules after crossover
+	// SANITY CHECK: Fix any invalid CrossUp/CrossDown operations after crossover
+	// This prevents nonsense operations from surviving crossover
+	sanitizeCrossOperations(rng, child.EntryRule.Root, feats)
+	sanitizeCrossOperations(rng, child.ExitRule.Root, feats)
+	sanitizeCrossOperations(rng, child.RegimeFilter.Root, feats)
+
+	// Recompile rules after crossover and sanitization
 	child.EntryCompiled = compileRuleTree(child.EntryRule.Root)
 	child.ExitCompiled = compileRuleTree(child.ExitRule.Root)
 	child.RegimeCompiled = compileRuleTree(child.RegimeFilter.Root)
@@ -607,7 +819,13 @@ func bigMutation(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 		}
 	}
 
-	// Recompile rules after big mutation
+	// SANITY CHECK: Fix any invalid CrossUp/CrossDown operations after big mutation
+	// This prevents nonsense operations from surviving big mutations
+	sanitizeCrossOperations(rng, child.EntryRule.Root, feats)
+	sanitizeCrossOperations(rng, child.ExitRule.Root, feats)
+	sanitizeCrossOperations(rng, child.RegimeFilter.Root, feats)
+
+	// Recompile rules after big mutation and sanitization
 	child.EntryCompiled = compileRuleTree(child.EntryRule.Root)
 	child.ExitCompiled = compileRuleTree(child.ExitRule.Root)
 	child.RegimeCompiled = compileRuleTree(child.RegimeFilter.Root)

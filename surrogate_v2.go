@@ -92,50 +92,32 @@ func (m *SurrogateV2) AddScore(score float32) {
 func (m *SurrogateV2) GetAcceptThreshold() float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	if len(m.recentScores) < 10 {
-		// Not enough data - use permissive threshold
-		return -1.0
-	}
-
-	// Copy and sort scores
-	sorted := make([]float64, len(m.recentScores))
-	copy(sorted, m.recentScores)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] > sorted[j] })
-
-	// Find percentile
-	percentileIdx := int(float64(len(sorted)) * (1.0 - m.acceptPercentile))
-	if percentileIdx >= len(sorted) {
-		percentileIdx = len(sorted) - 1
-	}
-	if percentileIdx < 0 {
-		percentileIdx = 0
-	}
-
-	return sorted[percentileIdx]
+	return m.computeThresholdUnsafe()
 }
 
 // AcceptRankBased checks if strategy passes rank-based filter
 func (m *SurrogateV2) AcceptRankBased(x []float64) bool {
-	// Get threshold before locking to avoid deadlock
-	m.mu.Lock()
-	threshold := m.getAcceptThresholdNoLock()
-	m.mu.Unlock()
-
-	// Epsilon-greedy exploration
+	// Epsilon-greedy exploration (checked before lock for performance)
 	if m.rng.Float64() < m.exploreP {
 		return true
 	}
 
-	// Check prediction
+	// Acquire lock once for entire operation to prevent race condition
+	// FIX: Previously called getAcceptThresholdNoLock() with a lock, then
+	// released and re-acquired, creating a race window. Now do all work
+	// under a single lock to ensure atomicity.
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Compute threshold and prediction under same lock for consistency
+	threshold := m.computeThresholdUnsafe()
 	pred := m.scoreNoLock(x)
 	return pred >= threshold
 }
 
-// getAcceptThresholdNoLock computes rank-based acceptance threshold without locking
-func (m *SurrogateV2) getAcceptThresholdNoLock() float64 {
+// computeThresholdUnsafe computes rank-based acceptance threshold without locking
+// CRITICAL: This function must be called while holding m.mu.Lock() to prevent races
+func (m *SurrogateV2) computeThresholdUnsafe() float64 {
 	if len(m.recentScores) < 10 {
 		// Not enough data - use permissive threshold
 		return -1.0

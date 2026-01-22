@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"strings"
 	"sync/atomic"
@@ -24,6 +25,7 @@ func isHighFrequencyFeature(name string) bool {
 }
 
 // randomFeatureIndex selects a random feature, preferring high-frequency ones
+// During bootstrap/recovery mode, heavily weights toward high-frequency features to reduce dead strategies
 func randomFeatureIndex(rng *rand.Rand, feats Features) int {
 	// Build list of high-frequency feature indices
 	highFreqIndices := make([]int, 0, len(feats.Names)/2)
@@ -33,8 +35,14 @@ func randomFeatureIndex(rng *rand.Rand, feats Features) int {
 		}
 	}
 
-	// 70% chance to pick from high-frequency features, 30% from all features
-	if len(highFreqIndices) > 0 && rng.Float32() < 0.70 {
+	// During bootstrap/recovery: 85% chance to pick from high-frequency features
+	// Normal mode: 70% chance to pick from high-frequency features
+	highFreqProb := float32(0.70)
+	if RecoveryMode.Load() || isBootstrapMode() {
+		highFreqProb = 0.85 // Stronger preference during bootstrap/recovery
+	}
+
+	if len(highFreqIndices) > 0 && rng.Float32() < highFreqProb {
 		return highFreqIndices[rng.Intn(len(highFreqIndices))]
 	}
 	return rng.Intn(len(feats.F))
@@ -156,6 +164,22 @@ type Leaf struct {
 	Lookback int
 }
 
+// LeafProof provides mathematical proof of leaf evaluation to demonstrate no lookahead bias
+type LeafProof struct {
+	Kind          string     // "CrossUp", "Rising", "SlopeGT", etc.
+	Operator      string     // The actual operator used
+	FeatureA      string     // Feature name
+	FeatureB      string     // For Cross operators
+	BarIndex      int        // Current bar t
+	Values        []float64  // All values used in computation
+	Comparisons   []string   // Step-by-step comparison results
+	GuardChecks   []string   // t>=1, t>=lookback, NaN checks, eps checks
+	ComputedSlope float64    // For SlopeGT/SlopeLT
+	Threshold     float64    // X value compared against
+	Result        bool       // Final result (matches returned bool)
+	LeafNode      Leaf       // Original leaf node for bytecode re-evaluation
+}
+
 type RuleNode struct {
 	Op   Op
 	Leaf Leaf
@@ -199,6 +223,7 @@ type Strategy struct {
 	MaxHoldBars     int // time-based exit: max bars to hold a position
 	MaxConsecLosses int // busted trades protection: stop after N consecutive losses
 	CooldownBars    int // optional: pause after busted streak (0 = no cooldown, stop completely)
+	FeatureMapHash  string // Fingerprint of feature ordering when strategy was created
 }
 
 // Fingerprint creates a unique string representation of the strategy (excluding seed)
@@ -210,7 +235,9 @@ func (s Strategy) Fingerprint() string {
 		stopModelToString(s.StopLoss) + "|" +
 		tpModelToString(s.TakeProfit) + "|" +
 		trailModelToString(s.Trail) + "|" +
-		fmt.Sprintf("hold=%d|loss=%d|cd=%d", s.MaxHoldBars, s.MaxConsecLosses, s.CooldownBars)
+		fmt.Sprintf("hold=%d|loss=%d|cd=%d", s.MaxHoldBars, s.MaxConsecLosses, s.CooldownBars) +
+		includeRiskParams(s) + "|" +
+		s.FeatureMapHash
 }
 
 // SkeletonFingerprint creates a structure-only fingerprint (ignores numeric thresholds)
@@ -222,7 +249,46 @@ func (s Strategy) SkeletonFingerprint() string {
 		stopModelToSkeleton(s.StopLoss) + "|" +
 		tpModelToSkeleton(s.TakeProfit) + "|" +
 		trailModelToSkeleton(s.Trail) + "|" +
-		fmt.Sprintf("hold|loss|cd")
+		fmt.Sprintf("hold|loss|cd") +
+		"|dir=" + fmt.Sprint(s.Direction)
+}
+
+// CoarseFingerprint creates a fingerprint with coarse threshold buckets
+// This reduces duplicates by bucketing similar thresholds together
+// More granular than SkeletonFingerprint (which ignores thresholds entirely)
+// Less granular than Fingerprint() (which uses exact values)
+func (s Strategy) CoarseFingerprint() string {
+	return ruleTreeToCoarse(s.EntryRule.Root) + "|" +
+		ruleTreeToCoarse(s.ExitRule.Root) + "|" +
+		ruleTreeToCoarse(s.RegimeFilter.Root) + "|" +
+		stopModelToCoarse(s.StopLoss) + "|" +
+		tpModelToCoarse(s.TakeProfit) + "|" +
+		trailModelToCoarse(s.Trail) + "|" +
+		fmt.Sprintf("hold=%d|loss=%d|cd=%d",
+			coarseInt(s.MaxHoldBars, 50),   // Bucket by 50
+			coarseInt(s.MaxConsecLosses, 2), // Bucket by 2
+			coarseInt(s.CooldownBars, 10)) + // Bucket by 10
+		"|dir=" + fmt.Sprint(s.Direction) +
+		"|fees=" + fmt.Sprintf("%.0f", math.Floor(float64(s.FeeBps))) +
+		"|slip=" + fmt.Sprintf("%.0f", math.Floor(float64(s.SlippageBps))) +
+		"|" + s.FeatureMapHash
+}
+
+// coarseInt buckets an integer into coarse ranges
+func coarseInt(val, bucket int) int {
+	if bucket <= 0 {
+		return val
+	}
+	return (val / bucket) * bucket
+}
+
+// includeRiskParams returns a string fragment with risk parameters for fingerprints
+// Quantizes floats to 4 decimal places to avoid "same but formatted different"
+func includeRiskParams(st Strategy) string {
+	feeQ := math.Floor(float64(st.FeeBps)*10000) / 10000
+	slipQ := math.Floor(float64(st.SlippageBps)*10000) / 10000
+	riskQ := math.Floor(float64(st.RiskPct)*10000) / 10000
+	return fmt.Sprintf("|fees=%.4f|slip=%.4f|risk=%.4f|dir=%d", feeQ, slipQ, riskQ, st.Direction)
 }
 
 type RuleTree struct {
@@ -244,6 +310,158 @@ func setBootstrapMode(enabled bool) {
 	} else {
 		atomic.StoreInt32(&globalBootstrapMode, 0)
 	}
+}
+
+// FeatureCategory groups feature types for complexity validation
+type FeatureCategory uint8
+
+const (
+	CatPriceMarket FeatureCategory = iota // PriceLevel, Oscillator, Momentum
+	CatVolumeVolatility                   // Volume, ATR
+	CatOther                              // ZScore, Normalized, EventFlag, etc.
+)
+
+// getFeatureCategory returns the category group for a feature type
+func getFeatureCategory(featType FeatureType) FeatureCategory {
+	switch featType {
+	case FeatTypePriceLevel, FeatTypeOscillator, FeatTypeMomentum:
+		return CatPriceMarket
+	case FeatTypeVolume, FeatTypeATR:
+		return CatVolumeVolatility
+	default:
+		return CatOther
+	}
+}
+
+// getRuleFeatureCategories returns the set of feature categories used in a rule tree
+func getRuleFeatureCategories(node *RuleNode, feats Features) map[FeatureCategory]bool {
+	categories := make(map[FeatureCategory]bool)
+	if node == nil {
+		return categories
+	}
+
+	if node.Op == OpLeaf {
+		// Add category for feature A
+		if node.Leaf.A >= 0 && node.Leaf.A < len(feats.Types) {
+			cat := getFeatureCategory(feats.Types[node.Leaf.A])
+			categories[cat] = true
+		}
+		// For Cross leaves, also check feature B
+		if (node.Leaf.Kind == LeafCrossUp || node.Leaf.Kind == LeafCrossDown) &&
+			node.Leaf.B >= 0 && node.Leaf.B < len(feats.Types) {
+			cat := getFeatureCategory(feats.Types[node.Leaf.B])
+			categories[cat] = true
+		}
+		return categories
+	}
+
+	// Recursively collect categories from children
+	leftCats := getRuleFeatureCategories(node.L, feats)
+	rightCats := getRuleFeatureCategories(node.R, feats)
+
+	for cat := range leftCats {
+		categories[cat] = true
+	}
+	for cat := range rightCats {
+		categories[cat] = true
+	}
+
+	return categories
+}
+
+// hasMinimumComplexity checks if an entry rule has minimum required complexity
+// Requires at least one Price/Market condition AND one Volume/Volatility condition
+// Rejects volume-only entries like "AbsGT VolSMA50 X"
+func hasMinimumComplexity(node *RuleNode, feats Features) bool {
+	categories := getRuleFeatureCategories(node, feats)
+
+	hasPriceMarket := categories[CatPriceMarket]
+	hasVolumeVolatility := categories[CatVolumeVolatility]
+
+	// Must have BOTH price/market AND volume/volatility features
+	return hasPriceMarket && hasVolumeVolatility
+}
+
+// addMissingFeatureCategory adds a leaf with the required feature category to the tree
+// Returns true if successful, false otherwise
+func addMissingFeatureCategory(node *RuleNode, rng *rand.Rand, feats Features, requiredCat FeatureCategory) bool {
+	if node == nil {
+		return false
+	}
+
+	if node.Op == OpLeaf {
+		// Replace this leaf with one that uses the required category
+		newLeaf := randomLeaf(rng, feats)
+		// Build list of features with required category
+		candidateIndices := make([]int, 0)
+		for i, featType := range feats.Types {
+			if getFeatureCategory(featType) == requiredCat {
+				candidateIndices = append(candidateIndices, i)
+			}
+		}
+		if len(candidateIndices) > 0 {
+			newLeaf.A = candidateIndices[rng.Intn(len(candidateIndices))]
+			// For Cross leaves, also ensure B is from the same category
+			if newLeaf.Kind == LeafCrossUp || newLeaf.Kind == LeafCrossDown {
+				newLeaf.B = candidateIndices[rng.Intn(len(candidateIndices))]
+			}
+			node.Leaf = newLeaf
+			return true
+		}
+		return false
+	}
+
+	// Try left child first, then right
+	if addMissingFeatureCategory(node.L, rng, feats, requiredCat) {
+		return true
+	}
+	if addMissingFeatureCategory(node.R, rng, feats, requiredCat) {
+		return true
+	}
+	return false
+}
+
+// maxLookback computes the maximum lookback required by a rule tree
+// This is the maximum lookback of any leaf in the tree
+func maxLookback(node *RuleNode) int {
+	if node == nil {
+		return 0
+	}
+
+	if node.Op == OpLeaf {
+		return node.Leaf.Lookback
+	}
+
+	leftLB := maxLookback(node.L)
+	rightLB := maxLookback(node.R)
+
+	if leftLB > rightLB {
+		return leftLB
+	}
+	return rightLB
+}
+
+// computeWarmup computes the warmup period needed for a strategy
+// This is the maximum lookback of entry, exit, and regime rules
+func computeWarmup(st Strategy) int {
+	entryLB := maxLookback(st.EntryRule.Root)
+	exitLB := maxLookback(st.ExitRule.Root)
+	regimeLB := maxLookback(st.RegimeFilter.Root)
+
+	warmup := entryLB
+	if exitLB > warmup {
+		warmup = exitLB
+	}
+	if regimeLB > warmup {
+		warmup = regimeLB
+	}
+
+	// Minimum warmup of 10 bars to ensure indicators have some history
+	if warmup < 10 {
+		warmup = 10
+	}
+
+	return warmup
 }
 
 func randomStrategy(rng *rand.Rand, feats Features) Strategy {
@@ -316,13 +534,13 @@ func replaceOneLeafWithHighFrequency(node *RuleNode, rng *rand.Rand, feats Featu
 // randomEntryRuleNode generates an entry rule with constrained tree shape
 // to prevent "always true" strategies. Rules:
 // 1. Root must be AND (not OR)
-// 2. OR operators are limited to 1 per tree
+// 2. OR operators are limited to 3 per tree
 // 3. This forces selectivity and prevents easy OR(...) where one side is always true
-func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, orCount *int) *RuleNode {
+func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, entryOrCount *int) *RuleNode {
 	if depth >= maxDepth || rng.Float32() < 0.3 {
 		return &RuleNode{
 			Op:   OpLeaf,
-			Leaf: randomLeaf(rng, feats),
+			Leaf: randomEntryLeaf(rng, feats),
 		}
 	}
 
@@ -333,25 +551,25 @@ func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, or
 	// NOT has 10% probability when not at leaf level
 	if randOp < 0.10 {
 		op = OpNot
-	} else if randOp < 0.40 && *orCount < 1 {
-		// Only allow OR if we haven't used it yet (30% chance)
+	} else if randOp < 0.40 && *entryOrCount < 3 {
+		// Allow up to 3 ORs per entry rule
 		op = OpOr
-		*orCount++
+		*entryOrCount++
 	}
 
 	if op == OpNot {
 		// NOT has only one child (Left), Right stays empty
 		return &RuleNode{
 			Op: op,
-			L:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, orCount),
+			L:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount),
 			R:  nil,
 		}
 	}
 
 	return &RuleNode{
 		Op: op,
-		L:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, orCount),
-		R:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, orCount),
+		L:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount),
+		R:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount),
 	}
 }
 
@@ -360,14 +578,98 @@ func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, or
 func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps float32) Strategy {
 	// Entry rule: use constrained generation to prevent "always true" strategies
 	// Root must be AND, and OR count is limited to 1
-	orCount := 0
-	entryRoot := randomEntryRuleNode(rng, feats, 0, 4, &orCount)
+
+	// RECOVERY MODE: Define helper functions for constraint validation
+	// Defined ONCE outside the attempts loop for efficiency
+	var countSparseFeatures func(n *RuleNode) int
+	var checkNOTDepth func(n *RuleNode, depth int) bool
+
+	if RecoveryMode.Load() {
+		// Helper: count sparse features (SwingHigh, SwingLow, BOS, FVG are sparse)
+		// Sparse features produce few trading signals, leading to dead strategies
+		countSparseFeatures = func(n *RuleNode) int {
+			if n == nil {
+				return 0
+			}
+			if n.Op == OpLeaf {
+				featName := feats.Names[n.Leaf.A]
+				sparsePrefixes := []string{"Swing", "BOS", "FVG", "Breakout"}
+				for _, prefix := range sparsePrefixes {
+					if strings.HasPrefix(featName, prefix) {
+						return 1
+					}
+				}
+				return 0
+			}
+			return countSparseFeatures(n.L) + countSparseFeatures(n.R)
+		}
+
+		// Helper: check NOT nesting (allow NOT at root, but NOT(NOT(...)) is rejected)
+		// Deeply nested NOTs create overly restrictive rules that rarely trigger
+		checkNOTDepth = func(n *RuleNode, depth int) bool {
+			if n == nil {
+				return true
+			}
+			if n.Op == OpNot {
+				if depth >= 1 { // Reject NOT(NOT(...)) patterns
+					return false
+				}
+				return checkNOTDepth(n.L, depth+1)
+			}
+			return checkNOTDepth(n.L, depth) && checkNOTDepth(n.R, depth)
+		}
+	}
+
+	var entryRoot *RuleNode
+
+	if RecoveryMode.Load() {
+		// Recovery mode: bounded loop to find a rule that passes constraints
+		for attempts := 0; attempts < 50; attempts++ {
+			entryOrCount := 0
+			entryRoot = randomEntryRuleNode(rng, feats, 0, 4, &entryOrCount)
+
+			// Validate sparse feature constraint
+			sparseCount := countSparseFeatures(entryRoot)
+			if sparseCount > 1 {
+				continue // Too many sparse features, try again
+			}
+
+			// Validate NOT nesting constraint
+			if !checkNOTDepth(entryRoot, 0) {
+				continue // NOT nesting too deep, try again
+			}
+
+			// All constraints passed - break and use this rule
+			break
+		}
+		// If we exhausted attempts, we use the last generated rule (fallback)
+	} else {
+		// Normal mode: original generation
+		entryOrCount := 0
+		entryRoot = randomEntryRuleNode(rng, feats, 0, 4, &entryOrCount)
+	}
 
 	// CRITICAL: Ensure entry rule contains at least one high-frequency primitive
 	// to avoid "rare by construction" strategies that never trigger
 	if !hasHighFrequencyPrimitive(entryRoot, feats) {
 		replaceOneLeafWithHighFrequency(entryRoot, rng, feats)
 	}
+
+	// CRITICAL FIX #6: Enforce minimum complexity for entry rules
+	// Require at least one Price/Market feature AND one Volume/Volatility feature
+	// This prevents volume-only junk strategies like "AbsGT VolSMA50 X"
+	if !hasMinimumComplexity(entryRoot, feats) {
+		categories := getRuleFeatureCategories(entryRoot, feats)
+		if !categories[CatPriceMarket] {
+			// Add a price/market feature
+			addMissingFeatureCategory(entryRoot, rng, feats, CatPriceMarket)
+		}
+		if !categories[CatVolumeVolatility] {
+			// Add a volume/volatility feature
+			addMissingFeatureCategory(entryRoot, rng, feats, CatVolumeVolatility)
+		}
+	}
+
 	exitRoot := randomRuleNode(rng, feats, 0, 3)
 
 	// Regime filter: 65% chance of having a regime filter (reduced from 85%)
@@ -387,6 +689,13 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 	} else {
 		direction = -1 // short-only
 	}
+
+	// TREND ALIGNMENT: Ensure entry has trend guard for direction
+	// This adds EMA50/EMA200 cross to align entries with the trend, reducing bad entries
+	ensureTrendGuard(entryRoot, direction, feats, rng)
+
+	// FORCE TRIGGER: Ensure at least one trigger leaf to prevent entry_rate_dead
+	ensureTriggerLeaf(entryRoot, rng, feats)
 
 	s := Strategy{
 		Seed:            rng.Int63(),
@@ -467,6 +776,136 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 	return s
 }
 
+// isAbsoluteThresholdKind returns true if the leaf kind uses absolute thresholds
+// CRITICAL FIX #7: PriceLevel features (EMA, BB, Swing) should NOT use absolute thresholds
+// because BTC price scale changes massively from 2017→2026
+func isAbsoluteThresholdKind(kind LeafKind) bool {
+	switch kind {
+	case LeafGT, LeafLT, LeafBetween, LeafAbsGT, LeafAbsLT:
+		return true
+	default:
+		return false
+	}
+}
+
+// isTriggerKind returns true if the leaf kind is a trigger (Cross, Rising, Falling)
+// These are safe for PriceLevel features because they don't use absolute price thresholds
+func isTriggerKind(kind LeafKind) bool {
+	switch kind {
+	case LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling:
+		return true
+	default:
+		return false
+	}
+}
+
+// findFeatureIndexByContains finds feature index by substring search
+func findFeatureIndexByContains(feats Features, substr string) int {
+	for i, name := range feats.Names {
+		if strings.Contains(name, substr) {
+			return i
+		}
+	}
+	return -1
+}
+
+// treeHasTrendGuard checks if tree contains EMA cross for direction
+func treeHasTrendGuard(node *RuleNode, dir int, ema50, ema200 int) bool {
+	if node == nil {
+		return false
+	}
+	if node.Op == OpLeaf {
+		if dir == 1 {
+			return node.Leaf.Kind == LeafCrossUp && node.Leaf.A == ema50 && node.Leaf.B == ema200
+		}
+		return node.Leaf.Kind == LeafCrossDown && node.Leaf.A == ema50 && node.Leaf.B == ema200
+	}
+	return treeHasTrendGuard(node.L, dir, ema50, ema200) ||
+		treeHasTrendGuard(node.R, dir, ema50, ema200)
+}
+
+// replaceRandomLeaf replaces a random leaf in the tree
+func replaceRandomLeaf(root *RuleNode, rng *rand.Rand, replacement Leaf) {
+	if root == nil {
+		return
+	}
+
+	var walk func(node *RuleNode) bool
+	walk = func(node *RuleNode) bool {
+		if node == nil {
+			return false
+		}
+		if node.Op == OpLeaf {
+			// Replace this leaf
+			node.Leaf = replacement
+			return true
+		}
+		// Randomly try left or right first
+		if rng.Float32() < 0.5 {
+			if walk(node.L) {
+				return true
+			}
+			return walk(node.R)
+		} else {
+			if walk(node.R) {
+				return true
+			}
+			return walk(node.L)
+		}
+	}
+	walk(root)
+}
+
+// ensureTrendGuard adds EMA cross trend guard if missing
+func ensureTrendGuard(root *RuleNode, dir int, feats Features, rng *rand.Rand) {
+	ema200 := findFeatureIndexByContains(feats, "EMA200")
+	ema50 := findFeatureIndexByContains(feats, "EMA50")
+	if ema200 < 0 || ema50 < 0 {
+		return // Features not available
+	}
+
+	if treeHasTrendGuard(root, dir, ema50, ema200) {
+		return // Already has trend guard
+	}
+
+	var guard Leaf
+	if dir == 1 {
+		guard = Leaf{Kind: LeafCrossUp, A: ema50, B: ema200}
+	} else {
+		guard = Leaf{Kind: LeafCrossDown, A: ema50, B: ema200}
+	}
+	replaceRandomLeaf(root, rng, guard)
+}
+
+// hasTriggerLeaf checks if tree contains any trigger leaf (Cross/Rising/Falling)
+func hasTriggerLeaf(node *RuleNode) bool {
+	if node == nil {
+		return false
+	}
+	if node.Op == OpLeaf {
+		switch node.Leaf.Kind {
+		case LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling:
+			return true
+		}
+		return false
+	}
+	return hasTriggerLeaf(node.L) || hasTriggerLeaf(node.R)
+}
+
+// ensureTriggerLeaf forces at least one trigger leaf in entry rule
+// This prevents "entry_rate_dead" rejections by ensuring strategy can trigger
+func ensureTriggerLeaf(root *RuleNode, rng *rand.Rand, feats Features) {
+	if hasTriggerLeaf(root) {
+		return // Already has trigger leaf
+	}
+	// Replace a random leaf with a trigger leaf
+	triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
+	triggerKind := triggerKinds[rng.Intn(len(triggerKinds))]
+	newLeaf := randomEntryLeaf(rng, feats)
+	newLeaf.Kind = triggerKind
+	replaceRandomLeaf(root, rng, newLeaf)
+}
+
 func randomRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int) *RuleNode {
 	if depth >= maxDepth || rng.Float32() < 0.3 {
 		return &RuleNode{
@@ -504,20 +943,65 @@ func randomRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int) *RuleNo
 func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 	// Prefer triggers (Cross, Rising, Falling) over simple thresholds to capture real moves
 	// 60% trigger leaves, 30% threshold leaves, 10% slope leaves
-	triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
-	thresholdKinds := []LeafKind{LeafGT, LeafLT, LeafBetween, LeafAbsGT, LeafAbsLT}
-	slopeKinds := []LeafKind{LeafSlopeGT, LeafSlopeLT}
-
 	var kind LeafKind
-	if len(feats.F) < 2 {
-		// No cross leaves possible - use threshold or rising/falling
-		kind = thresholdKinds[rng.Intn(len(thresholdKinds))]
-	} else if rng.Float32() < 0.60 {
-		kind = triggerKinds[rng.Intn(len(triggerKinds))]
-	} else if rng.Float32() < 0.90 {
-		kind = thresholdKinds[rng.Intn(len(thresholdKinds))]
+
+	// RECOVERY MODE + BOOTSTRAP MODE: Weight toward high-frequency operators to reduce dead strategies
+	// When population is empty or in recovery, we need strategies that actually trigger
+	if RecoveryMode.Load() || isBootstrapMode() {
+		// Bootstrap/Recovery mode: 80% high-freq (biased toward Cross/Between), 15% mid-freq, 5% rare
+		// Increased Cross/CrossDown/Between probability to improve entry rate hit rate
+		crossKinds := []LeafKind{
+			LeafCrossUp, LeafCrossDown, // Highest entry rate - trigger on price movement
+			LeafBetween,                // High entry rate - range-based trigger
+		}
+		highFreqKinds := []LeafKind{
+			LeafGT, LeafLT, // Simple comparisons
+		}
+		midFreqKinds := []LeafKind{
+			LeafRising, LeafFalling, // Trend-based (less frequent)
+		}
+		rareKinds := []LeafKind{
+			LeafAbsGT, LeafAbsLT,    // Rare by construction
+			LeafSlopeGT, LeafSlopeLT, // Trend-based, sparse
+		}
+
+		roll := rng.Float32()
+		if roll < 0.5 {
+			// 50% Cross/Between - highest entry rate operators
+			kind = crossKinds[rng.Intn(len(crossKinds))]
+		} else if roll < 0.8 {
+			// 30% GT/LT - simple comparisons
+			kind = highFreqKinds[rng.Intn(len(highFreqKinds))]
+		} else if roll < 0.95 {
+			// 15% Rising/Falling - trend-based
+			kind = midFreqKinds[rng.Intn(len(midFreqKinds))]
+		} else {
+			// 5% rare - reduced from 10%
+			kind = rareKinds[rng.Intn(len(rareKinds))]
+		}
 	} else {
-		kind = slopeKinds[rng.Intn(len(slopeKinds))]
+		// Normal mode: biased toward Cross/Between for better entry rate
+		crossKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafBetween}
+		triggerKinds := []LeafKind{LeafRising, LeafFalling}
+		thresholdKinds := []LeafKind{LeafGT, LeafLT, LeafAbsGT, LeafAbsLT}
+		slopeKinds := []LeafKind{LeafSlopeGT, LeafSlopeLT}
+
+		if len(feats.F) < 2 {
+			// No cross leaves possible - use threshold or rising/falling
+			kind = thresholdKinds[rng.Intn(len(thresholdKinds))]
+		} else if rng.Float32() < 0.45 {
+			// 45% Cross/Between - increased from 30% for better entry rate
+			kind = crossKinds[rng.Intn(len(crossKinds))]
+		} else if rng.Float32() < 0.65 {
+			// 20% Rising/Falling
+			kind = triggerKinds[rng.Intn(len(triggerKinds))]
+		} else if rng.Float32() < 0.90 {
+			// 25% threshold
+			kind = thresholdKinds[rng.Intn(len(thresholdKinds))]
+		} else {
+			// 10% slope
+			kind = slopeKinds[rng.Intn(len(slopeKinds))]
+		}
 	}
 
 	// Use smart feature selection that prefers high-frequency features
@@ -527,6 +1011,21 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 	featName := ""
 	if a < len(feats.Names) {
 		featName = feats.Names[a]
+	}
+
+	// CRITICAL FIX #7: Ban absolute price thresholds on PriceLevel features
+	// PriceLevel features (EMA*, BB_Upper/Lower*, SwingHigh/Low) should NOT use
+	// absolute thresholds because BTC price scale changes massively from 2017→2026
+	// Instead, force Cross/Rising/Falling comparisons (relative)
+	if a < len(feats.Types) && feats.Types[a] == FeatTypePriceLevel && isAbsoluteThresholdKind(kind) {
+		// Force a trigger kind instead (CrossUp, CrossDown, Rising, or Falling)
+		triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
+		if len(feats.F) < 2 {
+			// No cross leaves possible - use Rising or Falling
+			kind = triggerKinds[2+rng.Intn(2)] // Rising or Falling
+		} else {
+			kind = triggerKinds[rng.Intn(len(triggerKinds))]
+		}
 	}
 
 	var b int
@@ -543,6 +1042,7 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 			typeA = feats.Types[a]
 		}
 		maxAttempts := 100
+		found := false
 		for attempt := 0; attempt < maxAttempts; attempt++ {
 			b = rng.Intn(len(feats.F))
 			if b == a {
@@ -552,16 +1052,18 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 			if b < len(feats.Types) {
 				typeB := feats.Types[b]
 				if canCrossFeatures(typeA, typeB) {
-					break // Found compatible B
+					found = true
+					break
 				}
-			} else if typeA == FeatTypeUnknown {
-				// If typeA is unknown, allow crossing with unknown typeB
-				break
 			}
-			// If we've tried many times, give up and use the last one
-			if attempt == maxAttempts-1 {
-				break
-			}
+		}
+		// FIX: If no compatible B found, fall back to Rising instead of using incompatible B
+		if !found {
+			kind = LeafRising
+			lookback = 5 + rng.Intn(16)
+			b = a // Not used for Rising
+			threshold = 0
+			break // Skip the default setup below
 		}
 		lookback = 0  // Cross leaves don't use lookback
 		threshold = 0 // Cross leaves don't use threshold
@@ -685,6 +1187,65 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 		Y:        leafY,
 		Lookback: lookback,
 	}
+}
+
+// randomEntryLeaf generates leaves biased toward high entry rate operators
+// 70% triggers (Cross/Rising/Falling), 25% thresholds (near mean), 5% slopes
+func randomEntryLeaf(rng *rand.Rand, feats Features) Leaf {
+	// Trigger kinds produce more entry edges
+	triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
+	thresholdKinds := []LeafKind{LeafGT, LeafLT, LeafBetween}
+	slopeKinds := []LeafKind{LeafSlopeGT, LeafSlopeLT}
+
+	var kind LeafKind
+	p := rng.Float32()
+	switch {
+	case p < 0.70:
+		kind = triggerKinds[rng.Intn(len(triggerKinds))]
+	case p < 0.95:
+		kind = thresholdKinds[rng.Intn(len(thresholdKinds))]
+	default:
+		kind = slopeKinds[rng.Intn(len(slopeKinds))]
+	}
+
+	a := randomFeatureIndex(rng, feats)
+	featName := ""
+	if a < len(feats.Names) {
+		featName = feats.Names[a]
+	}
+
+	leaf := Leaf{Kind: kind, A: a, B: a}
+
+	// Shorter lookback for Rising/Falling -> more edges
+	switch kind {
+	case LeafRising, LeafFalling:
+		leaf.Lookback = 3 + rng.Intn(10) // 3-12 (shorter than normal 5-20)
+		return leaf
+	}
+
+	// For thresholds: use "near mean" instead of extreme quantiles
+	if a < len(feats.Stats) {
+		st := feats.Stats[a]
+		if st.Std > 0 {
+			k := (rng.Float32()*1.2 - 0.6) // -0.6 to +0.6 sigma (centered)
+			leaf.X = st.Mean + k*st.Std
+			if kind == LeafBetween {
+				leaf.Y = leaf.X + rng.Float32()*0.5*st.Std // Small band
+			}
+			leaf.X = clampThresholdByFeature(leaf.X, featName)
+			leaf.Y = clampThresholdByFeature(leaf.Y, featName)
+		}
+	}
+
+	// For Cross operations: delegate to randomLeaf for compatibility
+	if kind == LeafCrossUp || kind == LeafCrossDown {
+		tmp := randomLeaf(rng, feats)
+		tmp.Kind = kind
+		tmp.A = a
+		leaf = tmp
+	}
+
+	return leaf
 }
 
 func randomStopModel(rng *rand.Rand) StopModel {
@@ -892,6 +1453,144 @@ func trailModelToSkeleton(tm TrailModel) string {
 	}
 }
 
+// Coarse helper functions - bucket numeric thresholds into ranges
+// This reduces duplicates while providing more discrimination than skeleton-only
+
+func ruleTreeToCoarse(node *RuleNode) string {
+	if node == nil {
+		return ""
+	}
+
+	if node.Op == OpLeaf {
+		return leafToCoarse(&node.Leaf)
+	}
+
+	leftStr := ruleTreeToCoarse(node.L)
+	rightStr := ruleTreeToCoarse(node.R)
+
+	switch node.Op {
+	case OpAnd:
+		return "(AND " + leftStr + " " + rightStr + ")"
+	case OpOr:
+		return "(OR " + leftStr + " " + rightStr + ")"
+	case OpNot:
+		return "(NOT " + leftStr + ")"
+	default:
+		return ""
+	}
+}
+
+func leafToCoarse(leaf *Leaf) string {
+	kindNames := map[LeafKind]string{
+		LeafGT:        "GT",
+		LeafLT:        "LT",
+		LeafCrossUp:   "CrossUp",
+		LeafCrossDown: "CrossDown",
+		LeafRising:    "Rising",
+		LeafFalling:   "Falling",
+		LeafBetween:   "Between",
+		LeafAbsGT:     "AbsGT",
+		LeafAbsLT:     "AbsLT",
+		LeafSlopeGT:   "SlopeGT",
+		LeafSlopeLT:   "SlopeLT",
+	}
+	kindName := kindNames[leaf.Kind]
+
+	// Include feature IDs + bucketed thresholds
+	// Threshold bucket: use adaptive bucketing (0.1 for small values, 5.0 for large)
+	// Lookback bucket: round to nearest 5 bars
+	switch leaf.Kind {
+	case LeafGT, LeafLT, LeafAbsGT, LeafAbsLT:
+		threshBucket := adaptiveCoarseFloat32(leaf.X)
+		return "(" + kindName + " F[" + fmt.Sprint(leaf.A) + " " + fmt.Sprint(threshBucket) + ")"
+	case LeafBetween:
+		t1Bucket := adaptiveCoarseFloat32(leaf.X)
+		t2Bucket := adaptiveCoarseFloat32(leaf.Y)
+		return "(" + kindName + " F[" + fmt.Sprint(leaf.A) + " " + fmt.Sprint(t1Bucket) + " " + fmt.Sprint(t2Bucket) + ")"
+	case LeafSlopeGT, LeafSlopeLT:
+		threshBucket := coarseFloat32(leaf.X, 0.01) // Slope is small, bucket by 0.01
+		lbBucket := coarseInt(leaf.Lookback, 5)     // Lookback bucket by 5
+		return "(" + kindName + " F[" + fmt.Sprint(leaf.A) + " " + fmt.Sprint(threshBucket) + " LB=" + fmt.Sprint(lbBucket) + ")"
+	case LeafCrossUp, LeafCrossDown:
+		return "(" + kindName + " F[" + fmt.Sprint(leaf.A) + "] F[" + fmt.Sprint(leaf.B) + "])"
+	case LeafRising, LeafFalling:
+		lbBucket := coarseInt(leaf.Lookback, 5) // Lookback bucket by 5
+		return "(" + kindName + " F[" + fmt.Sprint(leaf.A) + "] LB=" + fmt.Sprint(lbBucket) + ")"
+	default:
+		return "(" + kindName + " F[" + fmt.Sprint(leaf.A) + "])"
+	}
+}
+
+// coarseFloat32 buckets a float32 into coarse ranges
+func coarseFloat32(val float32, bucket float32) float32 {
+	if bucket <= 0 {
+		return val
+	}
+	return float32(int(val/bucket)) * bucket
+}
+
+// adaptiveCoarseFloat32 buckets a float32 with adaptive bucket size
+// For small values (|x| < 10): use 0.1 bucket for better precision
+// For large values (|x| >= 10): use 5.0 bucket to group similar values
+// This reduces false "seen" collisions while still grouping similar strategies
+func adaptiveCoarseFloat32(val float32) float32 {
+	if val < 0 {
+		val = -val
+	}
+	if val < 10 {
+		// Small values: use 0.1 bucket for fine-grained discrimination
+		return float32(int(val*10)) / 10
+	}
+	// Large values: use 5.0 bucket to group similar thresholds
+	return float32(int(val/5)) * 5
+}
+
+func stopModelToCoarse(sm StopModel) string {
+	// Keep kind + bucketed numeric values
+	switch sm.Kind {
+	case "fixed":
+		pctBucket := coarseFloat32(sm.Value, 0.01) // Bucket by 1%
+		return "Fixed_" + fmt.Sprint(pctBucket)
+	case "atr":
+		multBucket := coarseFloat32(sm.ATRMult, 0.5) // Bucket by 0.5x ATR
+		return "ATR_" + fmt.Sprint(multBucket)
+	case "swing":
+		return "Swing"
+	default:
+		return sm.Kind
+	}
+}
+
+func tpModelToCoarse(tp TPModel) string {
+	// Keep kind + bucketed numeric values
+	switch tp.Kind {
+	case "fixed":
+		pctBucket := coarseFloat32(tp.Value, 0.01) // Bucket by 1%
+		return "Fixed_" + fmt.Sprint(pctBucket)
+	case "atr":
+		multBucket := coarseFloat32(tp.ATRMult, 0.5) // Bucket by 0.5x ATR
+		return "ATR_" + fmt.Sprint(multBucket)
+	default:
+		return tp.Kind
+	}
+}
+
+func trailModelToCoarse(tm TrailModel) string {
+	if !tm.Active {
+		return "none"
+	}
+	// Keep kind + bucketed numeric values
+	switch tm.Kind {
+	case "atr":
+		multBucket := coarseFloat32(tm.ATRMult, 0.5) // Bucket by 0.5x ATR
+		return "ATR_" + fmt.Sprint(multBucket)
+	case "swing":
+		return "swing"
+	default:
+		return tm.Kind
+	}
+}
+
 func evaluateRule(rule *RuleNode, features [][]float32, t int) bool {
 	if rule == nil {
 		return true // nil rule = no filter = allow (consistent with empty compiled code)
@@ -917,39 +1616,127 @@ func evaluateRule(rule *RuleNode, features [][]float32, t int) bool {
 }
 
 func evaluateLeaf(leaf *Leaf, features [][]float32, t int) bool {
+	result, _ := evaluateLeafWithProof(leaf, features, nil, t)
+	return result
+}
+
+// evaluateLeafWithProof returns both the boolean result and mathematical proof
+// The feats parameter is optional (used for feature names in proof)
+func evaluateLeafWithProof(leaf *Leaf, features [][]float32, feats *Features, t int) (bool, LeafProof) {
+	proof := LeafProof{
+		BarIndex: t,
+		GuardChecks: []string{},
+		Values: []float64{},
+		Comparisons: []string{},
+		LeafNode: *leaf, // Store original leaf for bytecode re-evaluation
+	}
+
+	// Map LeafKind to string
+	kindNames := map[LeafKind]string{
+		LeafGT:        "GT",
+		LeafLT:        "LT",
+		LeafCrossUp:   "CrossUp",
+		LeafCrossDown: "CrossDown",
+		LeafRising:    "Rising",
+		LeafFalling:   "Falling",
+		LeafBetween:   "Between",
+		LeafAbsGT:     "AbsGT",
+		LeafAbsLT:     "AbsLT",
+		LeafSlopeGT:   "SlopeGT",
+		LeafSlopeLT:   "SlopeLT",
+	}
+	proof.Kind = kindNames[leaf.Kind]
+
+	// Get feature names if available
+	getFeatName := func(idx int) string {
+		if feats != nil && idx >= 0 && idx < len(feats.Names) {
+			return feats.Names[idx]
+		}
+		return fmt.Sprintf("F[%d]", idx)
+	}
+	proof.FeatureA = getFeatName(leaf.A)
+	if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+		proof.FeatureB = getFeatName(leaf.B)
+	}
+
 	// FIX: Cross operators need t >= 1 to access t-1 values
 	// Check this BEFORE accessing previous values (prevents t=0 crash)
 	if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
 		if t < 1 {
-			return false // Can't detect cross without previous bar
+			proof.GuardChecks = append(proof.GuardChecks, "t >= 1: false")
+			proof.Result = false
+			return false, proof
 		}
+		proof.GuardChecks = append(proof.GuardChecks, "t >= 1: true")
+		proof.GuardChecks = append(proof.GuardChecks, "t-1 >= 0: true")
+	} else if leaf.Kind == LeafRising || leaf.Kind == LeafFalling || leaf.Kind == LeafSlopeGT || leaf.Kind == LeafSlopeLT {
+		if t < leaf.Lookback {
+			proof.GuardChecks = append(proof.GuardChecks, fmt.Sprintf("t >= lookback(%d): false", leaf.Lookback))
+			proof.Result = false
+			return false, proof
+		}
+		proof.GuardChecks = append(proof.GuardChecks, fmt.Sprintf("t >= lookback(%d): true", leaf.Lookback))
 	}
 
-	if t < leaf.Lookback {
-		return false
+	if t < leaf.Lookback && leaf.Kind != LeafCrossUp && leaf.Kind != LeafCrossDown {
+		proof.GuardChecks = append(proof.GuardChecks, fmt.Sprintf("t >= lookback(%d): false", leaf.Lookback))
+		proof.Result = false
+		return false, proof
 	}
 
 	// Guard against invalid feature indices (safety for mutated strategies)
 	if leaf.A < 0 || leaf.A >= len(features) {
-		return false // Invalid index - treat as false
+		proof.GuardChecks = append(proof.GuardChecks, fmt.Sprintf("feature A index %d valid: false", leaf.A))
+		proof.Result = false
+		return false, proof
 	}
-	if leaf.B < 0 || leaf.B >= len(features) {
-		return false // Invalid index - treat as false
+	// BUG FIX: Only check leaf.B for operators that actually use it (CrossUp, CrossDown)
+	// SlopeGT, GT, LT, Rising, Falling operators don't use leaf.B (it's -1)
+	if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+		if leaf.B < 0 || leaf.B >= len(features) {
+			proof.GuardChecks = append(proof.GuardChecks, fmt.Sprintf("feature B index %d valid: false", leaf.B))
+			proof.Result = false
+			return false, proof
+		}
 	}
 
 	fa := features[leaf.A]
-	fb := features[leaf.B]
+	var fb []float32
+	// Only access leaf.B for operators that actually use it (CrossUp, CrossDown)
+	if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+		fb = features[leaf.B]
+	}
 
 	aVal := fa[t]
-	bVal := fb[t]
+	var bVal float32
+	if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+		bVal = fb[t]
+	}
+
+	// NaN guard
+	if math.IsNaN(float64(aVal)) {
+		proof.GuardChecks = append(proof.GuardChecks, "A[t] is NaN: true")
+		proof.Result = false
+		return false, proof
+	}
+	proof.GuardChecks = append(proof.GuardChecks, "No NaN in features: true")
 
 	// CRITICAL FIX #2: Only compute prevA/prevB for Cross operations (prevents t=0 crash)
 	// Also make Cross logic identical to bytecode evaluator (same eps rule)
+	var result bool
 	switch leaf.Kind {
 	case LeafGT:
-		return aVal > leaf.X
+		proof.Operator = ">"
+		proof.Threshold = float64(leaf.X)
+		proof.Values = []float64{float64(aVal), float64(leaf.X)}
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("%s > %.4f: %v", getFeatName(leaf.A), leaf.X, aVal > leaf.X))
+		result = aVal > leaf.X
 	case LeafLT:
-		return aVal < leaf.X
+		proof.Operator = "<"
+		proof.Threshold = float64(leaf.X)
+		proof.Values = []float64{float64(aVal), float64(leaf.X)}
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("%s < %.4f: %v", getFeatName(leaf.A), leaf.X, aVal < leaf.X))
+		result = aVal < leaf.X
 	case LeafCrossUp:
 		// CRITICAL FIX #1: Prevent fake CrossUp - match bytecode logic
 		const eps = 1e-6
@@ -957,6 +1744,10 @@ func evaluateLeaf(leaf *Leaf, features [][]float32, t int) bool {
 		prevB := fb[t-1]
 		aMove := aVal - prevA
 		bMove := bVal - prevB
+
+		proof.Operator = "CrossUp"
+		proof.Values = []float64{float64(prevA), float64(prevB), float64(aVal), float64(bVal)}
+
 		// Use abs() because negative move still counts as no movement
 		if aMove < 0 {
 			aMove = -aMove
@@ -964,11 +1755,19 @@ func evaluateLeaf(leaf *Leaf, features [][]float32, t int) bool {
 		if bMove < 0 {
 			bMove = -bMove
 		}
+
+		// Movement check with eps
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("|A[t]-A[t-1]| = %.2f >= eps: %v", math.Abs(float64(aVal-prevA)), math.Abs(float64(aVal-prevA)) >= eps))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("|B[t]-B[t-1]| = %.2f >= eps: %v", math.Abs(float64(bVal-prevB)), math.Abs(float64(bVal-prevB)) >= eps))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("A[t-1] <= B[t-1]: %.2f <= %.2f: %v", prevA, prevB, prevA <= prevB))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("A[t] > B[t]: %.2f > %.2f: %v", aVal, bVal, aVal > bVal))
+
 		// Block if EITHER series doesn't move
 		if aMove < eps || bMove < eps {
-			return false // At least one series didn't move - can't be a real cross
+			result = false
+		} else {
+			result = prevA <= prevB && aVal > bVal
 		}
-		return prevA <= prevB && aVal > bVal
 	case LeafCrossDown:
 		// CRITICAL FIX #1: Prevent fake CrossDown - match bytecode logic
 		const eps2 = 1e-6
@@ -976,6 +1775,10 @@ func evaluateLeaf(leaf *Leaf, features [][]float32, t int) bool {
 		prevB := fb[t-1]
 		aMove := aVal - prevA
 		bMove := bVal - prevB
+
+		proof.Operator = "CrossDown"
+		proof.Values = []float64{float64(prevA), float64(prevB), float64(aVal), float64(bVal)}
+
 		// Use abs() because negative move still counts as no movement
 		if aMove < 0 {
 			aMove = -aMove
@@ -983,50 +1786,180 @@ func evaluateLeaf(leaf *Leaf, features [][]float32, t int) bool {
 		if bMove < 0 {
 			bMove = -bMove
 		}
+
+		// Movement check with eps
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("|A[t]-A[t-1]| = %.2f >= eps: %v", math.Abs(float64(aVal-prevA)), math.Abs(float64(aVal-prevA)) >= eps2))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("|B[t]-B[t-1]| = %.2f >= eps: %v", math.Abs(float64(bVal-prevB)), math.Abs(float64(bVal-prevB)) >= eps2))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("A[t-1] >= B[t-1]: %.2f >= %.2f: %v", prevA, prevB, prevA >= prevB))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("A[t] < B[t]: %.2f < %.2f: %v", aVal, bVal, aVal < bVal))
+
 		// Block if EITHER series doesn't move
 		if aMove < eps2 || bMove < eps2 {
-			return false // At least one series didn't move - can't be a real cross
+			result = false
+		} else {
+			result = prevA >= prevB && aVal < bVal
 		}
-		return prevA >= prevB && aVal < bVal
 	case LeafRising:
-		return aVal > fa[t-leaf.Lookback]
+		proof.Operator = "Rising"
+		prevVal := fa[t-leaf.Lookback]
+		proof.Threshold = float64(leaf.Lookback)
+		proof.Values = []float64{float64(prevVal), float64(aVal)}
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("X[t-lookback] = %.2f", prevVal))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("X[t] = %.2f", aVal))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("X[t] > X[t-lookback]: %.2f > %.2f: %v", aVal, prevVal, aVal > prevVal))
+		result = aVal > prevVal
 	case LeafFalling:
-		return aVal < fa[t-leaf.Lookback]
+		proof.Operator = "Falling"
+		prevVal := fa[t-leaf.Lookback]
+		proof.Threshold = float64(leaf.Lookback)
+		proof.Values = []float64{float64(prevVal), float64(aVal)}
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("X[t-lookback] = %.2f", prevVal))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("X[t] = %.2f", aVal))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("X[t] < X[t-lookback]: %.2f < %.2f: %v", aVal, prevVal, aVal < prevVal))
+		result = aVal < prevVal
 	case LeafBetween:
-		// Check if value is between X (low) and Y (high)
+		proof.Operator = "Between"
 		low := leaf.X
 		high := leaf.Y
 		if low > high {
 			low, high = high, low
 		}
-		return aVal >= low && aVal <= high
+		proof.Values = []float64{float64(low), float64(high), float64(aVal)}
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("low = %.4f", low))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("high = %.4f", high))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("%s >= low: %v", getFeatName(leaf.A), aVal >= low))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("%s <= high: %v", getFeatName(leaf.A), aVal <= high))
+		result = aVal >= low && aVal <= high
 	case LeafAbsGT:
+		proof.Operator = "AbsGT"
+		proof.Threshold = float64(leaf.X)
 		absVal := aVal
 		if absVal < 0 {
 			absVal = -absVal
 		}
-		return absVal > leaf.X
+		proof.Values = []float64{float64(absVal), float64(leaf.X)}
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("|%s| = %.4f", getFeatName(leaf.A), absVal))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("|%s| > %.4f: %v", getFeatName(leaf.A), leaf.X, absVal > leaf.X))
+		result = absVal > leaf.X
 	case LeafAbsLT:
+		proof.Operator = "AbsLT"
+		proof.Threshold = float64(leaf.X)
 		absVal := aVal
 		if absVal < 0 {
 			absVal = -absVal
 		}
-		return absVal < leaf.X
+		proof.Values = []float64{float64(absVal), float64(leaf.X)}
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("|%s| = %.4f", getFeatName(leaf.A), absVal))
+		proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("|%s| < %.4f: %v", getFeatName(leaf.A), leaf.X, absVal < leaf.X))
+		result = absVal < leaf.X
 	case LeafSlopeGT:
+		proof.Operator = "SlopeGT"
+		proof.Threshold = float64(leaf.X)
 		// Compute slope over lookback period
 		if t >= leaf.Lookback {
 			slope := (aVal - fa[t-leaf.Lookback]) / float32(leaf.Lookback)
-			return slope > leaf.X
+			proof.ComputedSlope = float64(slope)
+			proof.Values = []float64{float64(fa[t-leaf.Lookback]), float64(aVal), float64(slope)}
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("start = X[t-lookback] = %.2f", fa[t-leaf.Lookback]))
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("end = X[t] = %.2f", aVal))
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("n = %d", leaf.Lookback))
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("slope = (end - start) / n = %.3f", slope))
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("slope > threshold: %.3f > %.4f: %v", slope, leaf.X, slope > leaf.X))
+			result = slope > leaf.X
+		} else {
+			result = false
 		}
-		return false
 	case LeafSlopeLT:
+		proof.Operator = "SlopeLT"
+		proof.Threshold = float64(leaf.X)
 		// Compute slope over lookback period
 		if t >= leaf.Lookback {
 			slope := (aVal - fa[t-leaf.Lookback]) / float32(leaf.Lookback)
-			return slope < leaf.X
+			proof.ComputedSlope = float64(slope)
+			proof.Values = []float64{float64(fa[t-leaf.Lookback]), float64(aVal), float64(slope)}
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("start = X[t-lookback] = %.2f", fa[t-leaf.Lookback]))
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("end = X[t] = %.2f", aVal))
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("n = %d", leaf.Lookback))
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("slope = (end - start) / n = %.3f", slope))
+			proof.Comparisons = append(proof.Comparisons, fmt.Sprintf("slope < threshold: %.3f < %.4f: %v", slope, leaf.X, slope < leaf.X))
+			result = slope < leaf.X
+		} else {
+			result = false
 		}
-		return false
 	default:
-		return false
+		result = false
+	}
+
+	proof.Result = result
+	return result, proof
+}
+
+// ruleTreeToStringWithNames converts a rule tree to a string with feature names instead of indices
+// This helps debug "the strategy you think" == "the strategy being executed"
+func ruleTreeToStringWithNames(node *RuleNode, feats Features) string {
+	if node == nil {
+		return ""
+	}
+
+	if node.Op == OpLeaf {
+		return leafToStringWithNames(&node.Leaf, feats)
+	}
+
+	leftStr := ruleTreeToStringWithNames(node.L, feats)
+	rightStr := ruleTreeToStringWithNames(node.R, feats)
+
+	switch node.Op {
+	case OpAnd:
+		return "(AND " + leftStr + " " + rightStr + ")"
+	case OpOr:
+		return "(OR " + leftStr + " " + rightStr + ")"
+	case OpNot:
+		return "(NOT " + leftStr + ")"
+	default:
+		return ""
+	}
+}
+
+// leafToStringWithNames converts a leaf to string with feature names
+func leafToStringWithNames(leaf *Leaf, feats Features) string {
+	// Get feature names for indices
+	getFeatName := func(idx int) string {
+		if idx >= 0 && idx < len(feats.Names) {
+			return feats.Names[idx]
+		}
+		return fmt.Sprintf("F[%d]", idx)
+	}
+
+	kindNames := map[LeafKind]string{
+		LeafGT:        "GT",
+		LeafLT:        "LT",
+		LeafCrossUp:   "CrossUp",
+		LeafCrossDown: "CrossDown",
+		LeafRising:    "Rising",
+		LeafFalling:   "Falling",
+		LeafBetween:   "Between",
+		LeafAbsGT:     "AbsGT",
+		LeafAbsLT:     "AbsLT",
+		LeafSlopeGT:   "SlopeGT",
+		LeafSlopeLT:   "SlopeLT",
+	}
+	kindName := kindNames[leaf.Kind]
+
+	featA := getFeatName(leaf.A)
+
+	switch leaf.Kind {
+	case LeafGT, LeafLT, LeafAbsGT, LeafAbsLT:
+		return "(" + kindName + " " + featA + " " + fmt.Sprintf("%.4f", leaf.X) + ")"
+	case LeafBetween:
+		return "(" + kindName + " " + featA + " " + fmt.Sprintf("%.4f", leaf.X) + " " + fmt.Sprintf("%.4f", leaf.Y) + ")"
+	case LeafSlopeGT, LeafSlopeLT:
+		return "(" + kindName + " " + featA + " " + fmt.Sprintf("%.4f", leaf.X) + " " + fmt.Sprintf("%d", leaf.Lookback) + ")"
+	case LeafCrossUp, LeafCrossDown:
+		featB := getFeatName(leaf.B)
+		return "(" + kindName + " " + featA + " " + featB + ")"
+	case LeafRising, LeafFalling:
+		return "(" + kindName + " " + featA + " " + fmt.Sprintf("%d", leaf.Lookback) + ")"
+	default:
+		return "(" + kindName + " " + featA + ")"
 	}
 }

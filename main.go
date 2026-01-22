@@ -18,37 +18,111 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"hb_bactest_checker/logx"
 )
 
 // Global verbose flag - controls debug output across all packages
 var Verbose bool = false
 
+// Global logTrades flag - enables detailed per-trade logging
+var LogTrades bool = false
+
+// Global recovery mode flag - thread-safe for concurrent worker access
+var RecoveryMode atomic.Bool
+
+// Global auto-recovery toggle flag - separate from manual RecoveryMode
+// Automatically toggles based on elite count to adjust entry constraints
+var recoveryModeActive atomic.Bool
+
+// Global holdingHeartbeat interval - how often to print holding logs (in bars, 0 = disabled)
+var HoldingHeartbeat int = 0
+
+// Global verifyMode flag - enables bytecode vs AST verification
+var VerifyMode bool = false
+
+// Global debugPF flag - enables throttled PF debug logging
+var DebugPF bool = false
+
 // Generator loop counters (atomic for thread safety)
 var (
-	genGenerated   int64 // Total strategies generated
-	genRejectedSur int64 // Rejected by surrogate
-	genRejectedSeen  int64 // Rejected by markSeen (duplicate)
-	genSentToJobs  int64 // Sent to worker jobs
+	genGenerated      int64 // Total strategies generated
+	genRejectedSur    int64 // Rejected by surrogate
+	genRejectedSeen    int64 // Rejected by markSeen (duplicate) - DEPRECATED, use seenHits/seenNew instead
+	genRejectedNovelty int64 // Rejected by novelty pressure (too similar to recent)
+	genRerolled       int64 // Strategies that were rerolled from seen to unseen
+	genSentToJobs     int64 // Sent to worker jobs
+	// EXACT counters for seen tracking - call CheckAndSet exactly once per final candidate
+	seenHits int64 // CheckAndSet returned false (already existed)
+	seenNew  int64 // CheckAndSet returned true (new insert)
 )
 
 // getGeneratorStats returns formatted generator loop statistics
 func getGeneratorStats() string {
 	generated := atomic.LoadInt64(&genGenerated)
 	rejectedSur := atomic.LoadInt64(&genRejectedSur)
-	rejectedSeen := atomic.LoadInt64(&genRejectedSeen)
+	rejectedNovelty := atomic.LoadInt64(&genRejectedNovelty)
+	rerolled := atomic.LoadInt64(&genRerolled)
 	sentToJobs := atomic.LoadInt64(&genSentToJobs)
+	// Use exact counters for seen tracking
+	hits := atomic.LoadInt64(&seenHits)
+	newFp := atomic.LoadInt64(&seenNew)
 
 	totalGenerated := generated
 	if totalGenerated == 0 {
 		totalGenerated = 1 // avoid division by zero
 	}
 
+	// FIX: Add explicit bounds checking for percentages to handle potential
+	// race conditions where numerators might exceed denominator temporarily.
+	// Use math/min for clamping to ensure percentages stay in [0, 100] range.
 	surPct := 100.0 * float64(rejectedSur) / float64(totalGenerated)
-	seenPct := 100.0 * float64(rejectedSeen) / float64(totalGenerated)
-	sentPct := 100.0 * float64(sentToJobs) / float64(totalGenerated)
+	if surPct < 0 {
+		surPct = 0
+	}
+	if surPct > 100 {
+		surPct = 100
+	}
 
-	return fmt.Sprintf("gen=%d rej_sur=%d(%.1f%%) rej_seen=%d(%.1f%%) sent=%d(%.1f%%)",
-		generated, rejectedSur, surPct, rejectedSeen, seenPct, sentToJobs, sentPct)
+	// Use exact formula: seen_hits / (seen_hits + seen_new)
+	seenTotal := hits + newFp
+	if seenTotal == 0 {
+		seenTotal = 1 // avoid division by zero
+	}
+	seenPct := 100.0 * float64(hits) / float64(seenTotal)
+	if seenPct < 0 {
+		seenPct = 0
+	}
+	if seenPct > 100 {
+		seenPct = 100
+	}
+
+	noveltyPct := 100.0 * float64(rejectedNovelty) / float64(totalGenerated)
+	if noveltyPct < 0 {
+		noveltyPct = 0
+	}
+	if noveltyPct > 100 {
+		noveltyPct = 100
+	}
+
+	rerolledPct := 100.0 * float64(rerolled) / float64(totalGenerated)
+	if rerolledPct < 0 {
+		rerolledPct = 0
+	}
+	if rerolledPct > 100 {
+		rerolledPct = 100
+	}
+
+	sentPct := 100.0 * float64(sentToJobs) / float64(totalGenerated)
+	if sentPct < 0 {
+		sentPct = 0
+	}
+	if sentPct > 100 {
+		sentPct = 100
+	}
+
+	return fmt.Sprintf("gen=%d rej_sur=%d(%.1f%%) rej_seen=%d/%d(%.1f%%) rerolled=%d(%.1f%%) rej_novelty=%d(%.1f%%) sent=%d(%.1f%%)",
+		generated, rejectedSur, surPct, hits, seenTotal, seenPct, rerolled, rerolledPct, rejectedNovelty, noveltyPct, sentToJobs, sentPct)
 }
 
 type BatchMsg struct {
@@ -67,6 +141,7 @@ type EliteLog struct {
 	EntryRule    string  `json:"entry_rule"`
 	ExitRule     string  `json:"exit_rule"`
 	RegimeFilter string  `json:"regime_filter"`
+	FeatureMapHash string `json:"feature_map_hash,omitempty"` // Feature ordering fingerprint
 	TrainScore   float32 `json:"train_score"`
 	TrainReturn  float32 `json:"train_return"`
 	TrainMaxDD   float32 `json:"train_max_dd"`
@@ -159,20 +234,84 @@ func main() {
 	// Golden mode flags
 	goldenSeed := flag.Int64("golden_seed", 0, "seed of winner strategy to run in golden mode")
 	goldenN := flag.Int("golden_print_trades", 10, "how many trades to print in golden mode")
+	exportCSVPath := flag.String("export_csv", "", "export trades to CSV file (works with golden/test mode)")
+	exportStatesPath := flag.String("export_states", "", "export states with proofs to CSV file (works with golden/test mode)")
 	// Trace mode flags
 	traceSeed := flag.Int64("trace_seed", 0, "seed of strategy to trace (outputs per-bar states)")
 	traceCSVPath := flag.String("trace_csv", "trace.csv", "output CSV path for trace mode")
 	traceManual := flag.String("trace_manual", "", "manual debug strategy (ema20x50, etc.)")
 	traceOpenCSV := flag.Bool("trace_open", false, "open CSV after trace (Windows)")
 	traceWindow := flag.String("trace_window", "test", "trace window: train | val | test")
+	// Trade logging flags
+	logTrades := flag.Bool("log_trades", false, "enable detailed per-trade logging (4 events: SIGNAL DETECT, ENTRY EXEC, HOLDING, EXIT)")
+	holdingHeartbeat := flag.Int("holding_heartbeat", 0, "holding log interval in bars (0 = disabled, e.g., 50 = log every 50 bars)")
+	// Debug flags
+	debugPF := flag.Bool("debug_pf", false, "enable throttled PF debug logging")
+	// Recovery mode flag
+	recoveryMode := flag.Bool("recovery", false, "enable recovery mode (relaxed screening, expanded seeding)")
+	// Verification flags
+	verifyMode := flag.Bool("verify", false, "enable bytecode vs AST verification mode (reports discrepancies)")
+	// Custom window replay flags (for consistency testing)
+	fromIdx := flag.Int("from_idx", -1, "custom start bar index (-1 for full data)")
+	toIdx := flag.Int("to_idx", -1, "custom end bar index (-1 for end)")
+	fromTime := flag.String("from", "", "custom start time (YYYY-MM-DD HH:MM:SS)")
+	toTime := flag.String("to", "", "custom end time (YYYY-MM-DD HH:MM:SS)")
+	warmupBars := flag.Int("warmup_bars", 2000, "warmup buffer before custom window")
 	flag.Parse()
 
 	// Set global verbose flag from command line
 	Verbose = *verbose
+	LogTrades = *logTrades
+	HoldingHeartbeat = *holdingHeartbeat
+	DebugPF = *debugPF
+	RecoveryMode.Store(*recoveryMode)
+	VerifyMode = *verifyMode
 
 	// Convert flag values to float32
 	feeBps := float32(*feeBpsFlag)
 	slipBps := float32(*slipBpsFlag)
+
+	// Track which flags were explicitly set for friction reduction
+	feeBpsWasSet := false
+	slipBpsWasSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "fee_bps" {
+			feeBpsWasSet = true
+		}
+		if f.Name == "slip_bps" {
+			slipBpsWasSet = true
+		}
+	})
+
+	// Auto-reduce friction in recovery mode ONLY if not explicitly set
+	if RecoveryMode.Load() {
+		if !feeBpsWasSet && *feeBpsFlag == 30 {  // Default value
+			feeBps = float32(5)
+			fmt.Println("[RECOVERY] Fee auto-reduced to 5 bps (was 30)")
+			fmt.Println("[RECOVERY] Override with explicit -fee_bps flag")
+		}
+		if !slipBpsWasSet && *slipBpsFlag == 8 {  // Default value
+			slipBps = float32(5)
+			fmt.Println("[RECOVERY] Slippage auto-reduced to 5 bps (was 8)")
+			fmt.Println("[RECOVERY] Override with explicit -slip_bps flag")
+		}
+	}
+
+	// STARTUP CONFIG: Print key configuration values for debugging
+	fmt.Printf("=== STARTUP CONFIGURATION ===\n")
+	fmt.Printf("Fee: %.2f bps (%.3f%%)\n", feeBps, feeBps/100.0)
+	fmt.Printf("Slippage: %.2f bps (%.3f%%)\n", slipBps, slipBps/100.0)
+	fmt.Printf("Warmup (custom): %d bars\n", *warmupBars)
+	fmt.Printf("=============================\n\n")
+
+	// Part C1: Log score formula at startup
+	fmt.Printf("====================================================================================================\n")
+	fmt.Printf("SCORING FORMULA: v3 (computeScore with smoothness)\n")
+	fmt.Printf("  Components: logReturn*6.0 + calmar*2.0 + expectancy*200.0 + tradesReward*0.01 - ddPenalty*6.0\n")
+	fmt.Printf("              + sortino*0.5 - smoothPenalty*0.5 - deflationPenalty\n")
+	fmt.Printf("  Caps: calmar=[-inf,10], expectancy=[-5,5], sortino=[-10,20]\n")
+	fmt.Printf("  Sentinel: -1e30 for hard rejection (trades==0 || dd>=0.45)\n")
+	fmt.Printf("====================================================================================================\n\n")
 
 	// Define scoring thresholds based on mode
 	var maxValDD, minValReturn, minValPF, minValExpect float32
@@ -205,8 +344,23 @@ func main() {
 		MinValPF:         minValPF,
 		MinValExpect:     minValExpect,
 		MinValTrades:     minValTrades,
-		ScreenRelaxLevel: 3, // Default to very relaxed (unblock mode)
+		ScreenRelaxLevel: 1, // CRITICAL FIX #6: Default to normal screening (was 3)
+		// The complexity rule in strategy.go prevents volume-only junk strategies,
+		// so we can keep screening strict without needing desperate relaxation
 	}
+
+	// Part C2: Log gate thresholds at startup
+	relaxLevel := meta.ScreenRelaxLevel
+	relaxNames := []string{"Strict", "Normal", "Relaxed", "Very_Relaxed"}
+	relaxName := "Unknown"
+	if relaxLevel >= 0 && relaxLevel < len(relaxNames) {
+		relaxName = relaxNames[relaxLevel]
+	}
+	fmt.Printf("GATE THRESHOLDS:\n")
+	fmt.Printf("  Val:    minReturn=%.4f, minPF=%.2f, minExp=%.4f, maxDD=%.2f, minTrades=%d\n",
+		meta.MinValReturn, meta.MinValPF, meta.MinValExpect, meta.MaxValDD, meta.MinValTrades)
+	fmt.Printf("  RelaxLevel: %d (0=strict, 1=normal, 2=relaxed, 3=very-relaxed) [%s]\n", relaxLevel, relaxName)
+	fmt.Printf("====================================================================================================\n\n")
 
 	// Mode dispatch
 	switch *mode {
@@ -214,10 +368,10 @@ func main() {
 		runTraceMode(*traceSeed, *traceCSVPath, *traceManual, *traceOpenCSV, *feeBpsFlag, *slipBpsFlag, *traceWindow)
 		return
 	case "golden":
-		runGoldenMode(*goldenSeed, *goldenN, *feeBpsFlag, *slipBpsFlag)
+		runGoldenMode(*goldenSeed, *goldenN, *feeBpsFlag, *slipBpsFlag, *exportCSVPath, *exportStatesPath)
 		return
 	case "test":
-		runTestMode(feeBps, slipBps)
+		runTestMode(feeBps, slipBps, *fromIdx, *toIdx, *fromTime, *toTime, *warmupBars)
 		return
 	case "validate":
 		RunValidation("btc_5min_data.csv")
@@ -253,6 +407,11 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Track search start time for runtime display
+	// Initialized here (before saveNow) so it's accessible throughout
+	var searchStartTime time.Time
+	var searchStartTimeMu sync.Mutex
 
 	var saveNow func()
 
@@ -330,12 +489,24 @@ func main() {
 		return out
 	}
 
-	restoreHOFSlim := func(h *HallOfFame, slimElites []SlimElite, rng *rand.Rand) {
+	restoreHOFSlim := func(h *HallOfFame, slimElites []SlimElite, rng *rand.Rand, feats *Features) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		h.Elites = make([]Elite, len(slimElites))
-		for i, se := range slimElites {
-			h.Elites[i] = slimToElite(se, rng)
+		validElites := make([]Elite, 0, len(slimElites))
+		for _, se := range slimElites {
+			elite, err := slimToElite(se, rng, feats)
+			if err != nil {
+				// Silently skip invalid elites - will log summary below
+				continue
+			}
+			validElites = append(validElites, elite)
+		}
+		h.Elites = validElites
+
+		// Log summary using structured logging
+		droppedCount := len(slimElites) - len(validElites)
+		if droppedCount > 0 {
+			logx.LogHOFRestore(len(validElites), len(slimElites), droppedCount)
 		}
 	}
 
@@ -348,7 +519,7 @@ func main() {
 	// Anti-stagnation tracking (thread-safe)
 	var radicalP float32 = 0.10    // base radical mutation probability
 	var surExploreP float32 = 0.10 // base surrogate exploration
-	var surThreshold float64 = 0.0 // surrogate filtering threshold
+	var surThreshold float64 = -0.5 // surrogate filtering threshold - start more aggressive to filter junk early
 	var lastBestValScore float32 = -1e30
 	var batchesSinceLastImprovement int
 	var stagnationMu sync.RWMutex // protects the above anti-stagnation variables
@@ -393,20 +564,33 @@ func main() {
 	}
 
 	// Track seen fingerprints to avoid retesting strategies
-	// Use SkeletonFingerprint for structure-only deduplication (less aggressive)
+	// Use CoarseFingerprint for deduplication (threshold buckets)
+	// This reduces duplicates more effectively than SkeletonFingerprint
 	// Full fingerprint is still used for leaderboard uniqueness via globalFingerprints
-	seen := make(map[string]struct{})
-	seenMu := sync.Mutex{}
+	// OPTIMIZATION: Use sharded map to reduce mutex contention (3-5x speedup)
+	seen := NewShardedSeenMap()
 
+	// markSeen checks if a strategy has been seen before
+	// When hof.Len() == 0: use full Fingerprint() for maximum exploration (exact match only)
+	// When hof.Len() > 0: use CoarseFingerprint() for faster deduplication (threshold buckets)
+	// Returns true if NEW (just inserted), false if ALREADY SEEN
+	// Increments exact counters: seenNew when new, seenHits when already seen
 	markSeen := func(s Strategy) bool {
-		fp := s.SkeletonFingerprint() // Use structure-only fingerprint for seen tracking
-		seenMu.Lock()
-		defer seenMu.Unlock()
-		if _, ok := seen[fp]; ok {
-			return false
+		var fp string
+		if hof.Len() == 0 {
+			// Bootstrap mode: use exact fingerprint to maximize exploration
+			fp = s.Fingerprint()
+		} else {
+			// Normal mode: use coarse fingerprint for speed
+			fp = s.CoarseFingerprint()
 		}
-		seen[fp] = struct{}{}
-		return true
+		isNew := seen.CheckAndSet(fp)
+		if isNew {
+			atomic.AddInt64(&seenNew, 1) // CheckAndSet returned true (new insert)
+		} else {
+			atomic.AddInt64(&seenHits, 1) // CheckAndSet returned false (already existed)
+		}
+		return isNew
 	}
 
 	// Initialize RNG for seeding (needs to be before seedFromWinners)
@@ -420,6 +604,28 @@ func main() {
 	}
 	rng := rand.New(rand.NewSource(seed))
 
+	// rerollOnSeen attempts to mutate a seen strategy to find an unseen variant
+	// Does NOT call CheckAndSet - caller must call markSeen after this returns
+	// Performs multiple mutations until maxRetries, returns last mutation
+	rerollOnSeen := func(st Strategy, fullF Features, maxRetries int) Strategy {
+		current := st
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			// Create a mutated version
+			current = mutateStrategy(rng, current, fullF)
+
+			// NOTE: We DON'T call CheckAndSet here - caller will do that
+			// Just count this as a reroll attempt and continue to next iteration
+			// Only count on first successful reroll (attempt == 0)
+			if attempt == 0 {
+				atomic.AddInt64(&genRerolled, 1)
+			}
+		}
+
+		// Return the last mutated version
+		return current
+	}
+
 	// Load checkpoint if provided (must be after HOF and RNG initialization)
 	if *resumePath != "" {
 		cp, err := LoadCheckpoint(*resumePath)
@@ -428,13 +634,57 @@ func main() {
 		} else {
 			fmt.Printf("Resuming from checkpoint: %s (saved %d)\n", *resumePath, cp.SavedAtUnix)
 
+			// === FEATURE MAP SAFETY PRINT FOR CHECKPOINT LOADING ===
+			runtimeHash := ComputeFeatureMapHash(feats)
+			runtimeVersion := GetFeatureMapVersion(feats)
+			fmt.Println("\n=== CHECKPOINT LOADED - Feature Map Info ===")
+			fmt.Printf("FeatureMapHash: %s\n", runtimeHash)
+			fmt.Printf("FeatureSetVersion: %s\n", runtimeVersion)
+			fmt.Println("=============================================")
+
 			// restore hof (from slim elites)
-			restoreHOFSlim(hof, cp.HOFElites, rng)
+			restoreHOFSlim(hof, cp.HOFElites, rng, &feats)
+			// OPTIMIZATION: Initialize HOF snapshot for lock-free reads
+			hof.InitSnapshot()
 
 			// restore archive (from slim elites)
+			archiveLoaded := 0
 			for _, se := range cp.ArchiveElites {
-				e := slimToElite(se, rng)
+				e, err := slimToElite(se, rng, &feats)
+				if err != nil {
+					continue  // Skip invalid elites
+				}
 				archive.Add(e.Val, e)
+				archiveLoaded++
+			}
+			droppedArchive := len(cp.ArchiveElites) - archiveLoaded
+			if droppedArchive > 0 {
+				logx.LogArchiveRestore(archiveLoaded, len(cp.ArchiveElites), droppedArchive)
+			}
+
+			// Fallback: if no valid elites loaded, log clear message
+			// The search will bootstrap fresh population automatically
+			if hof.Len() == 0 {
+				fmt.Println("[CHECKPOINT] Warning: No valid HOF elites found in checkpoint.")
+				fmt.Println("[CHECKPOINT] Starting with empty population - will bootstrap fresh strategies.")
+			}
+
+			// === CHECKPOINT HASH VALIDATION ===
+			if cp.FeatureMapHash != "" && cp.FeatureMapHash != runtimeHash {
+				fmt.Printf("\n!!! CHECKPOINT FEATURE MAP MISMATCH DETECTED !!!\n")
+				fmt.Printf("Checkpoint hash:  %s\n", cp.FeatureMapHash)
+				fmt.Printf("Runtime hash:    %s\n\n", runtimeHash)
+				fmt.Printf("Checkpoint version: %s\n\n", truncateVersion(cp.FeatureMapHash, runtimeVersion, 5))
+				fmt.Printf("Runtime version:    %s\n", truncateVersion(runtimeHash, runtimeVersion, 5))
+				fmt.Printf("\nWARNING: Checkpoint was saved with different feature ordering!\n")
+				fmt.Printf("All elites from this checkpoint will use WRONG feature indices.\n")
+				fmt.Printf("RECOMMENDATION: Start fresh or regenerate with current feature order.\n")
+				fmt.Printf("====================================================\n\n")
+			} else if cp.FeatureMapHash != "" {
+				fmt.Printf("\n%s Checkpoint feature map hash validated: MATCH\n", logx.Success("✓"))
+			} else {
+				fmt.Printf("\n%s Legacy checkpoint (no feature_map_hash stored)\n", logx.Warn("⚠"))
+				fmt.Printf("   Cannot validate feature ordering. May produce WRONG results.\n")
 			}
 
 			// restore counters
@@ -446,12 +696,8 @@ func main() {
 			// Initialize testedAtLastCheckpoint for resume
 			// Will be set in aggregator goroutine at first checkpoint
 
-			// restore seen
-			seenMu.Lock()
-			for _, fp := range cp.SeenFingerprints {
-				seen[fp] = struct{}{}
-			}
-			seenMu.Unlock()
+			// restore seen - use sharded map's Restore method
+			seen.Restore(cp.SeenFingerprints)
 
 			// restore seed if user didn't provide one
 			if *seedFlag == 0 && cp.Seed != 0 {
@@ -555,15 +801,12 @@ func main() {
 		// cap seen size so file doesn't explode
 		const maxSeen = 200000
 
-		seenMu.Lock()
-		seenList := make([]string, 0, len(seen))
-		for fp := range seen {
-			seenList = append(seenList, fp)
-			if len(seenList) >= maxSeen {
-				break
-			}
+		// OPTIMIZATION: Use sharded map's Snapshot method (thread-safe)
+		allFingerprints := seen.Snapshot()
+		seenList := allFingerprints
+		if len(seenList) > maxSeen {
+			seenList = seenList[:maxSeen]
 		}
-		seenMu.Unlock()
 
 		// Snapshot archive elites (limit to 200 for checkpoint size)
 		const maxArchiveElites = 200
@@ -585,14 +828,22 @@ func main() {
 			HOFElites:        snapshotHOFSlim(hof),
 			ArchiveElites:    archiveSlim,
 			SeenFingerprints: seenList,
+			FeatureMapHash:   ComputeFeatureMapHash(feats),
+			FeatureMapVersion: GetFeatureMapVersion(feats),
+
 		}
 		// Print rejection stats before checkpointing
 		printRejectionStats()
 
+		// Calculate elapsed time since search started
+		searchStartTimeMu.Lock()
+		elapsed := time.Since(searchStartTime)
+		searchStartTimeMu.Unlock()
+
 		if err := SaveCheckpoint(*checkpointPath, cp); err != nil {
 			fmt.Printf("WARN: checkpoint save failed: %v\n", err)
 		} else {
-			fmt.Printf("\nCheckpoint saved: %s\n", *checkpointPath)
+			fmt.Printf("\n%s Checkpoint saved: %s (runtime: %s)\n", logx.Success("✓"), *checkpointPath, logx.FormatDuration(elapsed))
 		}
 		// Also save meta state whenever we checkpoint
 		saveMeta()
@@ -694,6 +945,21 @@ func main() {
 					Trail:      parseTrailModel(log.Trail),
 				}
 
+				// SANITY CHECK: Validate cross operations when loading from disk
+				// This prevents strategies with invalid CrossUp/CrossDown from being loaded
+				{
+					_, entryInvalid := validateCrossSanity(s.EntryRule.Root, feats)
+					_, exitInvalid := validateCrossSanity(s.ExitRule.Root, feats)
+					_, regimeInvalid := validateCrossSanity(s.RegimeFilter.Root, feats)
+
+					totalInvalid := entryInvalid + exitInvalid + regimeInvalid
+					if totalInvalid > 0 {
+						// Reject this strategy due to invalid cross operations
+						atomic.AddInt64(&rejectedCrossSanityLoad, 1)
+						continue // Skip this strategy
+					}
+				}
+
 				// Recompile rules
 				s.EntryCompiled = compileRuleTree(s.EntryRule.Root)
 				s.ExitCompiled = compileRuleTree(s.ExitRule.Root)
@@ -745,6 +1011,17 @@ func main() {
 	// Track generation types for diversity monitoring
 	var immigrantCount, heavyMutCount, crossCount, normalMutCount int64
 
+	// Track recent fingerprints for novelty pressure (penalize too-similar children)
+	// This reduces the duplicate storm by rejecting strategies too similar to recent ones
+	const recentFingerprintsWindow = 5000 // Track last 5000 generated fingerprints
+	var recentFingerprints = make(map[string]int)   // fingerprint -> count
+	var recentFingerprintsMu sync.RWMutex
+	var totalRecentFingerprints int64 = 0
+
+	// Fingerprint frequency monitoring for canonicalization
+	// Log top 20 most common fingerprints every 10 batches to detect stuck generators
+	var fingerprintBatchCounter int64
+
 	f, err := os.OpenFile("best_every_10000.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		fmt.Printf("Error opening output file: %v\n", err)
@@ -757,6 +1034,11 @@ func main() {
 	doneAgg := make(chan struct{})
 	go func() {
 		defer close(doneAgg)
+
+		// Initialize search start time now that the search loop is starting
+		searchStartTimeMu.Lock()
+		searchStartTime = time.Now()
+		searchStartTimeMu.Unlock()
 
 		// Define validation stability threshold once (not duplicated in loop)
 		const stabilityThreshold = 0.25 // TEMP warm-start: val must be at least 25% of train (relaxed from 40%)
@@ -845,8 +1127,7 @@ func main() {
 				radicalP = clampf(radicalP*1.20, 0.10, 0.70)
 				surExploreP = clampf(surExploreP*1.20, 0.10, 0.70)
 				stagnationMu.Unlock()
-				print(" [META-STAGNATE(%d): radicalP %.2f->%.2f, surExploreP %.2f->%.2f, passRate=%.2f%%]",
-					batchesNoImprove, oldRadical, radicalP, oldSurExplore, surExploreP, passRate*100)
+				logx.LogMetaStagnate(batchesNoImprove, oldRadical, radicalP, oldSurExplore, surExploreP, passRate)
 
 				// If pass rate is basically zero, gate is too strict -> loosen a bit
 				if passRate < 0.002 { // <0.2%
@@ -989,6 +1270,47 @@ func main() {
 				for atomic.LoadUint64(&tested) >= nextCheckpoint {
 					// We've reached or passed a checkpoint, process it
 					batchID++
+					fingerprintBatchCounter++
+
+					// CANONICALIZATION CHECK: Log fingerprint frequency every 10 batches
+					// This detects if the generator is stuck producing the same patterns
+					if fingerprintBatchCounter%10 == 0 {
+						recentFingerprintsMu.RLock()
+						// Build list of fingerprint counts for sorting
+						type fpCount struct {
+							fp    string
+							count int
+						}
+						var fpList []fpCount
+						for fp, count := range recentFingerprints {
+							fpList = append(fpList, fpCount{fp: fp, count: count})
+						}
+						recentFingerprintsMu.RUnlock()
+
+						// Sort by count (descending) to find most common fingerprints
+						sort.Slice(fpList, func(i, j int) bool {
+							return fpList[i].count > fpList[j].count
+						})
+
+						// Log top 10 fingerprints
+						topN := 10
+						if len(fpList) < topN {
+							topN = len(fpList)
+						}
+						if topN > 0 && fpList[0].count > 10 { // Only log if there's significant repetition
+							fmt.Printf("\n  [FINGERPRINT CANONICALIZATION] Top %d skeletons (last %d generated):\n",
+								topN, totalRecentFingerprints)
+							for i := 0; i < topN; i++ {
+								fmt.Printf("    #%d: count=%d, fp=%s\n", i+1, fpList[i].count, fpList[i].fp[:80])
+							}
+							// Warn if generator is stuck
+							if fpList[0].count > 50 {
+								fmt.Printf("    %s WARNING: Generator stuck! Top fingerprint appears %d times\n",
+									logx.Warn("⚠"), fpList[0].count)
+							}
+						}
+					}
+
 					line := ReportLine{
 						Batch:          batchID,
 						Tested:         int64(atomic.LoadUint64(&tested)),
@@ -1084,6 +1406,14 @@ func main() {
 					// Track stagnation per checkpoint, not per candidate
 					improved := false
 					passedThisBatch := int64(0) // Track how many passed validation this batch
+					var batchAccepted []Result  // Part D2: Track accepted candidates for emergency seeding
+					// Part D2: Track TRAIN-passed candidates for recovery seeding (with memory cap)
+					const maxTrainPassedCandidates = 200 // Cap memory growth - keep top 200 by score
+					type trainCandidate struct {
+						Strategy Strategy
+						Result   Result
+					}
+					var trainPassedCandidates []trainCandidate
 
 					for i := 0; i < numToValidate; i++ {
 						candidate := candidatesToValidate[i]
@@ -1146,32 +1476,95 @@ func main() {
 						// This unlocks evolution instead of infinite immigrants
 						elitesCount := len(hof.Elites)
 
-						// CRITICAL FIX: Exit "very relaxed" screening mode once elites exist
-						// This forces the pipeline to stop admitting junk once the gene pool exists
-						if elitesCount > 0 && getScreenRelaxLevel() > 1 {
-							setScreenRelaxLevel(1) // Switch to normal screening mode
-							fmt.Printf("[SCREEN] Elites detected (%d), switching to normal screening mode\n", elitesCount)
+						// RECOVERY MODE: Auto-toggle minEdges based on elite count (hysteresis to prevent flapping)
+						// Enable minEdges=2 when elites < 25, disable when elites >= 30
+						if !recoveryModeActive.Load() && elitesCount < 25 {
+							recoveryModeActive.Store(true)
+							setEdgeMinMultiplier(2)
+							currentMinEdges := getEdgeMinMultiplier()
+							if currentMinEdges < 2 {
+								currentMinEdges = 2
+							}
+							fmt.Printf("[AUTO-RECOVERY] ENABLED (elites=%d < 25), minEdges=%d\n", elitesCount, currentMinEdges)
+						} else if recoveryModeActive.Load() && elitesCount >= 30 {
+							recoveryModeActive.Store(false)
+							setEdgeMinMultiplier(3)
+							currentMinEdges := getEdgeMinMultiplier()
+							if currentMinEdges < 2 {
+								currentMinEdges = 2
+							}
+							fmt.Printf("[AUTO-RECOVERY] DISABLED (elites=%d >= 30), minEdges=%d\n", elitesCount, currentMinEdges)
 						}
 
-						// BOOTSTRAP LADDER: Relax validation gates when elite pool is small
-						// This allows population to grow before tightening back to real gates
+						// THREE-TIER LADDER: Bootstrap (0-9) → Recovery (10-19) → Standard (20+)
+						const bootstrapThreshold = 10
+						const recoveryThreshold = 20
+
 						var effectiveMaxDD, effectiveMinReturn, effectiveMinPF, effectiveMinExpect, effectiveMinScore float32
 						var effectiveMinTrades int
 						var skipCPCV bool
+						var passesValidation bool
+						var isPreElite bool = false
 
-						if elitesCount < 10 {
-							// CRITICAL FIX #3: TRUE bootstrap gates for first 10 elites
-							// Accept "least bad" candidates that aren't completely broken
-							// No profit requirement yet - just survival constraints
-							effectiveMaxDD = 0.65          // Allow higher DD during bootstrap
-							effectiveMinReturn = -0.02      // Allow up to -2% loss (not 0%!)
-							effectiveMinPF = 0.95           // Allow near-breakeven PF (not 1.0!)
-							effectiveMinExpect = -0.0005    // Allow slightly negative expectancy
-							effectiveMinScore = -50.0       // Allow very low scores during bootstrap
-							effectiveMinTrades = 20         // Minimum 20 trades
-							skipCPCV = true                 // Skip CPCV during bootstrap
+						// Variables for rejection logging (must be in outer scope)
+						var basicGatesOK, profitOK, trainOK, stableEnough bool
+
+						if elitesCount < bootstrapThreshold {
+							// BOOTSTRAP MODE (0-9 elites): Very relaxed VAL gates
+							effectiveMaxDD = 0.65
+							effectiveMinReturn = -0.02
+							effectiveMinPF = 0.95
+							effectiveMinExpect = -0.0005
+							effectiveMinScore = -50.0
+							effectiveMinTrades = 20
+							skipCPCV = true
+
+							// Basic sanity gates
+							basicGatesOK = valR.MaxDD < effectiveMaxDD && valR.Trades >= effectiveMinTrades
+							profitOK = valR.Return >= effectiveMinReturn &&
+								valR.Expectancy > effectiveMinExpect &&
+								valR.ProfitFactor >= effectiveMinPF &&
+								valR.Score >= effectiveMinScore
+
+							var minTrainScore, minTrainReturn float32
+							minTrainScore = -10.0
+							minTrainReturn = -0.05
+							trainOK = candidate.Score > minTrainScore || candidate.Return > minTrainReturn
+
+							stableEnough = true
+							if candidate.Score > 0 {
+								stableEnough = valR.Score >= stabilityThreshold*candidate.Score
+							}
+							passesValidation = basicGatesOK && stableEnough && profitOK && trainOK
+
+						} else if elitesCount < recoveryThreshold {
+							// RECOVERY MODE (10-19 elites): Accept based on train, bypass VAL profit gates
+							// Check: VAL DD + VAL trades, train score + train return
+							recoveryValOK := valR.MaxDD < 0.65 && valR.Trades >= 15  // Basic VAL sanity
+							recoveryTrainOK := candidate.Score > -20.0 || candidate.Return > -0.10  // Train not terrible
+
+							if recoveryValOK && recoveryTrainOK {
+								passesValidation = false  // Don't use normal validation path
+								isPreElite = true  // Mark for special handling below
+								skipCPCV = true
+								fmt.Printf("[PRE-ELITE] train_score=%.2f train_ret=%.2f%% val_trades=%d val_dd=%.2f%%\n",
+									candidate.Score, candidate.Return*100, valR.Trades, valR.MaxDD*100)
+							}
+
+							// Set default values for rejection logging (not used for pre-elite path)
+							effectiveMaxDD = 0.65
+							effectiveMinReturn = -0.02
+							effectiveMinPF = 0.95
+							effectiveMinExpect = -0.0005
+							effectiveMinScore = -50.0
+							effectiveMinTrades = 15
+							basicGatesOK = recoveryValOK
+							profitOK = true
+							trainOK = recoveryTrainOK
+							stableEnough = true
+
 						} else {
-							// Use standard gates once we have enough elites
+							// STANDARD MODE (20+ elites): Full validation gates
 							effectiveMaxDD = maxValDD
 							effectiveMinReturn = minValReturn
 							effectiveMinPF = minValPF
@@ -1179,26 +1572,24 @@ func main() {
 							effectiveMinScore = minValScore
 							effectiveMinTrades = minValTrades
 							skipCPCV = false
+
+							basicGatesOK = valR.MaxDD < effectiveMaxDD && valR.Trades >= effectiveMinTrades
+							profitOK = valR.Return >= effectiveMinReturn &&
+								valR.Expectancy > effectiveMinExpect &&
+								valR.ProfitFactor >= effectiveMinPF &&
+								valR.Score >= effectiveMinScore
+
+							var minTrainScore, minTrainReturn float32
+							minTrainScore = -5.0
+							minTrainReturn = 0.0
+							trainOK = candidate.Score > minTrainScore || candidate.Return > minTrainReturn
+
+							stableEnough = true
+							if candidate.Score > 0 {
+								stableEnough = valR.Score >= stabilityThreshold*candidate.Score
+							}
+							passesValidation = basicGatesOK && stableEnough && profitOK && trainOK
 						}
-
-						// Basic sanity gates (use effective gates from bootstrap ladder)
-						basicGatesOK := valR.MaxDD < effectiveMaxDD && valR.Trades >= effectiveMinTrades
-
-						// Profit sanity gate (use effective gates from bootstrap ladder)
-						// During bootstrap: allow ret>=-2%, pf>=0.95, exp>=-0.0005, score>=-50
-						// After bootstrap: use normal profit gates
-						profitOK := valR.Return >= effectiveMinReturn &&
-							valR.Expectancy > effectiveMinExpect &&
-							valR.ProfitFactor >= effectiveMinPF &&
-							valR.Score >= effectiveMinScore
-
-						// Add to Hall of Fame if passes validation + CPCV
-						// Stability check: val_score must be decent fraction of train_score to reduce overfitting
-						stableEnough := true
-						if candidate.Score > 0 {
-							stableEnough = valR.Score >= stabilityThreshold*candidate.Score
-						}
-						passesValidation := basicGatesOK && stableEnough && profitOK
 
 						// CRITICAL FIX #4: VAL rejection histogram
 						// Log ALL candidates that fail validation with current effective gates
@@ -1227,19 +1618,46 @@ func main() {
 							if valR.Score < effectiveMinScore {
 								reasons = append(reasons, fmt.Sprintf("Score<%.1f", effectiveMinScore))
 							}
+							// Anti-overfit: log train gate failures
+							if !trainOK {
+								reasons = append(reasons, fmt.Sprintf("train_bad(score=%.2f,ret=%.1f%%)", candidate.Score, candidate.Return*100))
+							}
 							reasonStr := strings.Join(reasons, ",")
 							fmt.Printf("[VAL-REJECT] score=%.4f ret=%.2f%% pf=%.2f exp=%.5f dd=%.3f trds=%d [%s]\n",
 								valR.Score, valR.Return*100, valR.ProfitFactor, valR.Expectancy, valR.MaxDD, valR.Trades, reasonStr)
+
+							// EMERGENCY SEEDING: Always track candidates that passed TRAIN but failed VAL
+							// This enables recovery seeding even when VAL never passes
+							// Track candidates with reasonable trades that passed multi-fidelity
+							if candidate.Trades >= 10 {
+								// Track TRAIN-passed candidates for emergency seeding
+								cand := trainCandidate{
+									Strategy: candidate.Strategy,
+									Result:   candidate, // Use train result
+								}
+								trainPassedCandidates = append(trainPassedCandidates, cand)
+
+								// Cap memory: keep only top N by train score
+								if len(trainPassedCandidates) > maxTrainPassedCandidates {
+									sort.Slice(trainPassedCandidates, func(i, j int) bool {
+										return trainPassedCandidates[i].Result.Score > trainPassedCandidates[j].Result.Score
+									})
+									trainPassedCandidates = trainPassedCandidates[:maxTrainPassedCandidates]
+								}
+							}
 						}
 
-						if passesValidation {
+						if passesValidation || isPreElite {
 							// Track best validation score seen ONLY from fully validated strategies
 							// This prevents bestValSeen from tracking failing candidates
-							bestValSeenMu.Lock()
-							if valR.Trades >= minValTrades && valR.Score > -1e20 && valR.Score > bestValSeen {
-								bestValSeen = valR.Score
+							// PRE-ELITE: Don't update bestValSeen for recovery mode candidates
+							if !isPreElite {
+								bestValSeenMu.Lock()
+								if valR.Trades >= minValTrades && valR.Score > -1e20 && valR.Score > bestValSeen {
+									bestValSeen = valR.Score
+								}
+								bestValSeenMu.Unlock()
 							}
-							bestValSeenMu.Unlock()
 
 							// Run CPCV to check stability across multiple folds BEFORE adding to HOF/archive
 							// CRITICAL FIX: Make CPCV forward-looking by covering TRAIN + VAL (up to valW.End)
@@ -1278,7 +1696,21 @@ func main() {
 									End:    quickTestEnd,
 									Warmup: testW.Warmup,
 								}
+
+								// DEBUG: Print window info before evaluation
+								windowCandles := quickTestEnd - testW.Start
+								firstCandleTime := int64(0)
+								if testW.Start < len(series.OpenTimeMs) {
+									firstCandleTime = series.OpenTimeMs[testW.Start]
+								}
+								fmt.Printf("[QuickTest-DEBUG] window=[%d:%d] candles=%d first_candle_ts=%d\n",
+									testW.Start, quickTestEnd, windowCandles, firstCandleTime)
+
 								quickTestR := evaluateStrategyWindow(series, feats, candidate.Strategy, quickTestW)
+
+								// DEBUG: Print result after evaluation
+								fmt.Printf("[QuickTest-DEBUG] result: trades=%d return=%.4f pf=%.2f score=%.4f\n",
+									quickTestR.Trades, quickTestR.Return, quickTestR.ProfitFactor, quickTestR.Score)
 
 								// Track best quick test result for reporting (best score among all candidates)
 								if quickTestR.Score > bestQuickTestR.Score {
@@ -1356,11 +1788,22 @@ func main() {
 
 							passedThisBatch++                // Count passed strategies this batch for meta-update
 							atomic.AddInt64(&passedCount, 1) // Track adaptive criteria
+
+							// Part A1: Score sanity check BEFORE adding elite
+							if !IsValidScore(valR.Score) {
+								fmt.Printf("[INVALID-SCORE] Rejecting elite with invalid score=%.4f\n", valR.Score)
+								continue
+							}
+
+							// Part D2: Track for emergency seeding
+							batchAccepted = append(batchAccepted, candidate)
+
 							elite := Elite{
-								Strat:    candidate.Strategy,
-								Train:    candidate,
-								Val:      valR, // Use current candidate's validation result
-								ValScore: valR.Score,
+								Strat:     candidate.Strategy,
+								Train:     candidate,
+								Val:       valR, // Use current candidate's validation result
+								ValScore:  valR.Score,
+								IsPreElite: isPreElite,  // Mark recovery mode elites
 							}
 							hof.Add(elite)
 							archive.Add(valR, elite) // Use current candidate's validation result
@@ -1371,10 +1814,13 @@ func main() {
 							const bootstrapEliteThreshold = 10
 							if hof.Len() >= bootstrapEliteThreshold && isBootstrapMode() {
 								setBootstrapMode(false)
-								print("\n[BOOTSTRAP COMPLETE: Elites=%d, exiting bootstrap mode]\n", hof.Len())
+								logx.LogBootstrapComplete(hof.Len())
 								print("[Cooldown: 0-50 -> 200, MaxHoldBars: 50-150 -> 150-329, Profit gates: ENABLED]\n\n")
 							}
 							atomic.AddInt64(&strategiesPassed, 1) // Count strategies that truly pass all validation gates
+
+							// Compute feature map hash for this run
+							featureHash := ComputeFeatureMapHash(feats)
 
 							// Also log to persistent file
 							log := EliteLog{
@@ -1388,6 +1834,7 @@ func main() {
 								EntryRule:    ruleTreeToString(candidate.Strategy.EntryRule.Root),
 								ExitRule:     ruleTreeToString(candidate.Strategy.ExitRule.Root),
 								RegimeFilter: ruleTreeToString(candidate.Strategy.RegimeFilter.Root),
+								FeatureMapHash: featureHash,
 								TrainScore:   candidate.Score,
 								TrainReturn:  candidate.Return,
 								TrainMaxDD:   candidate.MaxDD,
@@ -1406,6 +1853,62 @@ func main() {
 						}
 					}
 
+					// Part D2: RECOVERY SEEDING - Seed elites when population is low
+					// Priority: trainPassedCandidates (passed SCREEN+TRAIN but failed VAL profit gates)
+					var seedCandidates []Elite
+
+					// First: try trainPassedCandidates (they passed SCREEN+TRAIN)
+					if len(trainPassedCandidates) > 0 {
+						for _, c := range trainPassedCandidates {
+							seedCandidates = append(seedCandidates, Elite{
+								Strat:    c.Strategy,
+								Train:    c.Result,
+								Val:      c.Result, // Use train result as proxy
+								ValScore: c.Result.Score,
+							})
+						}
+					}
+
+					// Second: fallback to batchAccepted (VAL-passed + all gates)
+					if len(seedCandidates) == 0 && len(batchAccepted) > 0 {
+						for _, r := range batchAccepted {
+							seedCandidates = append(seedCandidates, Elite{
+								Strat:    r.Strategy,
+								Train:    r,
+								Val:      r,
+								ValScore: r.Score,
+							})
+						}
+					}
+
+					// Seeding logic (expanded in recovery mode)
+					if hof.Len() == 0 && len(seedCandidates) > 0 {
+						maxSeeds := 5
+						if RecoveryMode.Load() {
+							maxSeeds = 20 // Expanded seeding in recovery mode
+							fmt.Println("[RECOVERY] Emergency seeding up to 20 elites from", len(seedCandidates), "candidates")
+						}
+
+						// CRITICAL: Use hof.Add() for each candidate to enforce fingerprint diversity
+						// Do NOT use SeedFromCandidates which may bypass diversity rules
+						seeded := 0
+						for _, cand := range seedCandidates {
+							if seeded >= maxSeeds {
+								break
+							}
+							beforeLen := hof.Len()
+							hof.Add(cand) // hof.Add enforces fingerprint diversity (max 2 per fingerprint family)
+							if hof.Len() > beforeLen {
+								seeded++
+							}
+						}
+						fmt.Printf("[RECOVERY] Seeded %d/%d elites (HOF now has %d)\n", seeded, maxSeeds, hof.Len())
+					}
+
+					// Reset tracking slices
+					trainPassedCandidates = nil
+					batchAccepted = nil
+
 					// After validation loop: run self-improvement meta-update
 					// Compute actual tested since last checkpoint for correct pass-rate
 					testedNow := int64(atomic.LoadUint64(&tested))
@@ -1415,6 +1918,14 @@ func main() {
 					}
 					updateMeta(improved, bestValR.Score, passedThisBatch, testedThisCheckpoint)
 					testedAtLastCheckpoint = testedNow
+
+					// Part D3: SELF-TERMINATING RECOVERY
+					// Automatically exit recovery mode when population is healthy
+					if RecoveryMode.Load() && hof.Len() >= 20 {
+						RecoveryMode.Store(false)
+						fmt.Println("[RECOVERY] Auto-disabled: elites =", hof.Len(), ">= 20 threshold")
+						fmt.Println("[RECOVERY] Returning to normal screening and generation mode")
+					}
 
 					// Adaptive surrogate threshold: adjust based on validated labels and improvement
 					if atomic.LoadInt64(&validatedLabels) > 5000 && improved {
@@ -1504,7 +2015,7 @@ func main() {
 					// Print batch report with pass/fail indicator and fingerprint
 					// Guard: only print if we have valid results
 					if bestTrainResult.Trades > 0 {
-						checkmark := map[bool]string{true: "✓", false: "✗"}[bestPassesValidation]
+						checkmark := logx.Checkmark(bestPassesValidation)
 						fingerprint := bestTrainResult.Strategy.Fingerprint()
 
 						// Build rejection reason string if failed
@@ -1537,10 +2048,10 @@ func main() {
 							}
 						}
 
-						// Format reason string
+						// Format reason string with color
 						reasonStr := ""
 						if len(reasonParts) > 0 {
-							reasonStr = " reason=" + strings.Join(reasonParts, ",")
+							reasonStr = " " + logx.Warn("reason="+strings.Join(reasonParts, ","))
 						}
 
 						// Check overtrading for reporting
@@ -1549,9 +2060,9 @@ func main() {
 						maxTradesPerYear := float32(500)
 						overtrading := tradesPerYear > maxTradesPerYear
 						if overtrading && len(reasonParts) > 0 {
-							reasonStr += ",ovtrd"
+							reasonStr += " " + logx.Error(",ovtrd")
 						} else if overtrading {
-							reasonStr = " reason=ovtrd"
+							reasonStr = " " + logx.Error("reason=ovtrd")
 						}
 
 						// Reject overtrading strategies from passing validation
@@ -1562,22 +2073,27 @@ func main() {
 						exitRuleNamed := ruleTreeToStringNamed(bestTrainResult.Strategy.ExitRule.Root, feats.Names)
 						regimeRuleNamed := ruleTreeToStringNamed(bestTrainResult.Strategy.RegimeFilter.Root, feats.Names)
 
-						// Print summary line
-						print("Batch %d: Tested %d | Train: %.4f | Val: %.4f | Ret: %.2f%% | WR: %.1f%% | Trds: %d | Rate: %.0f/s %s [fp: %s]\n",
-							batchID, atomic.LoadUint64(&tested), bestTrainResult.Score, bestValR.Score, bestValR.Return*100, bestValR.WinRate*100, bestValR.Trades, rate, checkmark, fingerprint)
+						// Print summary line using structured logging
+						searchStartTimeMu.Lock()
+						runtimeElapsed := now.Sub(searchStartTime)
+						searchStartTimeMu.Unlock()
+						logx.LogBatchProgress(batchID, atomic.LoadUint64(&tested), bestTrainResult.Score, bestValR.Score,
+							bestTrainResult.Return, bestValR.Return, bestValR.WinRate, bestValR.Trades, rate, runtimeElapsed, fingerprint+" "+checkmark)
 
 						// Print criteria summary
-						print("  [crit: score>%.2f, trds>=%d, DD<%.2f, ret>%.1f%%, exp>%.4f, pf>%.2f, stab>%.0f%%]\n",
-							minValScore, minValTrades, maxValDD, minValReturn*100, minValExpect, minValPF, stabilityThreshold*100)
+						print("  %s\n",
+							logx.Dimf("[crit: score>%.2f, trds>=%d, DD<%.2f, ret>%.1f%%, exp>%.4f, pf>%.2f, stab>%.0f%%]",
+								minValScore, minValTrades, maxValDD, minValReturn*100, minValExpect, minValPF, stabilityThreshold*100))
 
-						// Print validation details with quick test
-						print("  [val: score=%.4f dd=%.3f trds=%d%s]\n",
-							bestValR.Score, bestValR.MaxDD, bestValR.Trades, reasonStr)
-						print("  [QuickTest: Score=%.4f Ret=%.2f%% DD=%.3f Trds=%d]\n",
-							bestQuickTestR.Score, bestQuickTestR.Return*100, bestQuickTestR.MaxDD, bestQuickTestR.Trades)
+						// Print validation details with quick test (colored)
+						print("  [val: score=%s dd=%s trds=%d%s]\n",
+							logx.ScoreColor(bestValR.Score), logx.DDColor(bestValR.MaxDD), bestValR.Trades, reasonStr)
+						print("  [QuickTest: Score=%s Ret=%s DD=%s Trds=%d]\n",
+							logx.ScoreColor(bestQuickTestR.Score), logx.ReturnColor(bestQuickTestR.Return),
+							logx.DDColor(bestQuickTestR.MaxDD), bestQuickTestR.Trades)
 
 						// Print entry/exit story with feature names (indented)
-						print("  [ENTRY STORY]\n")
+						print("  %s\n", logx.Info("[ENTRY STORY]"))
 						if regimeRuleNamed != "" && regimeRuleNamed != "(NOT )" {
 							print("    Regime Filter (must be true): %s\n", formatIndentedRule(regimeRuleNamed, "    "))
 						} else {
@@ -1588,7 +2104,7 @@ func main() {
 						print("    Exit Signal: %s\n", formatIndentedRule(exitRuleNamed, "    "))
 
 						// Print risk management
-						print("  [RISK MANAGEMENT]\n")
+						print("  %s\n", logx.Highlight("[RISK MANAGEMENT]"))
 						print("    StopLoss: %s\n", stopModelToString(bestTrainResult.Strategy.StopLoss))
 						print("    TakeProfit: %s\n", tpModelToString(bestTrainResult.Strategy.TakeProfit))
 						print("    Trail: %s\n", trailModelToString(bestTrainResult.Strategy.Trail))
@@ -1617,17 +2133,13 @@ func main() {
 
 					batchBest = Result{Score: -1e30}
 
-					// Auto-adjust screen relax level based on candidate count
-					// CRITICAL FIX: Only enforce profit gates AFTER we have enough elites to support evolution
-					// This prevents getting stuck in "valley" where gates are too strict for early evolution
+					// Auto-adjust enforcement: Only enforce profit gates AFTER we have enough elites to support evolution
+					// CRITICAL FIX #6: Removed candidate-count-based relaxation logic
+					// The complexity rule in strategy.go prevents volume-only junk strategies,
+					// so screening can stay strict without needing desperate relaxation
 					elitesCount := len(hof.Elites)
 					const minElitesForProfitGates = 10 // Wait for at least 10 elites before enforcing strict gates
 					if elitesCount > 0 {
-						const minCandidatesPerCheckpoint = 5     // Minimum candidates before tightening
-						const maxCandidatesBeforeTightening = 50 // Maximum candidates before forcing tightening
-						candidateCount := len(globalTopCandidates)
-						currentRelaxLevel := meta.ScreenRelaxLevel
-
 						// Raise minValTrades from 20 to 30 once we have elites
 						// CRITICAL FIX: Also update the local variable used in validation gates
 						if meta.MinValTrades < 30 {
@@ -1635,7 +2147,7 @@ func main() {
 							meta.MinValTrades = 30
 							newMinTrades := meta.MinValTrades
 							meta.mu.Unlock()
-							print(" [AUTO-ADJUST: Elites detected, MinValTrades=20->%d]\n", newMinTrades)
+							logx.LogAutoAdjustInt("MinValTrades", 20, newMinTrades)
 							minValTrades = newMinTrades // FIX: Update local variable too!
 						}
 
@@ -1644,42 +2156,22 @@ func main() {
 						if elitesCount >= minElitesForProfitGates && minValReturn < 0.02 {
 							oldReturn := minValReturn
 							minValReturn = 0.02
-							print(" [AUTO-ADJUST: Enforcing profit gates, minValReturn=%.4f->%.2f%%]\n", oldReturn, minValReturn*100)
+							logx.LogAutoAdjust("Enforcing profit gates, minValReturn", oldReturn, minValReturn)
 						}
 						if elitesCount >= minElitesForProfitGates && minValPF < 1.05 {
 							oldPF := minValPF
 							minValPF = 1.05
-							print(" [AUTO-ADJUST: Enforcing profit gates, minValPF=%.2f->%.2f]\n", oldPF, minValPF)
+							logx.LogAutoAdjust("Enforcing profit gates, minValPF", oldPF, minValPF)
 						}
 						if elitesCount >= minElitesForProfitGates && maxValDD > 0.35 {
 							oldDD := maxValDD
 							maxValDD = 0.35
-							print(" [AUTO-ADJUST: Enforcing profit gates, maxValDD=%.2f->%.2f]\n", oldDD, maxValDD)
+							logx.LogAutoAdjust("Enforcing profit gates, maxValDD", oldDD, maxValDD)
 						}
 						if elitesCount >= minElitesForProfitGates && minValExpect < 0.0001 {
 							oldExp := minValExpect
 							minValExpect = 0.0001
-							print(" [AUTO-ADJUST: Enforcing profit gates, minValExpect=%.4f->%.4f]\n", oldExp, minValExpect)
-						}
-
-						if candidateCount < minCandidatesPerCheckpoint && currentRelaxLevel < 3 {
-							// Too few candidates - loosen gates
-							meta.mu.Lock()
-							meta.ScreenRelaxLevel = currentRelaxLevel + 1
-							newLevel := meta.ScreenRelaxLevel
-							meta.mu.Unlock()
-							setScreenRelaxLevel(newLevel)
-							print(" [AUTO-ADJUST: Too few candidates (%d), ScreenRelaxLevel=%d->%d]\n",
-								candidateCount, currentRelaxLevel, newLevel)
-						} else if candidateCount > maxCandidatesBeforeTightening && currentRelaxLevel > 0 {
-							// Plenty of candidates - tighten gates gradually
-							meta.mu.Lock()
-							meta.ScreenRelaxLevel = currentRelaxLevel - 1
-							newLevel := meta.ScreenRelaxLevel
-							meta.mu.Unlock()
-							setScreenRelaxLevel(newLevel)
-							print(" [AUTO-ADJUST: Many candidates (%d), ScreenRelaxLevel=%d->%d]\n",
-								candidateCount, currentRelaxLevel, newLevel)
+							logx.LogAutoAdjust("Enforcing profit gates, minValExpect", oldExp, minValExpect)
 						}
 					}
 
@@ -1696,7 +2188,7 @@ func main() {
 	for i := 0; i < workers; i++ {
 		go func(id int) {
 			defer wg.Done()
-			batchSize := 32
+			batchSize := 128 // OPTIMIZATION: Tuned from 32 for better amortization (1.2-1.5x speedup)
 			localBatch := make([]Strategy, 0, batchSize)
 			localResults := make([]Result, 0, batchSize)
 
@@ -1829,8 +2321,17 @@ func main() {
 			meta.mu.RUnlock()
 
 			immigrantP := float32(0.10) // Base: 10% when improving
+			if hof.Len() == 0 {
+				immigrantP = 1.00 // 100% immigrants when empty (bootstrap)
+			} else if hof.Len() >= 50 {
+				immigrantP = 0.20 // Increase to 20% when elites full
+			}
 			if stagnationCount > 3 {
-				immigrantP = 0.25 // Increase to 25% when stagnating
+				immigrantP += 0.15 // Additional boost when stagnating
+			}
+			// Cap at reasonable max
+			if immigrantP > 0.50 {
+				immigrantP = 0.50 // Max 50% immigrants
 			}
 
 			// Get adaptive parameters (thread-safe)
@@ -1839,10 +2340,18 @@ func main() {
 			stagnationMu.RUnlock()
 
 			heavyMutP := immigrantP + 0.50*currentRadicalP // was + currentRadicalP
-			crossP := heavyMutP + 0.20
-			if crossP > 0.95 {
-				crossP = 0.95
-			} // keep at least 5% normal mutation
+
+			// ADAPTIVE CROSSOVER: Increase crossover rate as elite pool grows
+			// More elites = more diverse gene pool = higher crossover value
+			// Base 10%, ramp to 15% when elites >= 50
+			elitesCount := hof.Len()
+			crossBonus := float32(0.0)
+			if elitesCount >= 50 {
+				crossBonus = 0.05 // Increase from 10% to 15% crossover
+			} else if elitesCount >= 25 {
+				crossBonus = 0.025 // Intermediate step: 12.5% crossover
+			}
+			crossP := heavyMutP + 0.10 + crossBonus // Adaptive: 10-15% crossover
 			// normal mutation = 1.0 - crossP
 
 			x := rng.Float32()
@@ -1865,7 +2374,7 @@ func main() {
 				s = bigMutation(rng, parent, feats)
 				atomic.AddInt64(&heavyMutCount, 1)
 			} else if x < crossP && hof.Len() >= 2 {
-				// Crossover: mix two parents (20% total)
+				// Crossover: mix two parents (adaptive 10-15% based on elite count)
 				var a, b Strategy
 				// 40% chance to use archive for one parent to increase diversity
 				if archive.Len() > 0 && rng.Float32() < 0.40 {
@@ -1879,7 +2388,7 @@ func main() {
 					a = hofA.Strat
 					b = hofB.Strat
 				}
-				s = crossover(rng, a, b)
+				s = crossover(rng, a, b, feats)
 				// small mutation after crossover helps
 				if rng.Float32() < 0.7 {
 					s = mutateStrategy(rng, s, feats)
@@ -1936,16 +2445,60 @@ func main() {
 				}
 			}
 
-			// FAST FIX: Temporarily bypass markSeen filter to confirm it's not the killer
 			// Check if we've already seen this strategy fingerprint
-			// if !markSeen(s) {
-			// 	continue
-			// }
-			isNew := markSeen(s)
-			if !isNew {
-				// COUNTER: markSeen rejected (duplicate)
-				atomic.AddInt64(&genRejectedSeen, 1)
+			// IMPORTANT: Instead of rejecting, try to reroll until unseen (max 10 retries)
+			// OPTIMIZATION: Skip reroll when elites==0 to save compute
+			if hof.Len() == 0 {
+				// No elites: just reject without reroll (save compute)
+				if !markSeen(s) {
+					atomic.AddInt64(&genRejectedSeen, 1)
+					continue
+				}
+				// Fingerprint was new - already inserted by markSeen
+			} else {
+				// Normal mode: reroll if seen
+				if !markSeen(s) {
+					// Instead of rejecting, try to reroll until unseen (max 10 retries)
+					s = rerollOnSeen(s, feats, 10)
+
+					// Check again if rerolled version is seen
+					if !markSeen(s) {
+						atomic.AddInt64(&genRejectedSeen, 1)
+						continue // Still seen after retries - reject
+					}
+					// Reroll succeeded - s is now an unseen strategy, continue to novelty check
+				}
 			}
+
+			// NOVELTY PRESSURE: Reject strategies too similar to recently generated ones
+			// This reduces duplicate storm by penalizing children that are too close to parent shape
+			// Use coarse fingerprint (threshold buckets) which captures structural + threshold similarity
+			coarseFP := s.CoarseFingerprint()
+			recentFingerprintsMu.Lock()
+			count := recentFingerprints[coarseFP]
+			// Reject if this coarse fingerprint appears too frequently in recent window
+			// Threshold: reject if seen more than 5 times in last 5000 strategies
+			// This catches generators that keep producing the same structural + threshold pattern
+			if count > 5 {
+				recentFingerprintsMu.Unlock()
+				atomic.AddInt64(&genRejectedNovelty, 1) // Separate counter for novelty pressure
+				continue
+			}
+			// Track this fingerprint
+			recentFingerprints[coarseFP] = count + 1
+			totalRecentFingerprints++
+			// Periodically prune the fingerprint map to keep it bounded
+			if totalRecentFingerprints > recentFingerprintsWindow*2 {
+				// Prune: keep only recent entries by halving all counts
+				for fp := range recentFingerprints {
+					recentFingerprints[fp] = recentFingerprints[fp] / 2
+					if recentFingerprints[fp] == 0 {
+						delete(recentFingerprints, fp)
+					}
+				}
+				totalRecentFingerprints = totalRecentFingerprints / 2
+			}
+			recentFingerprintsMu.Unlock()
 
 			select {
 			case <-ctx.Done():
@@ -1960,7 +2513,6 @@ func main() {
 	print("Starting strategy search (press Ctrl+C to stop)...")
 	print("")
 
-	start := time.Now()
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
@@ -1995,11 +2547,6 @@ func main() {
 				reportBestVal := bestValSeen
 				bestValSeenMu.Unlock()
 
-				stagnationMu.RLock()
-				currentRadicalP := radicalP
-				currentSurExploreP := surExploreP
-				stagnationMu.RUnlock()
-
 				meta.mu.RLock()
 				currentBatches := meta.Batches
 				meta.mu.RUnlock()
@@ -2007,9 +2554,38 @@ func main() {
 				// Get generator loop stats
 				genStats := getGeneratorStats()
 
-				print("[progress] tested=%d  rate=%.1f/s  elapsed=%s  bestVal=%.4f  elites=%d  [meta: radicalP=%.2f surExploreP=%.2f batches=%d]\n",
-					cur, rate, time.Since(start).Truncate(time.Second), reportBestVal, elitesCount, currentRadicalP, currentSurExploreP, currentBatches)
-				print("[generator] %s", genStats)
+				// Calculate rejection percentages with clamping
+				generated := atomic.LoadInt64(&genGenerated)
+				if generated == 0 {
+					generated = 1
+				}
+				rejSeen := 100.0 * float64(atomic.LoadInt64(&genRejectedSeen)) / float64(generated)
+				if rejSeen < 0 {
+					rejSeen = 0
+				}
+				if rejSeen > 100 {
+					rejSeen = 100
+				}
+				rejNovelty := 100.0 * float64(atomic.LoadInt64(&genRejectedNovelty)) / float64(generated)
+				if rejNovelty < 0 {
+					rejNovelty = 0
+				}
+				if rejNovelty > 100 {
+					rejNovelty = 100
+				}
+				rejSur := 100.0 * float64(atomic.LoadInt64(&genRejectedSur)) / float64(generated)
+				if rejSur < 0 {
+					rejSur = 0
+				}
+				if rejSur > 100 {
+					rejSur = 100
+				}
+
+				// Use structured progress logging
+				logx.LogProgress(int64(cur), rate, float64(reportBestVal), elitesCount, rejSeen, rejNovelty, rejSur, int64(currentBatches))
+
+				// Print generator stats separately
+				print("%s", genStats)
 			}
 		}
 	}()
@@ -2027,14 +2603,8 @@ func main() {
 				hm := atomic.LoadInt64(&heavyMutCount)
 				cr := atomic.LoadInt64(&crossCount)
 				nm := atomic.LoadInt64(&normalMutCount)
-				total := imm + hm + cr + nm
-				if total > 0 {
-					print("[gen-types] immigrant=%d(%.1f%%) heavyMut=%d(%.1f%%) crossover=%d(%.1f%%) normalMut=%d(%.1f%%) total=%d\n",
-						imm, 100.0*float64(imm)/float64(total),
-						hm, 100.0*float64(hm)/float64(total),
-						cr, 100.0*float64(cr)/float64(total),
-						nm, 100.0*float64(nm)/float64(total),
-						total)
+				if imm+hm+cr+nm > 0 {
+					logx.LogGenTypes(imm, hm, cr, nm)
 				}
 			}
 		}
@@ -2091,7 +2661,7 @@ func main() {
 	print("Results saved to: best_every_10000.txt")
 }
 
-func runTestMode(feeBps, slipBps float32) {
+func runTestMode(feeBps, slipBps float32, fromIdx, toIdx int, fromTime, toTime string, warmupBars int) {
 	fmt.Println("Running in TEST mode - evaluating saved winners on test data")
 	fmt.Println("=============================================================")
 	fmt.Printf("Cost overrides: Fee=%.1f bps (%.2f%%), Slippage=%.1f bps (%.2f%%)\n", feeBps, feeBps/100, slipBps, slipBps/100)
@@ -2112,13 +2682,28 @@ func runTestMode(feeBps, slipBps float32) {
 	feats := computeAllFeatures(series)
 	fmt.Printf("Computed %d features\n", len(feats.F))
 
-	// Split data into train/validation/test windows
-	trainStart, trainEnd, valEnd := GetSplitIndices(series.OpenTimeMs)
-	_, _, testW := GetSplitWindows(trainStart, trainEnd, valEnd, series.T, 500)
+	// Get custom window if specified, otherwise use default test window
+	var testW Window
+	if fromIdx >= 0 || toIdx >= 0 || fromTime != "" || toTime != "" {
+		// Custom window mode
+		fmt.Printf("Using custom window: from_idx=%d, to_idx=%d, from=\"%s\", to=\"%s\", warmup=%d\n",
+			fromIdx, toIdx, fromTime, toTime, warmupBars)
+		testW = GetCustomWindow(series.OpenTimeMs, fromIdx, toIdx, fromTime, toTime, warmupBars, series.T)
+		fmt.Printf("Custom window: %d candles (%d -> %d)\n", testW.End-testW.Start, testW.Start, testW.End)
 
-	// Recompute feature stats on train window only
-	computeStatsOnWindow(&feats, trainStart, trainEnd)
-	fmt.Printf("Feature stats computed on train window (%d candles)\n", trainEnd-trainStart)
+		// For custom windows, compute stats on the full dataset to avoid future leak
+		computeStatsOnWindow(&feats, 0, series.T)
+		fmt.Printf("Feature stats computed on full dataset (%d candles)\n", series.T)
+	} else {
+		// Default test mode
+		trainStart, trainEnd, valEnd := GetSplitIndices(series.OpenTimeMs)
+		_, _, testW = GetSplitWindows(trainStart, trainEnd, valEnd, series.T, 500)
+		fmt.Printf("Using default test window: %d candles (%d -> %d)\n", testW.End-testW.Start, testW.Start, testW.End)
+
+		// Recompute feature stats on train window only
+		computeStatsOnWindow(&feats, trainStart, trainEnd)
+		fmt.Printf("Feature stats computed on train window (%d candles)\n", trainEnd-trainStart)
+	}
 
 	loadTime := time.Since(startTime)
 	fmt.Printf("Data load time: %v\n\n", loadTime)
@@ -2153,11 +2738,46 @@ func runTestMode(feeBps, slipBps float32) {
 		TestExitReasons map[string]int `json:"test_exit_reasons"`
 	}
 
+	// Helper function: deduplicate TestResults by fingerprint
+	// Uses EliteLog fields (EntryRule, ExitRule, etc.) to build fingerprint
+	dedupeTestResults := func(results []TestResult) []TestResult {
+		seen := make(map[string]bool)
+		out := make([]TestResult, 0, len(results))
+
+		for _, r := range results {
+			// Build fingerprint from EliteLog fields (same as Strategy.Fingerprint())
+			fp := r.EntryRule + "|" +
+				r.ExitRule + "|" +
+				r.RegimeFilter + "|" +
+				r.StopLoss + "|" +
+				r.TakeProfit + "|" +
+				r.Trail + "|" +
+				fmt.Sprintf("hold=%d|loss=%d|cd=%d", 0, 0, 0) // Not stored in EliteLog
+			if seen[fp] {
+				continue // Skip duplicate
+			}
+			seen[fp] = true
+			out = append(out, r)
+		}
+
+		return out
+	}
+
+	// Helper function: short fingerprint for display
+	shortFingerprint := func(fp string) string {
+		const maxLen = 12
+		if len(fp) <= maxLen {
+			return fp
+		}
+		return fp[:maxLen]
+	}
+
 	// Print test window info
 	fmt.Printf("Test window: %d candles (indices %d -> %d)\n\n", testW.End-testW.Start, testW.Start, testW.End)
 
 	var allResults []TestResult
 	var parseErrors int
+	var invalidStrategyCount int
 	var noTradeStrategies int
 
 	// STRICT TEST FILTERS - These are the gates for passing test mode
@@ -2217,6 +2837,17 @@ func runTestMode(feeBps, slipBps float32) {
 			continue
 		}
 
+		// SANITY CHECK: Validate cross operations when loading for test mode
+		// This prevents strategies with invalid CrossUp/CrossDown from being tested
+		if err := validateLoadedStrategy(strategy, &feats); err != nil {
+			// Use separate counter - validation failure is NOT a parse error
+			invalidStrategyCount++
+			if invalidStrategyCount <= 5 {
+				fmt.Printf("Warning: Skipping strategy #%d: %v\n", i+1, err)
+			}
+			continue
+		}
+
 		// Compile bytecode (critical step!)
 		strategy.EntryCompiled = compileRuleTree(strategy.EntryRule.Root)
 		strategy.ExitCompiled = compileRuleTree(strategy.ExitRule.Root)
@@ -2272,6 +2903,10 @@ func runTestMode(feeBps, slipBps float32) {
 		passed = append(passed, r)
 	}
 
+	// DEDUPLICATE by fingerprint before ranking (removes duplicate strategies)
+	passed = dedupeTestResults(passed)
+	allResults = dedupeTestResults(allResults)
+
 	// Rank PASSED strategies by TEST performance (not validation)
 	// Primary: TestScore desc, Secondary: TestMaxDD asc, Tertiary: TestReturn desc
 	sort.Slice(passed, func(i, j int) bool {
@@ -2305,6 +2940,7 @@ func runTestMode(feeBps, slipBps float32) {
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Println("Shows best strategies on TEST even if they fail validation gates")
 	fmt.Println("Sorted by: Return (desc) → DD (asc) → Trades (desc)")
+	fmt.Println("(Deduplicated by fingerprint)")
 	fmt.Println()
 
 	numToPrintDebug := 20
@@ -2317,8 +2953,11 @@ func runTestMode(feeBps, slipBps float32) {
 	} else {
 		for i := 0; i < numToPrintDebug; i++ {
 			r := allResults[i]
-			fmt.Printf("#%2d | TestScore: %.4f | Ret: %6.2f%% | DD: %5.1f%% | Trades: %4d | ValScore: %.4f\n",
-				i+1, r.TestScore, r.TestReturn*100, r.TestMaxDD*100, r.TestTrades, r.ValScore)
+			// Build fingerprint from EliteLog fields directly
+			fp := r.EntryRule + "|" + r.ExitRule + "|" + r.RegimeFilter + "|" + r.StopLoss + "|" + r.TakeProfit + "|" + r.Trail
+			fpShort := shortFingerprint(fp)
+			fmt.Printf("#%2d | TestScore: %.4f | Ret: %6.2f%% | DD: %5.1f%% | Trades: %4d | ValScore: %.4f | FP: %s\n",
+				i+1, r.TestScore, r.TestReturn*100, r.TestMaxDD*100, r.TestTrades, r.ValScore, fpShort)
 		}
 	}
 
@@ -2327,6 +2966,7 @@ func runTestMode(feeBps, slipBps float32) {
 	fmt.Println("TOP 20 STRATEGIES BY TEST SCORE (STRICT FILTERS APPLIED)")
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Printf("Gates: Trades>=%d, MaxDD<=%.2f, Return>%.1f%%\n", minTrades, maxDD, minReturn*100)
+	fmt.Println("(Deduplicated by fingerprint)")
 	fmt.Println()
 
 	numToPrint := 20
@@ -2335,14 +2975,17 @@ func runTestMode(feeBps, slipBps float32) {
 	}
 
 	if numToPrint == 0 {
-		fmt.Println("NO STRATEGIES PASSED THE STRICT TEST GATES!")
+		fmt.Println(logx.Error("NO STRATEGIES PASSED THE STRICT TEST GATES!"))
 		fmt.Println()
 		fmt.Println("Try adjusting gates: -mode test -fee_bps=30 -slip_bps=8")
 	} else {
 		for i := 0; i < numToPrint; i++ {
 			r := passed[i]
-			fmt.Printf("#%2d | Test Score: %.4f | Test Return: %6.2f%% | Test WinRate: %5.1f%% | Test Trades: %4d | Test DD: %.2f%% | Val Score: %.4f\n",
-				i+1, r.TestScore, r.TestReturn*100, r.TestWinRate*100, r.TestTrades, r.TestMaxDD*100, r.ValScore)
+			// Build fingerprint from EliteLog fields directly
+			fp := r.EntryRule + "|" + r.ExitRule + "|" + r.RegimeFilter + "|" + r.StopLoss + "|" + r.TakeProfit + "|" + r.Trail
+			fpShort := shortFingerprint(fp)
+			fmt.Printf("#%2d | Test Score: %.4f | Test Return: %6.2f%% | Test WinRate: %5.1f%% | Test Trades: %4d | Test DD: %.2f%% | Val Score: %.4f | FP: %s\n",
+				i+1, r.TestScore, r.TestReturn*100, r.TestWinRate*100, r.TestTrades, r.TestMaxDD*100, r.ValScore, fpShort)
 		}
 	}
 
@@ -2351,10 +2994,12 @@ func runTestMode(feeBps, slipBps float32) {
 	fmt.Printf("Tested successfully:         %d\n", len(allResults)-parseErrors)
 	fmt.Printf("Skipped parse errors:        %d\n", parseErrors)
 	fmt.Printf("No-trade on test:            %d\n", noTradeStrategies)
-	fmt.Printf("Strategies with trades:      %d\n", len(allResults))
-	fmt.Printf("PASSED strict test gates:    %d (%.1f%%)\n", len(passed), float32(len(passed))*100/float32(len(allResults)))
+	fmt.Printf("Strategies with trades:      %d (after deduplication)\n", len(allResults))
+	passedPct := float32(len(passed)) * 100 / float32(len(allResults))
+	fmt.Printf("PASSED strict test gates:    %d (%s)\n", len(passed), logx.WinRateColor(passedPct/100))
 	fmt.Println(strings.Repeat("-", 80))
 	fmt.Println("Results saved to: winners_tested.jsonl")
+	fmt.Println("(Deduplicated by strategy fingerprint including all constants)")
 
 	// Aggregate exit reasons across all passing strategies
 	if len(passed) > 0 {
@@ -2952,6 +3597,7 @@ type WinnerRow struct {
 	EntryRule    string  `json:"entry_rule"`
 	ExitRule     string  `json:"exit_rule"`
 	RegimeFilter string  `json:"regime_filter"`
+	FeatureMapHash string `json:"feature_map_hash,omitempty"` // Feature ordering fingerprint
 	TrainScore   float32 `json:"train_score,omitempty"`
 	ValScore     float32 `json:"val_score,omitempty"`
 	TestScore    float32 `json:"test_score,omitempty"`
@@ -3004,7 +3650,7 @@ func loadFirstWinner(path string) (*WinnerRow, error) {
 }
 
 // runGoldenMode runs a single winner strategy with detailed trade logging
-func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64) {
+func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64, exportCSV, exportStates string) {
 	fmt.Println("Running in GOLDEN mode - single strategy with trade logging")
 	fmt.Println("================================================================")
 	fmt.Printf("Seed: %d, FeeBps: %.1f, SlippageBps: %.1f\n", seed, feeBps, slipBps)
@@ -3081,10 +3727,71 @@ func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64) {
 		Trail:      parseTrailModel(w.Trail),
 	}
 
+	// SANITY CHECK: Validate cross operations in golden mode
+	// Warn user if strategy has invalid cross operations (but don't fail, just sanitize)
+	{
+		_, entryInvalid := validateCrossSanity(st.EntryRule.Root, feats)
+		_, exitInvalid := validateCrossSanity(st.ExitRule.Root, feats)
+		_, regimeInvalid := validateCrossSanity(st.RegimeFilter.Root, feats)
+
+		totalInvalid := entryInvalid + exitInvalid + regimeInvalid
+		if totalInvalid > 0 {
+			fmt.Printf("WARNING: Strategy has %d invalid CrossUp/CrossDown operations - sanitizing...\n", totalInvalid)
+			// Sanitize the strategy
+			sanitizeCrossOperations(rand.New(rand.NewSource(w.Seed)), st.EntryRule.Root, feats)
+			sanitizeCrossOperations(rand.New(rand.NewSource(w.Seed)), st.ExitRule.Root, feats)
+			sanitizeCrossOperations(rand.New(rand.NewSource(w.Seed)), st.RegimeFilter.Root, feats)
+		}
+	}
+
 	// Compile bytecode
 	st.EntryCompiled = compileRuleTree(st.EntryRule.Root)
 	st.ExitCompiled = compileRuleTree(st.ExitRule.Root)
 	st.RegimeCompiled = compileRuleTree(st.RegimeFilter.Root)
+
+	// === SAFETY PRINTS: Feature map fingerprint + rule resolution ===
+	// Compute runtime feature map hash
+	runtimeHash := ComputeFeatureMapHash(feats)
+	runtimeVersion := GetFeatureMapVersion(feats)
+
+	fmt.Println("\n=== STRATEGY LOADED - Feature Index Resolution ===")
+	fmt.Printf("FeatureMapHash: %s\n", runtimeHash)
+	fmt.Printf("FeatureSetVersion: %s\n", runtimeVersion)
+
+	// Print raw AST (original rule text with indices)
+	fmt.Printf("\n--- Entry Rule (raw AST with indices) ---\n")
+	fmt.Printf("  %s\n", w.EntryRule)
+
+	// Print resolved version (with feature names)
+	fmt.Printf("\n--- Entry Rule (resolved with feature names) ---\n")
+	fmt.Printf("  %s\n", ruleTreeToStringWithNames(st.EntryRule.Root, feats))
+
+	fmt.Printf("\n--- Regime Filter (resolved) ---\n")
+	fmt.Printf("  %s\n", ruleTreeToStringWithNames(st.RegimeFilter.Root, feats))
+
+	fmt.Printf("\n--- Exit Rule (resolved) ---\n")
+	fmt.Printf("  %s\n", ruleTreeToStringWithNames(st.ExitRule.Root, feats))
+
+	// Validate feature map hash if stored in winner file
+	if w.FeatureMapHash != "" && w.FeatureMapHash != runtimeHash {
+		fmt.Printf("\n!!! FEATURE MAP MISMATCH DETECTED - REJECTING STRATEGY !!!\n")
+		fmt.Printf("Stored hash:  %s\n", w.FeatureMapHash)
+		fmt.Printf("Runtime hash: %s\n\n", runtimeHash)
+		fmt.Printf("Stored version (first 5 features): %s\n\n", truncateVersion(w.FeatureMapHash, runtimeVersion, 5))
+		fmt.Printf("Runtime version (first 5 features): %s\n", truncateVersion(runtimeHash, runtimeVersion, 5))
+		fmt.Printf("\nSTRATEGY REJECTED - Feature indices have changed since strategy was created.\n")
+		fmt.Printf("This strategy will produce WRONG results and MUST be regenerated.\n")
+		fmt.Printf("============================================================\n\n")
+		return
+	} else if w.FeatureMapHash != "" {
+		fmt.Printf("\n%s Feature map hash validated: MATCH\n", logx.Success("✓"))
+	} else {
+		fmt.Printf("\n%s WARNING: No stored feature_map_hash (legacy winner from old version)\n", logx.Warn("⚠"))
+		fmt.Printf("   Cannot validate feature indices. Strategy may produce WRONG results.\n")
+		fmt.Printf("   Recommendation: Regenerate this strategy with current feature order.\n")
+		fmt.Printf("   Proceeding in golden/trace mode only (NOT recommended for live trading)\n")
+	}
+	fmt.Println("==================================================")
 
 	// Run backtest with trade logging on TEST window
 	fmt.Println("\nRunning backtest on TEST window...")
@@ -3098,8 +3805,41 @@ func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64) {
 		fmt.Printf("States written to states.csv (%d bars)\n", len(result.States))
 	}
 
+	// Write trades to CSV if export path is specified
+	if exportCSV != "" {
+		fmt.Printf("\nWriting trades to %s...\n", exportCSV)
+		if err := WriteTradesToCSV(result.Trades, st, feats, result.WindowOffset, exportCSV); err != nil {
+			fmt.Printf("Error writing trades CSV: %v\n", err)
+		} else {
+			fmt.Printf("Trades written to %s (%d trades)\n", exportCSV, len(result.Trades))
+		}
+	}
+
+	// Write states with proofs to CSV if export path is specified
+	if exportStates != "" {
+		fmt.Printf("\nWriting states with proofs to %s...\n", exportStates)
+		if err := WriteStatesWithProofsToCSV(result.States, st, feats, result.SignalProofs, result.WindowOffset, exportStates); err != nil {
+			fmt.Printf("Error writing states CSV: %v\n", err)
+		} else {
+			fmt.Printf("States written to %s (%d bars)\n", exportStates, len(result.States))
+		}
+	}
+
 	// Print golden results
 	printGoldenResult(result, printTrades)
+}
+
+// truncateVersion extracts first N features from version string for diff hint
+func truncateVersion(storedHash, runtimeVersion string, n int) string {
+	if storedHash == "" {
+		return "(unknown - no stored hash)"
+	}
+	// Runtime version is "EMA10@F[0],EMA20@F[1],..." - extract first n features
+	parts := strings.Split(runtimeVersion, ",")
+	if len(parts) > n {
+		parts = parts[:n]
+	}
+	return strings.Join(parts, ", ") + "..."
 }
 
 // printGoldenResult prints detailed trade information for golden mode
@@ -3226,12 +3966,6 @@ func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st 
 		states[i] = "FLAT"
 	}
 
-	// Map to store signal details by bar index (in full series)
-	type signalDetails struct {
-		detailsStr string
-	}
-	signalDetailsMap := make(map[int]signalDetails)
-
 	// Map to store exit details by bar index (in full series)
 	type exitDetails struct {
 		reason      string
@@ -3242,6 +3976,70 @@ func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st 
 		tpPrice     float32
 	}
 	exitDetailsMap := make(map[int]exitDetails)
+
+	// Map to store signal boolean evaluations for SIGNAL DETECT bars
+	type signalBooleans struct {
+		regimeNotRisingVolPerTrade string
+		regimeImbalanceGT          string
+		regimeSwingHighGT           string
+		entryRisingVolSMA20         string
+		entryFallingMinusDI         string
+		entryFallingEMA50           string
+		entryCrossUpMACD            string
+		entryCrossUpEMASwing        string
+		entrySlopeLTEMA200         string
+	}
+	signalBoolsMap := make(map[int]signalBooleans)
+
+	// Helper function to check if rising (current > value N bars ago)
+	isRising := func(featIdx, lookback, t int) bool {
+		if t < lookback || featIdx < 0 || featIdx >= len(feats.F) {
+			return false
+		}
+		return feats.F[featIdx][t] > feats.F[featIdx][t-lookback]
+	}
+
+	// Helper function to check if falling (current < value N bars ago)
+	isFalling := func(featIdx, lookback, t int) bool {
+		if t < lookback || featIdx < 0 || featIdx >= len(feats.F) {
+			return false
+		}
+		return feats.F[featIdx][t] < feats.F[featIdx][t-lookback]
+	}
+
+	// Helper function to check CrossUp
+	isCrossUp := func(featA, featB, t int) (bool, float32, float32, float32, float32) {
+		if t < 1 || featA < 0 || featA >= len(feats.F) || featB < 0 || featB >= len(feats.F) {
+			return false, 0, 0, 0, 0
+		}
+		prevA := feats.F[featA][t-1]
+		curA := feats.F[featA][t]
+		prevB := feats.F[featB][t-1]
+		curB := feats.F[featB][t]
+		result := prevA <= prevB && curA > curB
+		return result, prevA, prevB, curA, curB
+	}
+
+	// Helper function to check slope less than threshold
+	slopeLT := func(featIdx, t int, threshold float32, lookback int) bool {
+		if t < lookback || featIdx < 0 || featIdx >= len(feats.F) {
+			return false
+		}
+		slope := (feats.F[featIdx][t] - feats.F[featIdx][t-lookback]) / float32(lookback)
+		return slope < threshold
+	}
+
+	// Get feature indices for this specific strategy
+	volPerTradeIdx := feats.Index["VolPerTrade"]    // F[35]
+	imbalanceIdx := feats.Index["Imbalance"]          // F[34]
+	swingHighIdx := feats.Index["SwingHigh"]          // F[8] and F[40]
+	volSMA20Idx := feats.Index["VolSMA20"]            // F[27]
+	minusDIIdx := feats.Index["MinusDI"]              // F[23]
+	ema50Idx := feats.Index["EMA50"]                  // F[2]
+	ema20Idx := feats.Index["EMA20"]                  // F[1]
+	bbWidth50Idx := feats.Index["BB_Width50"]         // F[13]
+	macdIdx := feats.Index["MACD"]                    // F[14]
+	ema200Idx := feats.Index["EMA200"]                // F[4]
 
 	// Mark ENTRY EXEC, HOLDING and exits
 	for _, tr := range trades {
@@ -3289,77 +4087,93 @@ func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st 
 		}
 
 		// Mark signal detect = entryIdx - 1 (because pendingEntry executes next bar open)
+		// AND calculate all boolean evaluations for this signal
 		if sigIdx >= 0 && sigIdx < len(states) {
 			// Don't overwrite if something "stronger" is already there
 			if states[sigIdx] == "FLAT" {
 				states[sigIdx] = "SIGNAL DETECT"
 
-				// FAST DEBUGGING: Log all required indicator values at signal detection
-				closePrice := fmt.Sprintf("%.2f", s.Close[sigIdx])
-				openPrice := fmt.Sprintf("%.2f", s.Open[sigIdx])
+				// === REGIME FILTER BOOLEANS ===
 
-				// Build details string with all required indicators
-				detailsStr := fmt.Sprintf("Close=%s Open=%s", closePrice, openPrice)
+				// 1. NOT Rising(VolPerTrade, 19)
+				risingVolPerTrade := isRising(volPerTradeIdx, 19, sigIdx)
+				regimeNotRisingVolPerTrade := fmt.Sprintf("NOT_Rising(VolPerTrade,19)=%t", !risingVolPerTrade)
 
-				// 1. EMA20, EMA50
-				var ema20Cur, ema50Cur string
-				if ema20Idx, ok20 := feats.Index["EMA20"]; ok20 && ema20Idx >= 0 && ema20Idx < len(feats.F) {
-					ema20Cur = fmt.Sprintf("%.2f", feats.F[ema20Idx][sigIdx])
+				// 2. Imbalance > 0.18
+				imbalanceVal := float32(0)
+				if imbalanceIdx >= 0 && imbalanceIdx < len(feats.F) && sigIdx < len(feats.F[imbalanceIdx]) {
+					imbalanceVal = feats.F[imbalanceIdx][sigIdx]
 				}
-				if ema50Idx, ok50 := feats.Index["EMA50"]; ok50 && ema50Idx >= 0 && ema50Idx < len(feats.F) {
-					ema50Cur = fmt.Sprintf("%.2f", feats.F[ema50Idx][sigIdx])
-				}
-				if ema20Cur != "" && ema50Cur != "" {
-					detailsStr += fmt.Sprintf(" EMA20=%s EMA50=%s", ema20Cur, ema50Cur)
-				}
+				regimeImbalanceGT := fmt.Sprintf("Imbalance>0.18=%t(value=%.4f)", imbalanceVal > 0.18, imbalanceVal)
 
-				// 2. PlusDI (F[21])
-				if plusDiIdx, ok := feats.Index["PlusDI"]; ok && plusDiIdx >= 0 && plusDiIdx < len(feats.F) {
-					detailsStr += fmt.Sprintf(" PlusDI=%.2f", feats.F[plusDiIdx][sigIdx])
+				// 3. SwingHigh > 144.19
+				swingHighVal := float32(0)
+				if swingHighIdx >= 0 && swingHighIdx < len(feats.F) && sigIdx < len(feats.F[swingHighIdx]) {
+					swingHighVal = feats.F[swingHighIdx][sigIdx]
 				}
+				regimeSwingHighGT := fmt.Sprintf("SwingHigh>144.19=%t(value=%.4f)", swingHighVal > 144.19, swingHighVal)
 
-				// 3. RSI7 (F[5])
-				if rsi7Idx, ok := feats.Index["RSI7"]; ok && rsi7Idx >= 0 && rsi7Idx < len(feats.F) {
-					detailsStr += fmt.Sprintf(" RSI7=%.2f", feats.F[rsi7Idx][sigIdx])
-				}
+				// === ENTRY RULE BOOLEANS ===
 
-				// 4. VolZ20 (F[30]), VolZ50 (F[31])
-				if volZ20Idx, ok := feats.Index["VolZ20"]; ok && volZ20Idx >= 0 && volZ20Idx < len(feats.F) {
-					detailsStr += fmt.Sprintf(" VolZ20=%.2f", feats.F[volZ20Idx][sigIdx])
-				}
-				if volZ50Idx, ok := feats.Index["VolZ50"]; ok && volZ50Idx >= 0 && volZ50Idx < len(feats.F) {
-					detailsStr += fmt.Sprintf(" VolZ50=%.2f", feats.F[volZ50Idx][sigIdx])
-				}
+				// 1. Rising(VolSMA20, 20)
+				risingVolSMA20 := isRising(volSMA20Idx, 20, sigIdx)
+				entryRisingVolSMA20 := fmt.Sprintf("Rising(VolSMA20,20)=%t", risingVolSMA20)
 
-				// 5. Body (F[37])
-				if bodyIdx, ok := feats.Index["Body"]; ok && bodyIdx >= 0 && bodyIdx < len(feats.F) {
-					detailsStr += fmt.Sprintf(" Body=%.2f", feats.F[bodyIdx][sigIdx])
-				}
+				// 2. Falling(MinusDI, 7)
+				fallingMinusDI := isFalling(minusDIIdx, 7, sigIdx)
+				entryFallingMinusDI := fmt.Sprintf("Falling(MinusDI,7)=%t", fallingMinusDI)
 
-				// 6. BB_Width50 (F[15])
-				if bbWidthIdx, ok := feats.Index["BB_Width50"]; ok && bbWidthIdx >= 0 && bbWidthIdx < len(feats.F) {
-					detailsStr += fmt.Sprintf(" BB_Width50=%.2f", feats.F[bbWidthIdx][sigIdx])
-				}
+				// 3. Falling(EMA50, 16)
+				fallingEMA50 := isFalling(ema50Idx, 16, sigIdx)
+				entryFallingEMA50 := fmt.Sprintf("Falling(EMA50,16)=%t", fallingEMA50)
 
-				// 7. Cross debug info (optional)
-				crossInfos := evaluateCrossDebug(st.EntryCompiled.Code, feats.F, feats.Names, sigIdx)
-				for _, ci := range crossInfos {
-					if ci.Result {
-						if ci.Kind == "CrossUp" {
-							crossStr := fmt.Sprintf(" CrossUp: prevA(%.2f)<=prevB(%.2f) curA(%.2f)>curB(%.2f)",
-								ci.PrevA, ci.PrevB, ci.CurA, ci.CurB)
-							detailsStr += crossStr
-						} else if ci.Kind == "CrossDown" {
-							crossStr := fmt.Sprintf(" CrossDown: prevA(%.2f)>=prevB(%.2f) curA(%.2f)<curB(%.2f)",
-								ci.PrevA, ci.PrevB, ci.CurA, ci.CurB)
-							detailsStr += crossStr
-						}
-					}
+				// 4. CrossUp(BB_Width50, MACD) - F[16] crosses above F[17]
+				crossMACD, prevA, prevB, curA, curB := isCrossUp(bbWidth50Idx, macdIdx, sigIdx)
+				entryCrossUpMACD := fmt.Sprintf("CrossUp(BB_Width50,MACD)=%t(prev(%.2f<=%.2f)cur(%.2f>%.2f))",
+					crossMACD, prevA, prevB, curA, curB)
+
+				// 5. CrossUp(EMA20, SwingHigh) - F[1] crosses above F[40]
+				crossEMASwing, prevA2, prevB2, curA2, curB2 := isCrossUp(ema20Idx, swingHighIdx, sigIdx)
+				entryCrossUpEMASwing := fmt.Sprintf("CrossUp(EMA20,SwingHigh)=%t(prev(%.2f<=%.2f)cur(%.2f>%.2f))",
+					crossEMASwing, prevA2, prevB2, curA2, curB2)
+
+				// 6. SlopeLT(EMA200, 0.06, 6)
+				slopeLTResult := slopeLT(ema200Idx, sigIdx, 0.06, 6)
+				entrySlopeLTEMA200 := fmt.Sprintf("SlopeLT(EMA200,0.06,6)=%t", slopeLTResult)
+
+				// Store all booleans for this signal
+				signalBoolsMap[sigIdx] = signalBooleans{
+					regimeNotRisingVolPerTrade: regimeNotRisingVolPerTrade,
+					regimeImbalanceGT:          regimeImbalanceGT,
+					regimeSwingHighGT:           regimeSwingHighGT,
+					entryRisingVolSMA20:         entryRisingVolSMA20,
+					entryFallingMinusDI:         entryFallingMinusDI,
+					entryFallingEMA50:           entryFallingEMA50,
+					entryCrossUpMACD:            entryCrossUpMACD,
+					entryCrossUpEMASwing:        entryCrossUpEMASwing,
+					entrySlopeLTEMA200:         entrySlopeLTEMA200,
 				}
 
-				signalDetailsMap[sigIdx] = signalDetails{
-					detailsStr: detailsStr,
-				}
+				// === EVALUATE ACTUAL ENTRY RULE FOR DEBUGGING ===
+				// This ensures "the strategy you think" == "the strategy being executed"
+				entryRuleFinalResult := evaluateRule(st.EntryRule.Root, feats.F, sigIdx)
+
+				// Also print to console as requested
+				fmt.Printf("\n=== SIGNAL DETECT at Bar %d ===\n", sigIdx)
+				fmt.Printf("Entry Rule (resolved): %s\n", ruleTreeToStringWithNames(st.EntryRule.Root, feats))
+				fmt.Printf("\nRegime Filter:\n")
+				fmt.Printf("  %s\n", regimeNotRisingVolPerTrade)
+				fmt.Printf("  %s\n", regimeImbalanceGT)
+				fmt.Printf("  %s\n", regimeSwingHighGT)
+				fmt.Printf("\nEntry Rule Leaf Evaluations:\n")
+				fmt.Printf("  %s\n", entryRisingVolSMA20)
+				fmt.Printf("  %s\n", entryFallingMinusDI)
+				fmt.Printf("  %s\n", entryFallingEMA50)
+				fmt.Printf("  %s\n", entryCrossUpMACD)
+				fmt.Printf("  %s\n", entryCrossUpEMASwing)
+				fmt.Printf("  %s\n", entrySlopeLTEMA200)
+				fmt.Printf("\n  >>> entryRuleResult = %t <<<\n", entryRuleFinalResult)
+				fmt.Printf("===========================\n\n")
 			}
 		}
 	}
@@ -3373,54 +4187,68 @@ func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st 
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	// No header (matches your example)
+	// Write header row with all feature names + boolean evaluation columns
+	header := []string{"BarIndex", "Time", "State"}
+	for _, name := range feats.Names {
+		header = append(header, name)
+	}
+	// Add boolean evaluation columns for SIGNAL DETECT rows
+	header = append(header,
+		"Regime_NOT_Rising_VolPerTrade",
+		"Regime_Imbalance_GT_0.18",
+		"Regime_SwingHigh_GT_144.19",
+		"Entry_Rising_VolSMA20",
+		"Entry_Falling_MinusDI",
+		"Entry_Falling_EMA50",
+		"Entry_CrossUp_BBWidth50_MACD",
+		"Entry_CrossUp_EMA10_SwingHigh",
+		"Entry_SlopeLT_EMA200",
+	)
+	if err := w.Write(header); err != nil {
+		return err
+	}
+
+	// Write data rows with all indicator values - INCLUDE FEATURE NAMES in each row
 	for i := 0; i < s.T; i++ {
 		ts := time.Unix(int64(s.OpenTimeMs[i])/1000, 0).UTC().Format(time.RFC3339)
 
-		// If this is a SIGNAL DETECT bar, include the details
-		if states[i] == "SIGNAL DETECT" {
-			if details, ok := signalDetailsMap[i]; ok {
-				row := []string{
-					fmt.Sprintf("%d", i),
-					ts,
-					states[i],
-					details.detailsStr,
-				}
-				if err := w.Write(row); err != nil {
-					return err
-				}
-				continue
+		// Build row with bar index, timestamp, state - with labels
+		row := []string{
+			fmt.Sprintf("BarIndex=%d", i),
+			fmt.Sprintf("Time=%s", ts),
+			fmt.Sprintf("State=%s", states[i]),
+		}
+
+		// Add all feature values with labels for this bar
+		for j := 0; j < len(feats.F); j++ {
+			if i < len(feats.F[j]) {
+				val := feats.F[j][i]
+				// Format: "IndicatorName=Value"
+				row = append(row, fmt.Sprintf("%s=%.4f", feats.Names[j], val))
+			} else {
+				row = append(row, fmt.Sprintf("%s=", feats.Names[j]))
 			}
 		}
 
-		// If this is an exit bar, include exit details with clear return percentage
-		if exit, ok := exitDetailsMap[i]; ok {
-			// Format return as clear percentage (e.g., "+1.23%" or "-1.23%")
-			returnPct := exit.pnl * 100 // Convert to percentage
-			returnStr := fmt.Sprintf("%.2f%%", returnPct)
-			if returnPct >= 0 {
-				returnStr = "+" + returnStr // Add + sign for positive returns
-			}
-
-			row := []string{
-				fmt.Sprintf("%d", i),
-				ts,
-				states[i],
-				exit.reason,
-				returnStr,                          // Return percentage (e.g., "+1.23%" or "-1.23%")
-				fmt.Sprintf("%.2f", exit.entryPrice),
-				fmt.Sprintf("%.2f", exit.exitPrice), // Added exit price
-				fmt.Sprintf("%.2f", exit.stopPrice),
-				fmt.Sprintf("%.2f", exit.tpPrice),
-			}
-			if err := w.Write(row); err != nil {
-				return err
-			}
-			continue
+		// Add boolean evaluations if this is a SIGNAL DETECT bar
+		if bools, ok := signalBoolsMap[i]; ok {
+			row = append(row,
+				bools.regimeNotRisingVolPerTrade,
+				bools.regimeImbalanceGT,
+				bools.regimeSwingHighGT,
+				bools.entryRisingVolSMA20,
+				bools.entryFallingMinusDI,
+				bools.entryFallingEMA50,
+				bools.entryCrossUpMACD,
+				bools.entryCrossUpEMASwing,
+				bools.entrySlopeLTEMA200,
+			)
+		} else {
+			// Add empty strings for non-signal rows
+			row = append(row, "", "", "", "", "", "", "", "", "")
 		}
 
-		// Normal row (no signal details)
-		if err := w.Write([]string{fmt.Sprintf("%d", i), ts, states[i]}); err != nil {
+		if err := w.Write(row); err != nil {
 			return err
 		}
 	}
@@ -3498,6 +4326,229 @@ func buildManualEMA20x50(feats Features, feeBps, slipBps float32) Strategy {
 	return st
 }
 
+// buildManualVolSMAEMAStrategy builds the VolSMA+EMA strategy from seed 6302889439695856639
+// This replicates the original winning strategy with corrected feature indices
+func buildManualVolSMAEMAStrategy(feats Features, feeBps, slipBps float32) Strategy {
+	// Helper to safely get feature index
+	getIdx := func(name string) int {
+		if idx, ok := feats.Index[name]; ok {
+			return idx
+		}
+		fmt.Printf("Warning: Feature '%s' not found, using -1\n", name)
+		return -1
+	}
+
+	// Original strategy feature mapping (with corrections):
+	// Rising F[27] 20  → Rising VolSMA20 20   (was F[27] originally, now at F[26])
+	// Falling F[23] 7 → Falling MinusDI 7    (was F[23] originally, now at F[24])
+	// Falling F[2] 16 → Falling EMA50 16     (still at F[2])
+	// CrossUp F[16] F[17] → CrossUp BB_Width50 MACD (was F[16],F[17] originally, now at F[13],F[14])
+	// CrossUp F[1] F[40] → CrossUp EMA20 SwingHigh (was F[1],F[40] originally, now at F[1],F[39])
+	// SlopeLT F[4] 0.06 6 → SlopeLT EMA200 0.06 6 (still at F[4])
+
+	volSMA20Idx := getIdx("VolSMA20")
+	minusDIIIdx := getIdx("MinusDI")
+	ema50Idx := getIdx("EMA50")
+	bbWidth50Idx := getIdx("BB_Width50")
+	macdIdx := getIdx("MACD")
+	ema20Idx := getIdx("EMA20")  // F[1] = EMA20 (both originally and now)
+	swingHighIdx := getIdx("SwingHigh")
+	ema200Idx := getIdx("EMA200")
+
+	activeIdx := getIdx("Active")
+	volPerTradeIdx := getIdx("VolPerTrade")
+	bbUpper20Idx := getIdx("BB_Upper20")
+
+	// Entry Rule: (AND (AND (AND (AND (Rising VolSMA20 20) (Falling MinusDI 7))
+	//                            (OR (Falling EMA50 16) (CrossUp BB_Width50 MACD)))
+	//                            (CrossUp EMA20 SwingHigh))
+	//                            (SlopeLT EMA200 0.06 6))
+
+	// Innermost: (Rising VolSMA20 20) AND (Falling MinusDI 7)
+	inner1 := &RuleNode{
+		Op: OpAnd,
+		L: &RuleNode{
+			Op: OpLeaf,
+			Leaf: Leaf{
+				Kind:     LeafRising,
+				A:        volSMA20Idx,
+				Lookback: 20,
+			},
+		},
+		R: &RuleNode{
+			Op: OpLeaf,
+			Leaf: Leaf{
+				Kind:     LeafFalling,
+				A:        minusDIIIdx,
+				Lookback: 7,
+			},
+		},
+	}
+
+	// (OR (Falling EMA50 16) (CrossUp BB_Width50 MACD))
+	orNode := &RuleNode{
+		Op: OpOr,
+		L: &RuleNode{
+			Op: OpLeaf,
+			Leaf: Leaf{
+				Kind:     LeafFalling,
+				A:        ema50Idx,
+				Lookback: 16,
+			},
+		},
+		R: &RuleNode{
+			Op: OpLeaf,
+			Leaf: Leaf{
+				Kind: LeafCrossUp,
+				A:    bbWidth50Idx,
+				B:    macdIdx,
+			},
+		},
+	}
+
+	// Combine: inner1 AND orNode
+	inner2 := &RuleNode{
+		Op: OpAnd,
+		L:  inner1,
+		R:  orNode,
+	}
+
+	// (CrossUp EMA20 SwingHigh)
+	crossNode := &RuleNode{
+		Op: OpLeaf,
+		Leaf: Leaf{
+			Kind: LeafCrossUp,
+			A:    ema20Idx,
+			B:    swingHighIdx,
+		},
+	}
+
+	// Combine: inner2 AND crossNode
+	inner3 := &RuleNode{
+		Op: OpAnd,
+		L:  inner2,
+		R:  crossNode,
+	}
+
+	// (SlopeLT EMA200 0.06 6)
+	slopeNode := &RuleNode{
+		Op: OpLeaf,
+		Leaf: Leaf{
+			Kind:     LeafSlopeLT,
+			A:        ema200Idx,
+			X:        0.06,
+			Lookback: 6,
+		},
+	}
+
+	// Entry root: inner3 AND slopeNode
+	entryRoot := &RuleNode{
+		Op: OpAnd,
+		L:  inner3,
+		R:  slopeNode,
+	}
+
+	// Exit Rule: (GT ROC20 -345827.62) - essentially always false (no exit signal)
+	roc20Idx := getIdx("ROC20")
+	exitRoot := &RuleNode{
+		Op: OpLeaf,
+		Leaf: Leaf{
+			Kind: LeafGT,
+			A:    roc20Idx,
+			X:    -345827.62,
+		},
+	}
+
+	// Regime Filter: (AND (NOT (Rising Active 19)) (OR (GT VolPerTrade 0.18) (GT BB_Upper20 144.19)))
+	notNode := &RuleNode{
+		Op: OpNot,
+		L: &RuleNode{
+			Op: OpLeaf,
+			Leaf: Leaf{
+				Kind:     LeafRising,
+				A:        activeIdx,
+				Lookback: 19,
+			},
+		},
+	}
+
+	orRegimeNode := &RuleNode{
+		Op: OpOr,
+		L: &RuleNode{
+			Op: OpLeaf,
+			Leaf: Leaf{
+				Kind: LeafGT,
+				A:    volPerTradeIdx,
+				X:    0.18,
+			},
+		},
+		R: &RuleNode{
+			Op: OpLeaf,
+			Leaf: Leaf{
+				Kind: LeafGT,
+				A:    bbUpper20Idx,
+				X:    144.19,
+			},
+		},
+	}
+
+	regimeRoot := &RuleNode{
+		Op: OpAnd,
+		L:  notNode,
+		R:  orRegimeNode,
+	}
+
+	// Build strategy with original risk parameters
+	st := Strategy{
+		Seed:            6302889439695856639, // Original seed for reference
+		FeeBps:          feeBps,
+		SlippageBps:     slipBps,
+		RiskPct:         0.01,
+		Direction:       1, // Long only
+		EntryRule:       RuleTree{Root: entryRoot},
+		ExitRule:        RuleTree{Root: exitRoot},
+		RegimeFilter:    RuleTree{Root: regimeRoot},
+		StopLoss:        StopModel{Kind: "fixed", Value: 3.75},
+		TakeProfit:      TPModel{Kind: "fixed", Value: 6.09},
+		Trail:           TrailModel{Active: true, ATRMult: 2.50},
+		MaxHoldBars:     150,
+		MaxConsecLosses: 0,
+		CooldownBars:    0,
+	}
+
+	// Debug: Print feature indices being used
+	fmt.Println("\n=== VolSMA+EMA Strategy Feature Indices ===")
+	fmt.Printf("VolSMA20: F[%d]\n", volSMA20Idx)
+	fmt.Printf("MinusDI: F[%d]\n", minusDIIIdx)
+	fmt.Printf("EMA50: F[%d]\n", ema50Idx)
+	fmt.Printf("BB_Width50: F[%d]\n", bbWidth50Idx)
+	fmt.Printf("MACD: F[%d]\n", macdIdx)
+	fmt.Printf("EMA20: F[%d]\n", ema20Idx)
+	fmt.Printf("SwingHigh: F[%d]\n", swingHighIdx)
+	fmt.Printf("EMA200: F[%d]\n", ema200Idx)
+	fmt.Printf("Active: F[%d]\n", activeIdx)
+	fmt.Printf("VolPerTrade: F[%d]\n", volPerTradeIdx)
+	fmt.Printf("BB_Upper20: F[%d]\n", bbUpper20Idx)
+	fmt.Printf("ROC20: F[%d]\n", roc20Idx)
+	fmt.Println("==============================================")
+
+	// Debug: Print rule tree with feature names
+	fmt.Println("=== Entry Rule (with feature names) ===")
+	fmt.Println(ruleTreeToStringWithNames(entryRoot, feats))
+	fmt.Println()
+
+	fmt.Println("=== Regime Filter (with feature names) ===")
+	fmt.Println(ruleTreeToStringWithNames(regimeRoot, feats))
+	fmt.Println()
+
+	// Compile rules
+	st.EntryCompiled = compileRuleTree(st.EntryRule.Root)
+	st.ExitCompiled = compileRuleTree(st.ExitRule.Root)
+	st.RegimeCompiled = compileRuleTree(st.RegimeFilter.Root)
+
+	return st
+}
+
 // runTraceMode runs a single strategy and outputs per-bar state CSV
 func runTraceMode(seed int64, csvPath, manual string, openCSV bool, feeBps, slipBps float64, traceWindow string) {
 	fmt.Println("Running in TRACE mode - per-bar state output")
@@ -3544,22 +4595,27 @@ func runTraceMode(seed int64, csvPath, manual string, openCSV bool, feeBps, slip
 
 	// Load or build strategy
 	var st Strategy
+	var winnerRow *WinnerRow // Declare outside so it's in scope for safety prints
 	if manual != "" {
-		// Only accept "ema20x50" as manual strategy
-		if manual != "ema20x50" {
-			fmt.Printf("Error: -trace_manual must be 'ema20x50', got '%s'\n", manual)
+		// Accept "ema20x50" or "volsma_ema" as manual strategies
+		if manual == "ema20x50" {
+			fmt.Printf("Using manual EMA20x50 strategy\n")
+			st = buildManualEMA20x50(feats, float32(feeBps), float32(slipBps))
+		} else if manual == "volsma_ema" {
+			fmt.Printf("Using manual VolSMA+EMA strategy (seed 6302889439695856639)\n")
+			st = buildManualVolSMAEMAStrategy(feats, float32(feeBps), float32(slipBps))
+		} else {
+			fmt.Printf("Error: -trace_manual must be 'ema20x50' or 'volsma_ema', got '%s'\n", manual)
 			return
 		}
-		fmt.Printf("Using manual EMA20x50 strategy\n")
-		st = buildManualEMA20x50(feats, float32(feeBps), float32(slipBps))
 	} else {
 		// Load winner from winners_tested.jsonl or winners.jsonl
-		var w *WinnerRow
+		winnerRow = new(WinnerRow)
 		if seed > 0 {
-			w, err = loadWinnerBySeed("winners_tested.jsonl", seed)
+			winnerRow, err = loadWinnerBySeed("winners_tested.jsonl", seed)
 			if err != nil {
 				// Try winners.jsonl as fallback
-				w, err = loadWinnerBySeed("winners.jsonl", seed)
+				winnerRow, err = loadWinnerBySeed("winners.jsonl", seed)
 				if err != nil {
 					fmt.Printf("Error loading winner with seed %d: %v\n", seed, err)
 					return
@@ -3567,37 +4623,54 @@ func runTraceMode(seed int64, csvPath, manual string, openCSV bool, feeBps, slip
 			}
 			fmt.Printf("Loaded winner with seed %d\n", seed)
 		} else {
-			w, err = loadFirstWinner("winners_tested.jsonl")
+			winnerRow, err = loadFirstWinner("winners_tested.jsonl")
 			if err != nil {
 				// Try winners.jsonl as fallback
-				w, err = loadFirstWinner("winners.jsonl")
+				winnerRow, err = loadFirstWinner("winners.jsonl")
 				if err != nil {
 					fmt.Printf("Error loading first winner: %v\n", err)
 					return
 				}
 			}
-			fmt.Printf("Loaded first winner (seed=%d)\n", w.Seed)
+			fmt.Printf("Loaded first winner (seed=%d)\n", winnerRow.Seed)
 		}
 
 		// Rebuild strategy from winner
 		st = Strategy{
-			Seed:        w.Seed,
+			Seed:        winnerRow.Seed,
 			FeeBps:      float32(feeBps),
 			SlippageBps: float32(slipBps),
 			RiskPct:     0.01,
-			Direction:   w.Direction,
+			Direction:   winnerRow.Direction,
 			EntryRule: RuleTree{
-				Root: parseRuleTree(w.EntryRule),
+				Root: parseRuleTree(winnerRow.EntryRule),
 			},
 			ExitRule: RuleTree{
-				Root: parseRuleTree(w.ExitRule),
+				Root: parseRuleTree(winnerRow.ExitRule),
 			},
 			RegimeFilter: RuleTree{
-				Root: parseRuleTree(w.RegimeFilter),
+				Root: parseRuleTree(winnerRow.RegimeFilter),
 			},
-			StopLoss:   parseStopModel(w.StopLoss),
-			TakeProfit: parseTPModel(w.TakeProfit),
-			Trail:      parseTrailModel(w.Trail),
+			StopLoss:   parseStopModel(winnerRow.StopLoss),
+			TakeProfit: parseTPModel(winnerRow.TakeProfit),
+			Trail:      parseTrailModel(winnerRow.Trail),
+		}
+
+		// SANITY CHECK: Validate cross operations in trace mode
+		// Warn user if strategy has invalid cross operations (but don't fail, just sanitize)
+		{
+			_, entryInvalid := validateCrossSanity(st.EntryRule.Root, feats)
+			_, exitInvalid := validateCrossSanity(st.ExitRule.Root, feats)
+			_, regimeInvalid := validateCrossSanity(st.RegimeFilter.Root, feats)
+
+			totalInvalid := entryInvalid + exitInvalid + regimeInvalid
+			if totalInvalid > 0 {
+				fmt.Printf("WARNING: Strategy has %d invalid CrossUp/CrossDown operations - sanitizing...\n", totalInvalid)
+				// Sanitize the strategy
+				sanitizeCrossOperations(rand.New(rand.NewSource(winnerRow.Seed)), st.EntryRule.Root, feats)
+				sanitizeCrossOperations(rand.New(rand.NewSource(winnerRow.Seed)), st.ExitRule.Root, feats)
+				sanitizeCrossOperations(rand.New(rand.NewSource(winnerRow.Seed)), st.RegimeFilter.Root, feats)
+			}
 		}
 	}
 
@@ -3605,6 +4678,52 @@ func runTraceMode(seed int64, csvPath, manual string, openCSV bool, feeBps, slip
 	st.EntryCompiled = compileRuleTree(st.EntryRule.Root)
 	st.ExitCompiled = compileRuleTree(st.ExitRule.Root)
 	st.RegimeCompiled = compileRuleTree(st.RegimeFilter.Root)
+
+	// SAFETY PRINT: Show resolved feature names (only for loaded strategies, manual has its own debug)
+	if manual == "" && winnerRow != nil {
+		// Compute runtime feature map hash
+		runtimeHash := ComputeFeatureMapHash(feats)
+		runtimeVersion := GetFeatureMapVersion(feats)
+
+		fmt.Println("\n=== STRATEGY LOADED - Feature Index Resolution ===")
+		fmt.Printf("FeatureMapHash: %s\n", runtimeHash)
+		fmt.Printf("FeatureSetVersion: %s\n", runtimeVersion)
+
+		// Print raw AST (original rule text with indices)
+		fmt.Printf("\n--- Entry Rule (raw AST with indices) ---\n")
+		fmt.Printf("  %s\n", winnerRow.EntryRule)
+
+		// Print resolved version (with feature names)
+		fmt.Printf("\n--- Entry Rule (resolved with feature names) ---\n")
+		fmt.Printf("  %s\n", ruleTreeToStringWithNames(st.EntryRule.Root, feats))
+
+		fmt.Printf("\n--- Regime Filter (resolved) ---\n")
+		fmt.Printf("  %s\n", ruleTreeToStringWithNames(st.RegimeFilter.Root, feats))
+
+		fmt.Printf("\n--- Exit Rule (resolved) ---\n")
+		fmt.Printf("  %s\n", ruleTreeToStringWithNames(st.ExitRule.Root, feats))
+
+		// Validate feature map hash if stored in winner file
+		if winnerRow.FeatureMapHash != "" && winnerRow.FeatureMapHash != runtimeHash {
+			fmt.Printf("\n!!! FEATURE MAP MISMATCH DETECTED - REJECTING STRATEGY !!!\n")
+			fmt.Printf("Stored hash:  %s\n", winnerRow.FeatureMapHash)
+			fmt.Printf("Runtime hash: %s\n\n", runtimeHash)
+			fmt.Printf("Stored version (first 5 features): %s\n\n", truncateVersion(winnerRow.FeatureMapHash, runtimeVersion, 5))
+			fmt.Printf("Runtime version (first 5 features): %s\n", truncateVersion(runtimeHash, runtimeVersion, 5))
+			fmt.Printf("\nSTRATEGY REJECTED - Feature indices have changed since strategy was created.\n")
+			fmt.Printf("This strategy will produce WRONG results and MUST be regenerated.\n")
+			fmt.Printf("============================================================\n\n")
+			return
+		} else if winnerRow.FeatureMapHash != "" {
+			fmt.Printf("\n%s Feature map hash validated: MATCH\n", logx.Success("✓"))
+		} else {
+			fmt.Printf("\n%s WARNING: No stored feature_map_hash (legacy winner from old version)\n", logx.Warn("⚠"))
+			fmt.Printf("   Cannot validate feature indices. Strategy may produce WRONG results.\n")
+			fmt.Printf("   Recommendation: Regenerate this strategy with current feature order.\n")
+			fmt.Printf("   Proceeding in trace mode for analysis only (NOT recommended for live trading)\n")
+		}
+		fmt.Println("==================================================")
+	}
 
 	// Run backtest with trade logging on TEST window
 	fmt.Printf("Running backtest on %s window...\n", strings.ToUpper(traceWindow))

@@ -139,7 +139,7 @@ func max(a, b int) int {
 // applySafeCrossover wraps crossover with safety check
 func applySafeCrossover(rng *rand.Rand, a, b Strategy, feats Features, series Series, fullF Features) (Strategy, bool, float32) {
 	// Perform normal crossover
-	child := crossover(rng, a, b)
+	child := crossover(rng, a, b, feats)
 
 	// Check safety against both parents
 	simA := compareSignals(a, child, series, fullF, 1000)

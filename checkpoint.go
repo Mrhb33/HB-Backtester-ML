@@ -21,6 +21,7 @@ type SlimElite struct {
 	EntryRule    string  `json:"entry_rule"`
 	ExitRule     string  `json:"exit_rule"`
 	RegimeFilter string  `json:"regime_filter"`
+	FeatureMapHash string `json:"feature_map_hash,omitempty"` // Feature ordering fingerprint when created
 
 	TrainScore   float32 `json:"train_score"`
 	TrainReturn  float32 `json:"train_return"`
@@ -47,6 +48,9 @@ type Checkpoint struct {
 	HOFElites        []SlimElite `json:"hof_elites"`
 	ArchiveElites    []SlimElite `json:"archive_elites"` // Archive elites for diversity preservation
 	SeenFingerprints []string    `json:"seen_fingerprints"`
+
+	FeatureMapHash   string `json:"feature_map_hash,omitempty"`   // Feature map fingerprint when checkpoint was saved
+	FeatureMapVersion string `json:"feature_map_version,omitempty"` // Human-readable version for debugging
 }
 
 // Convert Elite to SlimElite (strip compiled bytecode)
@@ -63,6 +67,7 @@ func eliteToSlim(e Elite) SlimElite {
 		EntryRule:    ruleTreeToString(e.Strat.EntryRule.Root),
 		ExitRule:     ruleTreeToString(e.Strat.ExitRule.Root),
 		RegimeFilter: ruleTreeToString(e.Strat.RegimeFilter.Root),
+		FeatureMapHash: e.Strat.FeatureMapHash, // Preserve feature map hash
 
 		TrainScore:   e.Train.Score,
 		TrainReturn:  e.Train.Return,
@@ -79,7 +84,7 @@ func eliteToSlim(e Elite) SlimElite {
 }
 
 // Convert SlimElite to Elite (recompile rules)
-func slimToElite(se SlimElite, rng *rand.Rand) Elite {
+func slimToElite(se SlimElite, rng *rand.Rand, feats *Features) (Elite, error) {
 	s := Strategy{
 		Seed:        se.Seed,
 		FeeBps:      se.FeeBps,
@@ -99,6 +104,12 @@ func slimToElite(se SlimElite, rng *rand.Rand) Elite {
 		TakeProfit: parseTPModel(se.TakeProfit),
 		Trail:      parseTrailModel(se.Trail),
 	}
+
+	// SANITY CHECK: Validate cross operations when loading from checkpoint
+	if err := validateLoadedStrategy(s, feats); err != nil {
+		return Elite{}, err
+	}
+
 	// Recompile rules
 	s.EntryCompiled = compileRuleTree(s.EntryRule.Root)
 	s.ExitCompiled = compileRuleTree(s.ExitRule.Root)
@@ -123,7 +134,7 @@ func slimToElite(se SlimElite, rng *rand.Rand) Elite {
 			Strategy: s,
 		},
 		ValScore: se.ValScore,
-	}
+	}, nil
 }
 
 func SaveCheckpoint(path string, cp Checkpoint) error {
@@ -131,6 +142,11 @@ func SaveCheckpoint(path string, cp Checkpoint) error {
 	cp.SavedAtUnix = time.Now().Unix()
 
 	tmp := path + ".tmp"
+
+	// FIX: Ensure temp file is cleaned up on error
+	cleanup := func() { os.Remove(tmp) }
+	defer cleanup()
+
 	b, err := json.MarshalIndent(cp, "", "  ")
 	if err != nil {
 		return err
@@ -138,7 +154,12 @@ func SaveCheckpoint(path string, cp Checkpoint) error {
 	if err := os.WriteFile(tmp, b, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path) // atomic replace
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// SUCCESS - cancel the cleanup
+	cleanup = func() {}
+	return nil
 }
 
 func LoadCheckpoint(path string) (Checkpoint, error) {

@@ -4,16 +4,11 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"sync/atomic"
-)
 
-// min helper for integer minimum
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+	"hb_bactest_checker/logx"
+)
 
 // Global rejection counters (track why strategies fail)
 var (
@@ -29,11 +24,36 @@ var (
 	trainFailDD             int64 // Failed train: drawdown too high
 	trainZeroTrades         int64 // Passed all gates but had 0 trades
 	strategiesPassed        int64 // Strategies that passed validation
+	// Cross sanity check rejection counters
+	rejectedCrossSanityMutation int64 // Rejected during mutation sanity check
+	rejectedCrossSanitySurrogate int64 // Rejected during surrogate generation
+	rejectedCrossSanityLoad     int64 // Rejected when loading winners from disk
+	// Total evaluations for sampling
+	totalEvaluated int64 // Total number of candidates evaluated
+	// Sampled rejection logging (log 1 out of every 1000 rejections)
+	rejectionLogSampleInterval int64 = 1000
 )
 
 // Global screen relax level (0=strict, 1=normal, 2=relaxed, 3=very_relaxed)
 // Accessed atomically for thread-safe reads from workers
-var globalScreenRelaxLevel int32 = 3 // Very relaxed mode - TEMP warm-start: freeze at 3 until elites > 0
+var globalScreenRelaxLevel int32 = 1 // CRITICAL FIX #6: Default to normal screening (was 3)
+// The complexity rule in strategy.go prevents volume-only junk strategies,
+// so we can keep screening strict without needing desperate relaxation
+
+// Global edge minimum multiplier (default 3, can be lowered to 2 during recovery)
+var globalEdgeMinMult int32 = 3
+
+func getEdgeMinMultiplier() int {
+	return int(atomic.LoadInt32(&globalEdgeMinMult))
+}
+
+func setEdgeMinMultiplier(val int) {
+	atomic.StoreInt32(&globalEdgeMinMult, int32(val))
+}
+
+// Global flag to track if DD thresholds have been logged
+var ddThresholdsLogged bool = false
+var ddThresholdsLoggedMu sync.Mutex
 
 // WARNING: allowZeroTrades is a DEBUG flag that bypasses critical validation gates
 // When enabled, strategies with zero trades can pass validation, which should NEVER happen in production
@@ -68,10 +88,41 @@ func setScreenRelaxLevel(level int) {
 	atomic.StoreInt32(&globalScreenRelaxLevel, int32(level))
 }
 
+// logDDThresholdsOnce logs the configured DD thresholds (only once)
+func logDDThresholdsOnce(maxScreenDD, maxTrainDD float32, minScreenTrades, minTrainTrades int, relaxLevel int) {
+	ddThresholdsLoggedMu.Lock()
+	defer ddThresholdsLoggedMu.Unlock()
+
+	if ddThresholdsLogged {
+		return
+	}
+	ddThresholdsLogged = true
+
+	relaxNames := []string{"Strict", "Normal", "Relaxed", "Very_Relaxed"}
+	relaxName := "Unknown"
+	if relaxLevel >= 0 && relaxLevel < len(relaxNames) {
+		relaxName = relaxNames[relaxLevel]
+	}
+
+	fmt.Printf("\n=== STAGED FILTER GATES (relax_level=%d: %s) ===\n", relaxLevel, relaxName)
+	fmt.Printf("Stage A (screen): DD <= %.1f%%, trades >= %d\n", maxScreenDD*100, minScreenTrades)
+	fmt.Printf("Stage B (train):  DD <= %.1f%%, trades >= %d\n", maxTrainDD*100, minTrainTrades)
+	fmt.Printf("Stage C (val):    Full strict scoring with DSR-lite penalty\n")
+	fmt.Printf("=============================================\n\n")
+}
+
+// checkEntryRateResult contains the result of entry rate checking with soft scoring
+type checkEntryRateResult struct {
+	EntryCount    int     // Number of entry edges detected
+	TooLow        bool    // Entry rate too low (dead strategy)
+	TooHigh       bool    // Entry rate too high (spam strategy)
+	PenaltyFactor float32 // Soft penalty factor: 1.0 = no penalty, <1.0 = penalized
+}
+
 // checkEntryRate quickly scans the window to count entry signals
-// Returns (entryCount, tooLow, tooHigh) - rejects strategies that are dead or spam
+// Returns adaptive limits based on window size + soft penalty instead of hard reject
 // This is much cheaper than full backtest and filters out invalid strategies early
-func checkEntryRate(full Series, fullF Features, st Strategy, w Window) (int, bool, bool) {
+func checkEntryRate(full Series, fullF Features, st Strategy, w Window) checkEntryRateResult {
 	i0 := w.Start - w.Warmup
 	if i0 < 0 {
 		i0 = 0
@@ -83,12 +134,34 @@ func checkEntryRate(full Series, fullF Features, st Strategy, w Window) (int, bo
 
 	// Check if entry rule compiles
 	if st.EntryCompiled.Code == nil {
-		return 0, true, false // No entry rule = dead
+		return checkEntryRateResult{EntryCount: 0, TooLow: true, TooHigh: false, PenaltyFactor: 0.0}
+	}
+
+	// ADAPTIVE ENTRY-RATE LIMITS: Scale by window size
+	// Base: 3-120 for ~6 month window (51840 candles)
+	// Scale linearly with actual window size
+	windowCandles := i1 - i0
+	baseWindowSize := 51840 // ~6 months at 5min
+
+	// Use global multiplier (can be lowered during recovery)
+	multiplier := getEdgeMinMultiplier()
+	minSampleHits := multiplier * windowCandles / baseWindowSize
+	if minSampleHits < 2 {
+		minSampleHits = 2 // Absolute minimum (allow sniper systems)
+	}
+	if minSampleHits > 8 {
+		minSampleHits = 8 // Cap low end for statistical confidence
+	}
+
+	maxSampleHits := 120 * windowCandles / baseWindowSize
+	if maxSampleHits < 80 {
+		maxSampleHits = 80 // Minimum high bound (allow reasonable activity)
+	}
+	if maxSampleHits > 200 {
+		maxSampleHits = 200 // Cap high bound (reduce spam for 5min BTC)
 	}
 
 	entryEdgeCount := 0
-	const minSampleHits = 3    // Minimum entry edges to not be "dead"
-	const maxSampleHits = 120  // Maximum entry edges to not be "spam" - filter always-on rules
 
 	// Quick scan: count entry EDGES (when entry becomes true), not "true bars"
 	// This is because you can only take one trade while in-position
@@ -106,18 +179,50 @@ func checkEntryRate(full Series, fullF Features, st Strategy, w Window) (int, bo
 		// Count only when entry transitions from false to true (rising edge)
 		if entryNow && !entryPrev {
 			entryEdgeCount++
-			// Early exit if we already exceeded max
-			if entryEdgeCount > maxSampleHits {
-				return entryEdgeCount, false, true
-			}
 		}
 
 		entryPrev = entryNow
 	}
 
+	// SOFT SCORING: Instead of hard reject, apply penalty factor
+	// This preserves exploration and reduces wasted generation
 	tooLow := entryEdgeCount < minSampleHits
 	tooHigh := entryEdgeCount > maxSampleHits
-	return entryEdgeCount, tooLow, tooHigh
+
+	var penaltyFactor float32 = 1.0 // No penalty by default
+
+	if tooLow {
+		// Penalize low entry rates (lower confidence)
+		// Penalty scales linearly: 0 trades = 0.0 factor, min trades = 1.0 factor
+		if entryEdgeCount == 0 {
+			penaltyFactor = 0.0 // Dead strategy - no signal at all
+		} else {
+			ratio := float32(entryEdgeCount) / float32(minSampleHits)
+			penaltyFactor = ratio // 0.33 at 1/3 of min, 0.67 at 2/3 of min
+		}
+	} else if tooHigh {
+		// Penalize high entry rates (fee/overtrade penalty)
+		// Penalty scales: max+20% = 1.0, 2x max = 0.5, 3x max = 0.0
+		excessRatio := float32(entryEdgeCount) / float32(maxSampleHits)
+		if excessRatio >= 3.0 {
+			penaltyFactor = 0.0 // Extreme spam
+		} else if excessRatio >= 2.0 {
+			penaltyFactor = 0.3 // Heavy spam
+		} else {
+			// Linear from 1.0 at max to 0.5 at 2x max
+			penaltyFactor = 1.0 - 0.5*(excessRatio-1.0)
+			if penaltyFactor < 0.3 {
+				penaltyFactor = 0.3
+			}
+		}
+	}
+
+	return checkEntryRateResult{
+		EntryCount:    entryEdgeCount,
+		TooLow:        tooLow,
+		TooHigh:       tooHigh,
+		PenaltyFactor: penaltyFactor,
+	}
 }
 
 // FidelityLevel represents evaluation depth
@@ -153,39 +258,39 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 	// var minScreenScore float32
 	// var minTrainScore float32
 
+	// STAGED GATES: Stage A (screen) allows high DD, Stage B (train) has tight DD
+	// Screen is a cheap pre-filter: only check trade count, allow any DD up to 95%
+	// Train is the real filter: check both trade count AND DD
+	maxScreenDD = 0.95 // Allow up to 95% DD in screen stage (cheap filter)
+
 	switch relaxLevel {
 	case 0: // Strict
 		// minScreenScore = -0.10
 		minScreenTrades = 30
-		maxScreenDD = 0.70
 		// minTrainScore = -0.20
 		minTrainTrades = 80
 		maxTrainDD = 0.50
 	case 1: // Normal
 		// minScreenScore = -0.20
 		minScreenTrades = 20
-		maxScreenDD = 0.80
 		// minTrainScore = -0.20
 		minTrainTrades = 60
 		maxTrainDD = 0.55
 	case 2: // Relaxed
 		// minScreenScore = -0.40
 		minScreenTrades = 15
-		maxScreenDD = 0.85
 		// minTrainScore = -0.20
 		minTrainTrades = 40
 		maxTrainDD = 0.60
 	case 3: // Very Relaxed (unblock mode) - TEMP warm-start: ultra-low min trades
 		// minScreenScore = -0.60
 		minScreenTrades = 5  // TEMP warm-start: allow sparse entries (was 10)
-		maxScreenDD = 0.90
 		// minTrainScore = -0.20
 		minTrainTrades = 15 // TEMP warm-start: allow sparse strategies (was 30)
 		maxTrainDD = 0.65
 	default: // Default to very relaxed - TEMP warm-start: ultra-low min trades
 		// minScreenScore = -0.60
 		minScreenTrades = 5  // TEMP warm-start: allow sparse entries (was 10)
-		maxScreenDD = 0.90
 		// minTrainScore = -0.20
 		minTrainTrades = 15 // TEMP warm-start: allow sparse strategies (was 30)
 		maxTrainDD = 0.65
@@ -197,20 +302,28 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		minTrainTrades = minTradesOverride
 	}
 
-	// Stage 0: Entry-rate precheck (fast rejection of dead/spam strategies)
+	// Log DD thresholds once (for debugging)
+	logDDThresholdsOnce(maxScreenDD, maxTrainDD, minScreenTrades, minTrainTrades, relaxLevel)
+
+	// Stage 0: Entry-rate precheck with SOFT SCORING (not hard rejection)
 	// This is much cheaper than full backtest and filters before expensive evaluation
-	_, entryTooLow, entryTooHigh := checkEntryRate(full, fullF, st, screenW)
-	if entryTooLow {
+	entryRateResult := checkEntryRate(full, fullF, st, screenW)
+
+	// Only hard-reject completely dead strategies (0 entry edges)
+	if entryRateResult.EntryCount == 0 {
 		atomic.AddInt64(&screenFailEntryRateLow, 1)
-		return false, false, false, Result{}, Result{}, "screen_entry_rate_low"
-	}
-	if entryTooHigh {
-		atomic.AddInt64(&screenFailEntryRateHigh, 1)
-		return false, false, false, Result{}, Result{}, "screen_entry_rate_high"
+		maybeLogSampledRejection("screen_entry_rate_dead", Result{Trades: 0}, st.Seed)
+		return false, false, false, Result{}, Result{}, "screen_entry_rate_dead"
 	}
 
 	// Stage 1: Fast screen (quick filter)
 	screenResult := evaluateStrategyWindow(full, fullF, st, screenW)
+
+	// Apply soft penalty to screen score based on entry rate
+	// This penalizes rather than rejects, preserving exploration
+	if entryRateResult.PenaltyFactor < 1.0 {
+		screenResult.Score *= entryRateResult.PenaltyFactor
+	}
 
 	// TEMP warm-start: disable score gates until elites exist
 	// Score can be negative early on, so we skip these computations during warm-start
@@ -237,15 +350,18 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		// }
 		if screenResult.Trades < minScreenTrades {
 			atomic.AddInt64(&screenFailTrades, 1)
+			maybeLogSampledRejection("screen_trades", screenResult, st.Seed)
 			return false, false, false, screenResult, Result{}, "screen_trades"
 		}
 		// MAX trades gate: reject spammy scalpers (too many trades)
 		if screenResult.Trades > 2000 {
 			atomic.AddInt64(&screenFailTooManyTrades, 1)
+			maybeLogSampledRejection("screen_too_many_trades", screenResult, st.Seed)
 			return false, false, false, screenResult, Result{}, "screen_too_many_trades"
 		}
 		if screenResult.MaxDD >= maxScreenDD {
 			atomic.AddInt64(&screenFailDD, 1)
+			maybeLogSampledRejection("screen_dd", screenResult, st.Seed, maxScreenDD)
 			return false, false, false, screenResult, Result{}, "screen_dd"
 		}
 	}
@@ -276,15 +392,18 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		// }
 		if trainResult.Trades < minTrainTrades {
 			atomic.AddInt64(&trainFailTrades, 1)
+			maybeLogSampledRejection("train_trades", trainResult, st.Seed)
 			return true, false, false, trainResult, Result{}, "train_trades"
 		}
 		// MAX trades gate: reject spammy scalpers (too many trades)
 		if trainResult.Trades > 5000 {
 			atomic.AddInt64(&trainFailTooManyTrades, 1)
+			maybeLogSampledRejection("train_too_many_trades", trainResult, st.Seed)
 			return true, false, false, trainResult, Result{}, "train_too_many_trades"
 		}
 		if trainResult.MaxDD >= maxTrainDD {
 			atomic.AddInt64(&trainFailDD, 1)
+			maybeLogSampledRejection("train_dd", trainResult, st.Seed, maxTrainDD)
 			return true, false, false, trainResult, Result{}, "train_dd"
 		}
 	}
@@ -292,6 +411,7 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 	// Track zero-trade strategies
 	if trainResult.Trades == 0 {
 		atomic.AddInt64(&trainZeroTrades, 1)
+		maybeLogSampledRejection("train_zero_trades", trainResult, st.Seed)
 	}
 
 	// Stage 3: Validation (only if passed train)
@@ -307,6 +427,11 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		valResult.Trades,
 		testedCount, // Apply DSR-lite penalty here!
 	)
+
+	// Part A1: Score sanity check for validation result
+	if !IsValidScore(valScore) {
+		return false, false, false, trainResult, Result{}, "val_invalid_score"
+	}
 
 	// Update result with DSR-lite score
 	valResult.Score = valScore
@@ -332,30 +457,41 @@ func printRejectionStats() {
 	trainFailDD := atomic.LoadInt64(&trainFailDD)
 	trainZeroTrades := atomic.LoadInt64(&trainZeroTrades)
 	strategiesPassed := atomic.LoadInt64(&strategiesPassed)
+	rejectedCrossSanityMutation := atomic.LoadInt64(&rejectedCrossSanityMutation)
+	rejectedCrossSanitySurrogate := atomic.LoadInt64(&rejectedCrossSanitySurrogate)
+	rejectedCrossSanityLoad := atomic.LoadInt64(&rejectedCrossSanityLoad)
 
 	totalRejected := screenFailScore + screenFailTrades + screenFailTooManyTrades + screenFailDD +
 		screenFailEntryRateLow + screenFailEntryRateHigh +
 		trainFailScore + trainFailTrades + trainFailTooManyTrades + trainFailDD
 	totalEval := totalRejected + strategiesPassed
 
-	fmt.Printf("\n=== REJECTION STATISTICS ===\n")
-	fmt.Printf("Total Evaluated: %d\n", totalEval)
-	fmt.Printf("Strategies Passed: %d\n", strategiesPassed)
-	fmt.Printf("Total Rejected: %d\n", totalRejected)
-	if totalRejected > 0 {
-		fmt.Printf("\nScreen Stage Failures:\n")
-		fmt.Printf("  Entry rate too low (<3 edges): %d (%.1f%%)\n", screenFailEntryRateLow, float64(screenFailEntryRateLow)*100/float64(totalRejected))
-		fmt.Printf("  Entry rate too high (>120 edges): %d (%.1f%%)\n", screenFailEntryRateHigh, float64(screenFailEntryRateHigh)*100/float64(totalRejected))
-		fmt.Printf("  Not enough trades: %d (%.1f%%)\n", screenFailTrades, float64(screenFailTrades)*100/float64(totalRejected))
-		fmt.Printf("  Too many trades (>2000): %d (%.1f%%)\n", screenFailTooManyTrades, float64(screenFailTooManyTrades)*100/float64(totalRejected))
-		fmt.Printf("  Drawdown too high: %d (%.1f%%)\n", screenFailDD, float64(screenFailDD)*100/float64(totalRejected))
-		fmt.Printf("\nTrain Stage Failures:\n")
-		fmt.Printf("  Not enough trades: %d (%.1f%%)\n", trainFailTrades, float64(trainFailTrades)*100/float64(totalRejected))
-		fmt.Printf("  Too many trades (>5000): %d (%.1f%%)\n", trainFailTooManyTrades, float64(trainFailTooManyTrades)*100/float64(totalRejected))
-		fmt.Printf("  Drawdown too high: %d (%.1f%%)\n", trainFailDD, float64(trainFailDD)*100/float64(totalRejected))
+	// Use structured logging for rejection statistics
+	logx.LogRejectionStatsHeader()
+	logx.LogRejectionStatsSummary(totalEval, totalRejected, strategiesPassed)
+	logx.LogRejectionStatsScreen(screenFailEntryRateLow, screenFailEntryRateHigh, screenFailTrades, screenFailTooManyTrades, screenFailDD, totalRejected)
+	logx.LogRejectionStatsTrain(trainFailTrades, trainFailTooManyTrades, trainFailDD, totalRejected)
+	logx.LogRejectionStatsFooter(trainZeroTrades, rejectedCrossSanityMutation, rejectedCrossSanitySurrogate, rejectedCrossSanityLoad)
+}
+
+// maybeLogSampledRejection logs a rejection reason for sampled candidates (1 in N)
+// This helps diagnose why candidates are being rejected without spamming logs
+// Shows detailed metrics: trades, return, profit factor, expectancy to identify specific failures
+func maybeLogSampledRejection(reason string, result Result, seed int64, ddThreshold ...float32) {
+	// Increment evaluation counter
+	count := atomic.AddInt64(&totalEvaluated, 1)
+
+	// Log 1 out of every N rejections (default 1000)
+	if count%rejectionLogSampleInterval == 1 {
+		ddInfo := ""
+		if len(ddThreshold) > 0 {
+			ddInfo = fmt.Sprintf(", dd_threshold=%.2f%%", ddThreshold[0]*100)
+		}
+		// Include detailed metrics: trades, return, profit factor, expectancy
+		// This helps identify whether rejection was due to ret vs trades vs pf vs dd
+		fmt.Printf("[SAMPLED REJECTION #%d] reason=%s, seed=%d, trades=%d, ret=%.2f%%, pf=%.2f, exp=%.5f, dd=%.2f%%%s\n",
+			count, reason, seed, result.Trades, result.Return*100, result.ProfitFactor, result.Expectancy, result.MaxDD*100, ddInfo)
 	}
-	fmt.Printf("\nZero-Trade Strategies: %d\n", trainZeroTrades)
-	fmt.Printf("===========================\n\n")
 }
 
 // computeDeflatedScore applies DSR-lite deflation penalty

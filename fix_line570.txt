@@ -1,1 +1,0 @@
-	fmt.Printf("\n\nStopped. Total tested: %d\n", atomic.LoadUint64(&tested))

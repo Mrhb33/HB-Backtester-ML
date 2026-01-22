@@ -47,7 +47,13 @@ func loadRecentElites(path string, limit int) ([]EliteLog, error) {
 }
 
 // Convert loaded logs to runnable strategies (compile bytecode etc.).
-func rebuildStrategy(s Strategy) (Strategy, error) {
+func rebuildStrategy(s Strategy, feats Features) (Strategy, error) {
+	// FIX: Always validate loaded strategies before compilation to catch
+	// invalid feature references (e.g., after feature map changes).
+	if err := validateLoadedStrategy(s, &feats); err != nil {
+		return s, err
+	}
+
 	// Compile rule bytecode for speed
 	s.EntryCompiled = compileRuleTree(s.EntryRule.Root)
 	s.ExitCompiled = compileRuleTree(s.ExitRule.Root)

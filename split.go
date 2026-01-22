@@ -96,3 +96,70 @@ func GetSplitWindows(trainStart, trainEnd, valEnd, totalCandles int, warmup int)
 
 	return trainW, valW, testW
 }
+
+// GetCustomWindow creates a custom window for time-based replay testing
+// Critical: Compute features on FULL dataset first, then slice with warmup buffer
+// to ensure indicators are "real" (not affected by slice boundaries)
+func GetCustomWindow(times []int64, fromIdx, toIdx int, fromStr, toStr string, warmup int, totalCandles int) Window {
+	// Resolve from/to indices from various inputs
+	start := -1
+	end := totalCandles
+
+	// Priority 1: Use explicit index if provided
+	if fromIdx >= 0 {
+		start = fromIdx
+	}
+	if toIdx >= 0 {
+		end = toIdx
+	}
+
+	// Priority 2: Parse time strings if provided
+	if start < 0 && fromStr != "" {
+		// Parse time string "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD"
+		layout := "2006-01-02 15:04:05"
+		if len(fromStr) <= 10 {
+			layout = "2006-01-02"
+		}
+		fromTs, err := time.Parse(layout, fromStr)
+		if err == nil {
+			start = idxAtOrAfter(times, fromTs.UnixMilli())
+		}
+	}
+
+	if end == totalCandles && toStr != "" {
+		layout := "2006-01-02 15:04:05"
+		if len(toStr) <= 10 {
+			layout = "2006-01-02"
+		}
+		toTs, err := time.Parse(layout, toStr)
+		if err == nil {
+			end = idxAtOrAfter(times, toTs.UnixMilli())
+		}
+	}
+
+	// Default to full range if still unresolved
+	if start < 0 {
+		start = 0
+	}
+	if end > totalCandles {
+		end = totalCandles
+	}
+
+	// Validate range
+	if start < 0 {
+		start = 0
+	}
+	if end > totalCandles {
+		end = totalCandles
+	}
+	if start >= end {
+		start = 0
+		end = totalCandles
+	}
+
+	return Window{
+		Start:  start, // First bar where trades are ALLOWED
+		End:    end,
+		Warmup: warmup, // Warmup bars before tradeStart
+	}
+}
