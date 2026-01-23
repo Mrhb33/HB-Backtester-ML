@@ -298,7 +298,7 @@ type RuleTree struct {
 // Global bootstrap mode flag (accessed atomically for thread safety)
 // When true: use lower cooldown (0-50) and lower MaxHoldBars (50-150) to speed up learning
 // Once elites exist, set to false for normal operation
-var globalBootstrapMode int32 = 1 // Start in bootstrap mode
+var globalBootstrapMode int32 = 0 // DISABLED - want longer holds for bigger winners
 
 func isBootstrapMode() bool {
 	return atomic.LoadInt32(&globalBootstrapMode) > 0
@@ -701,7 +701,7 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 		Seed:            rng.Int63(),
 		FeeBps:          feeBps,   // Use specified production costs
 		SlippageBps:     slipBps,  // Use specified production costs
-		RiskPct:         0.01,
+		RiskPct:         1.0,  // Set to 100% to report actual returns (not scaled)
 		Direction:       direction,
 		EntryRule:       RuleTree{Root: entryRoot},
 		EntryCompiled:   compileRuleTree(entryRoot),
@@ -712,7 +712,7 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 		Trail:           randomTrailModel(rng),
 		RegimeFilter:    RuleTree{Root: regimeRoot},
 		RegimeCompiled:  compileRuleTree(regimeRoot),
-		MaxHoldBars:     150 + rng.Intn(180), // 150..329 bars (searchable/evolved, reduced early exits)
+		MaxHoldBars:     500 + rng.Intn(500), // 500..999 bars (~2-4 days for 5min) - allow big winners to run
 		MaxConsecLosses: 20,                 // stop after 20 consecutive losses
 		CooldownBars:    200,                // pause for 200 bars after busted (realistic)
 	}
@@ -721,7 +721,7 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 	// When no elites exist yet, use 0-50 cooldown and 50-150 MaxHoldBars for faster feedback
 	if isBootstrapMode() {
 		s.CooldownBars = rng.Intn(51)      // 0-50 bars during bootstrap
-		s.MaxHoldBars = 50 + rng.Intn(101) // 50-150 bars during bootstrap
+		s.MaxHoldBars = 200 + rng.Intn(301) // 200-500 bars during bootstrap (~17-42 hours)
 	}
 
 	// CRITICAL FIX #1: Force SL/TP to be same kind and enforce RR >= 1.3
@@ -788,11 +788,12 @@ func isAbsoluteThresholdKind(kind LeafKind) bool {
 	}
 }
 
-// isTriggerKind returns true if the leaf kind is a trigger (Cross, Rising, Falling)
-// These are safe for PriceLevel features because they don't use absolute price thresholds
+// isTriggerKind returns true if the leaf kind is a trigger
+// Trigger leaf kinds: CrossUp, CrossDown, Between, GT, LT, Rising, Falling
+// These are the leaves that actually cause entries to trigger (not just static conditions)
 func isTriggerKind(kind LeafKind) bool {
 	switch kind {
-	case LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling:
+	case LeafCrossUp, LeafCrossDown, LeafBetween, LeafGT, LeafLT, LeafRising, LeafFalling:
 		return true
 	default:
 		return false
@@ -877,14 +878,16 @@ func ensureTrendGuard(root *RuleNode, dir int, feats Features, rng *rand.Rand) {
 	replaceRandomLeaf(root, rng, guard)
 }
 
-// hasTriggerLeaf checks if tree contains any trigger leaf (Cross/Rising/Falling)
+// hasTriggerLeaf checks if tree contains any trigger leaf
+// Trigger leaf kinds: CrossUp, CrossDown, Between, GT, LT, Rising, Falling
+// These are the leaves that actually cause entries to trigger (not just static conditions)
 func hasTriggerLeaf(node *RuleNode) bool {
 	if node == nil {
 		return false
 	}
 	if node.Op == OpLeaf {
 		switch node.Leaf.Kind {
-		case LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling:
+		case LeafCrossUp, LeafCrossDown, LeafBetween, LeafGT, LeafLT, LeafRising, LeafFalling:
 			return true
 		}
 		return false
@@ -894,12 +897,14 @@ func hasTriggerLeaf(node *RuleNode) bool {
 
 // ensureTriggerLeaf forces at least one trigger leaf in entry rule
 // This prevents "entry_rate_dead" rejections by ensuring strategy can trigger
+// Trigger leaf kinds: CrossUp, CrossDown, Between, GT, LT, Rising, Falling
 func ensureTriggerLeaf(root *RuleNode, rng *rand.Rand, feats Features) {
 	if hasTriggerLeaf(root) {
 		return // Already has trigger leaf
 	}
 	// Replace a random leaf with a trigger leaf
-	triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
+	// Include all trigger kinds: CrossUp, CrossDown, Between, GT, LT, Rising, Falling
+	triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafBetween, LeafGT, LeafLT, LeafRising, LeafFalling}
 	triggerKind := triggerKinds[rng.Intn(len(triggerKinds))]
 	newLeaf := randomEntryLeaf(rng, feats)
 	newLeaf.Kind = triggerKind

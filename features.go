@@ -335,6 +335,10 @@ func computeAllFeatures(s Series) Features {
 		addFeature(fmt.Sprintf("VolZ%d", p), volZ)
 	}
 
+	// Compute volSMA20 for Active calculation (already added as feature above, retrieve index)
+	volSMA20Idx := f.Index["VolSMA20"]
+	volSMA20 := f.F[volSMA20Idx]
+
 	buyRatio := make([]float32, n)
 	imbalance := make([]float32, n)
 	volPerTrade := make([]float32, n)
@@ -345,10 +349,14 @@ func computeAllFeatures(s Series) Features {
 			buyRatio[i] = s.TakerBuyBase[i] / s.Volume[i]
 			sellBase := s.Volume[i] - s.TakerBuyBase[i]
 			imbalance[i] = (s.TakerBuyBase[i] - sellBase) / s.Volume[i]
-			active[i] = 1 // Active based on Volume, not Trades (more reliable)
 		}
 		if s.Trades[i] > 0 {
 			volPerTrade[i] = s.Volume[i] / float32(s.Trades[i])
+		}
+		// FIX: Active = 1 when volume >= 20% of average (detects real spikes)
+		// Guard: i >= 19 for warmup, volSMA20[i] > 0 to avoid early bars
+		if i >= 19 && volSMA20[i] > 0 && s.Volume[i] >= volSMA20[i]*0.2 {
+			active[i] = 1
 		}
 	}
 
@@ -379,49 +387,28 @@ func computeAllFeatures(s Series) Features {
 	fvgUp := make([]float32, n)
 	fvgDown := make([]float32, n)
 
-	// CRITICAL FIX #2: SwingHigh should carry forward price levels, not act as a flag
-	// Use 20-bar window for swing detection (works well on 5m data)
-	// Each bar gets the current swing high price at that point in time
-	// Before first swing: use 0 (or could use NaN, but 0 is safer for Go)
-	leftLook := 10  // Half of 20-bar window
-	rightLook := 10
-	lastSwingHighPrice := float32(0)  // Start with 0 (no swing yet)
-	lastSwingLowPrice := float32(0)   // Start with 0 (no swing yet)
+	// Rolling max/min swing detection (no lookahead)
+	// Each bar gets the max high / min low from the lookback window
+	// This is NOT a pivot-style swing - it's a rolling window for stable levels
+	lookback := 20
+	lastHigh, lastLow := float32(0), float32(0)
 
-	// Initialize arrays with 0 (meaning "no swing yet")
 	for i := 0; i < n; i++ {
-		swingHigh[i] = 0
-		swingLow[i] = 0
-	}
-
-	// Main loop: detect swings AND update per-bar with current last swing price
-	for i := 0; i < n; i++ {
-		// First, carry forward the last known swing price for this bar
-		swingHigh[i] = lastSwingHighPrice
-		swingLow[i] = lastSwingLowPrice
-
-		// Then check if this bar is a new swing (only when we have enough context)
-		if i >= leftLook && i < n-rightLook {
-			isSwingHigh := true
-			isSwingLow := true
-			for j := i - leftLook; j <= i+rightLook; j++ {
-				if j != i {
-					if s.High[j] >= s.High[i] {
-						isSwingHigh = false
-					}
-					if s.Low[j] <= s.Low[i] {
-						isSwingLow = false
-					}
+		swingHigh[i] = lastHigh
+		swingLow[i] = lastLow
+		if i >= lookback-1 {
+			maxH := s.High[i-lookback+1]
+			minL := s.Low[i-lookback+1]
+			for j := i - lookback + 2; j <= i; j++ {
+				if s.High[j] > maxH {
+					maxH = s.High[j]
+				}
+				if s.Low[j] < minL {
+					minL = s.Low[j]
 				}
 			}
-			if isSwingHigh {
-				lastSwingHighPrice = s.High[i] // Update the swing high price
-				swingHigh[i] = lastSwingHighPrice  // Also update current bar
-			}
-			if isSwingLow {
-				lastSwingLowPrice = s.Low[i] // Update the swing low price
-				swingLow[i] = lastSwingLowPrice  // Also update current bar
-			}
+			lastHigh, lastLow = maxH, minL
+			swingHigh[i], swingLow[i] = lastHigh, lastLow
 		}
 	}
 
@@ -436,14 +423,14 @@ func computeAllFeatures(s Series) Features {
 		}
 	}
 
-	// BOS: Break of Structure - use carried-forward swing high price
-	lastSwingHighForBOS := float32(-1)
-	for i := 0; i < n; i++ {
-		// Use the carried-forward swing high price
-		if swingHigh[i] > 0 {
-			lastSwingHighForBOS = swingHigh[i]
+	// BOS: Break of Structure - EVENT TRIGGER (only on crossing bar)
+	// Use swingHigh[i-1] as reference to avoid same-bar update/break artifacts
+	lastSwingHigh := float32(-1)
+	for i := 1; i < n; i++ {
+		if swingHigh[i-1] > 0 {
+			lastSwingHigh = swingHigh[i-1]
 		}
-		if lastSwingHighForBOS > 0 && s.Close[i] > lastSwingHighForBOS {
+		if lastSwingHigh > 0 && s.Close[i-1] <= lastSwingHigh && s.Close[i] > lastSwingHigh {
 			bos[i] = 1
 		}
 	}
@@ -562,13 +549,41 @@ func computeSMA(src, dst []float32, period int) {
 }
 
 func computeEMA(src, dst []float32, period int) {
+	if len(src) < period {
+		return
+	}
+
+	// TradingView method: SMA for first period values
+	sum := float32(0)
+	for i := 0; i < period; i++ {
+		sum += src[i]
+	}
+	sma := sum / float32(period)
+
+	// Fill first period-1 with SMA
+	for i := 0; i < period-1; i++ {
+		dst[i] = sma
+	}
+	dst[period-1] = sma
+
+	// EMA formula from period onwards
+	multiplier := float32(2.0 / float32(period+1))
+	for i := period; i < len(src); i++ {
+		dst[i] = (src[i]-dst[i-1])*multiplier + dst[i-1]
+	}
+}
+
+// computeWilderEMA uses Wilder's smoothing method (α = 1/period)
+// This is the standard smoothing used for RSI, ATR, and ADX in TradingView
+// For period N: alpha = 1/N (NOT 2/(N+1) like EMA)
+func computeWilderEMA(src, dst []float32, period int) {
 	if len(src) < 1 {
 		return
 	}
-	multiplier := float32(2.0 / float32(period+1))
+	alpha := float32(1.0 / float32(period)) // Wilder: α = 1/period
 	dst[0] = src[0]
 	for i := 1; i < len(src); i++ {
-		dst[i] = (src[i]-dst[i-1])*multiplier + dst[i-1]
+		dst[i] = (src[i]-dst[i-1])*alpha + dst[i-1]
 	}
 }
 
@@ -757,7 +772,10 @@ func computeADX(high, low, close, adx, plusDI, minusDI []float32, period int) {
 		}
 	}
 
-	computeEMA(dx, adx, period)
+	// FIX: Use Wilder smoothing (α = 1/period) instead of EMA (α = 2/(period+1))
+	// TradingView uses Wilder smoothing for ADX, which matches the standard ADX calculation
+	// Without this fix, ADX values are ~1.4x higher than TradingView
+	computeWilderEMA(dx, adx, period)
 }
 
 func computeMFI(high, low, close, volume, dst []float32, period int) {
@@ -822,18 +840,26 @@ func computeROC(src, dst []float32, period int) {
 }
 
 func computeZScore(src, mean, dst []float32, period int) {
-	if len(src) < period {
+	if len(src) < period || len(mean) < period {
 		return
 	}
 	for i := period - 1; i < len(src); i++ {
-		sum := float32(0)
-		sumSq := float32(0)
-		for j := i - period + 1; j <= i; j++ {
-			sum += src[j]
-			sumSq += src[j] * src[j]
+		if i >= len(mean) {
+			break
 		}
-		meanVal := sum / float32(period)
-		variance := (sumSq / float32(period)) - (meanVal * meanVal)
+		meanVal := mean[i]
+		if meanVal == 0 {
+			continue // Avoid weird warmup spikes
+		}
+
+		// Calculate variance from mean
+		sumSqDiff := float32(0)
+		for j := i - period + 1; j <= i; j++ {
+			diff := src[j] - meanVal
+			sumSqDiff += diff * diff
+		}
+		variance := sumSqDiff / float32(period)
+
 		if variance > 0 {
 			std := float32(math.Sqrt(float64(variance)))
 			if std > 0 {

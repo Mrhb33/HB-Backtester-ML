@@ -13,6 +13,24 @@ import (
 
 var pfDebugCount uint64 // package-level counter for throttled PF debug logging
 
+// slippageRef returns the last fully-known bar index at the time of a fill.
+// For fills at bar t open or intrabar during bar t, use t-1.
+// For force-close at final close, use finalIdx-1 (if possible).
+func slippageRef(t int) int {
+	if t <= 0 {
+		return 0
+	}
+	return t - 1
+}
+
+// LeafKey is a composite key for uniquely identifying leaf nodes in OR-branch tracing
+type LeafKey struct {
+	Kind     LeafKind
+	A        int
+	B        int
+	Lookback int
+}
+
 // shouldLogPFDebug implements throttling for PF debug output
 // Returns true for first 20 calls, then every 5000th call thereafter
 func shouldLogPFDebug() bool {
@@ -474,7 +492,7 @@ type StateWithProof struct {
 }
 
 // WriteStatesWithProofsToCSV writes per-bar states with proof information for signal bars
-func WriteStatesWithProofsToCSV(states []StateRecord, st Strategy, f Features, signalProofs map[int][]LeafProof, windowOffset int, outputPath string) error {
+func WriteStatesWithProofsToCSV(states []StateRecord, series Series, st Strategy, f Features, signalProofs map[int][]LeafProof, windowOffset int, outputPath string) error {
 	file, err := os.Create(outputPath)
 	if err != nil {
 		return err
@@ -482,13 +500,24 @@ func WriteStatesWithProofsToCSV(states []StateRecord, st Strategy, f Features, s
 	defer file.Close()
 
 	// Write CSV header with proof columns
-	_, err = file.WriteString("BarIndex,Time,States,RegimeOK,EntryOK,ProofSummary\n")
+	_, err = file.WriteString("CSVRow,BarIndex,Time,States,RegimeOK,EntryOK,ProofSummary\n")
 	if err != nil {
 		return err
 	}
 
 	// Write state rows
 	for _, state := range states {
+		// CRITICAL FIX: f.F contains the FULL dataset (not sliced), so we need to use windowOffset
+		// state.BarIndex is the index in the window (starting from warmup)
+		// To get the correct global index for the full feature array, we add windowOffset
+		globalIdx := windowOffset + state.BarIndex
+
+		// Get original CSV row number using GLOBAL index
+		csvRow := 0
+		if globalIdx >= 0 && globalIdx < len(series.CSVRowIndex) {
+			csvRow = series.CSVRowIndex[globalIdx]
+		}
+
 		timeStr := state.Time.Format("2006-01-02 15:04:05")
 
 		// Check if this bar has proofs (it was a signal bar)
@@ -498,15 +527,17 @@ func WriteStatesWithProofsToCSV(states []StateRecord, st Strategy, f Features, s
 		var proofSummary string
 
 		if hasProofs {
-			// Adjust index by window offset for correct feature access
-			adjustedIdx := state.BarIndex + windowOffset
+			// Evaluate regime and entry using bytecode with GLOBAL index
+			regimeOK = st.RegimeFilter.Root == nil || (len(st.RegimeCompiled.Code) > 0 && evaluateCompiled(st.RegimeCompiled.Code, f.F, globalIdx))
+			entryOK = len(st.EntryCompiled.Code) > 0 && evaluateCompiled(st.EntryCompiled.Code, f.F, globalIdx)
 
-			// Evaluate regime and entry using bytecode
-			regimeOK = st.RegimeFilter.Root == nil || (len(st.RegimeCompiled.Code) > 0 && evaluateCompiled(st.RegimeCompiled.Code, f.F, adjustedIdx))
-			entryOK = len(st.EntryCompiled.Code) > 0 && evaluateCompiled(st.EntryCompiled.Code, f.F, adjustedIdx)
-
-			// Build proof summary
-			proofSummary = buildProofSummary(st, f, proofs, adjustedIdx)
+			// Build proof summary with proofs and indicators
+			proofSummary = buildProofSummary(st, f, proofs, globalIdx)
+		} else {
+			// Build proof summary with indicators only (no regime/entry evaluation)
+			proofSummary = buildProofSummary(st, f, []LeafProof{}, globalIdx)
+			regimeOK = false
+			entryOK = false
 		}
 
 		// Format: BarIndex,Time,States,RegimeOK,EntryOK,ProofSummary
@@ -519,8 +550,8 @@ func WriteStatesWithProofsToCSV(states []StateRecord, st Strategy, f Features, s
 			entryStr = "true"
 		}
 
-		_, err = file.WriteString(fmt.Sprintf("%d,%s,%s,%s,%s,\"%s\"\n",
-			state.BarIndex, timeStr, state.Statuses, regimeStr, entryStr, proofSummary))
+		_, err = file.WriteString(fmt.Sprintf("%d,%d,%s,%s,%s,%s,\"%s\"\n",
+			csvRow, state.BarIndex, timeStr, state.Statuses, regimeStr, entryStr, proofSummary))
 		if err != nil {
 			return err
 		}
@@ -568,11 +599,13 @@ func WriteTradesToCSV(trades []Trade, st Strategy, f Features, windowOffset int,
 
 	// Write trade rows
 	for i, trade := range trades {
-		// Adjust SignalIndex by windowOffset for correct feature access
-		adjustedSignalIdx := trade.SignalIndex + windowOffset
+		// CRITICAL FIX: Use global index for consistency with WriteStatesWithProofsToCSV
+		// f.F contains the FULL dataset (not sliced), so we need to use windowOffset
+		// trade.SignalIndex is local index (within window), convert to global
+		globalSignalIdx := windowOffset + trade.SignalIndex
 
-		// Build proof summary (compressed format with bytecode evaluation)
-		proofSummary := buildProofSummary(st, f, trade.Proofs, adjustedSignalIdx)
+		// Build proof summary with GLOBAL index
+		proofSummary := buildProofSummary(st, f, trade.Proofs, globalSignalIdx)
 
 		// Format times
 		signalTime := trade.SignalTime.Format("2006-01-02 15:04:05")
@@ -618,12 +651,38 @@ func WriteTradesToCSV(trades []Trade, st Strategy, f Features, windowOffset int,
 	return nil
 }
 
+// buildAllIndicatorsSummary creates a summary of all 43 indicator values
+func buildAllIndicatorsSummary(f Features, idx int) string {
+	var indicators []string
+	n := len(f.Names)
+	if len(f.F) < n {
+		n = len(f.F)
+	}
+	for i := 0; i < n; i++ {
+		name := f.Names[i]
+		// CRITICAL FIX: Add bounds checking to prevent panic on out-of-bounds access
+		if idx < 0 || idx >= len(f.F[i]) {
+			indicators = append(indicators, fmt.Sprintf("%s=OUT_OF_BOUNDS", name))
+			continue
+		}
+		value := f.F[i][idx]
+		// Format: EMA20=43921.95 (compact format)
+		indicators = append(indicators, fmt.Sprintf("%s=%.2f", name, value))
+	}
+	return "indicators={" + strings.Join(indicators, ", ") + "}"
+}
+
 // buildProofSummary creates a compressed summary of all proofs for CSV export
 // Uses BYTECODE evaluation to match actual execution path
 // Format: "regime_ok=true/false, entry_ok=true/false, path=branch_N, conditions..."
 func buildProofSummary(st Strategy, f Features, proofs []LeafProof, signalIdx int) string {
+	var parts []string
+
+	// Handle case when there are no proofs (non-signal bars)
 	if len(proofs) == 0 {
-		return "no_proofs"
+		// Just build indicator values without regime/entry evaluation
+		indicatorsPart := buildAllIndicatorsSummary(f, signalIdx)
+		return indicatorsPart
 	}
 
 	// Evaluate regime and entry rules using bytecode (actual execution path)
@@ -631,7 +690,6 @@ func buildProofSummary(st Strategy, f Features, proofs []LeafProof, signalIdx in
 	entryOK := len(st.EntryCompiled.Code) > 0 && evaluateCompiled(st.EntryCompiled.Code, f.F, signalIdx)
 
 	// Build condition results using bytecode evaluation for accuracy
-	var parts []string
 	parts = append(parts, fmt.Sprintf("regime_ok=%v", regimeOK))
 	parts = append(parts, fmt.Sprintf("entry_ok=%v", entryOK))
 
@@ -657,23 +715,36 @@ func buildProofSummary(st Strategy, f Features, proofs []LeafProof, signalIdx in
 		}
 		part += ":" + result
 
-		// Add key values for most important operators
+		// Add key values for most important operators with clear indicator labels
 		if p.Kind == "CrossUp" || p.Kind == "CrossDown" {
 			if len(p.Values) >= 4 {
-				part += fmt.Sprintf("[A[t-1]=%.2f,B[t-1]=%.2f,A[t]=%.2f,B[t]=%.2f]",
-					p.Values[0], p.Values[1], p.Values[2], p.Values[3])
+				// Format: FeatureA[t-1]=value | FeatureB[t-1]=value | FeatureA[t]=value | FeatureB[t]=value
+				part += fmt.Sprintf("[%s[t-1]=%.2f | %s[t-1]=%.2f | %s[t]=%.2f | %s[t]=%.2f]",
+					p.FeatureA, p.Values[0], p.FeatureB, p.Values[1], p.FeatureA, p.Values[2], p.FeatureB, p.Values[3])
 			}
 		} else if p.Kind == "Rising" || p.Kind == "Falling" {
 			if len(p.Values) >= 2 {
-				part += fmt.Sprintf("[X[t]=%.2f,X[t-lookback]=%.2f]",
-					p.Values[len(p.Values)-1], p.Values[0])
+				lookback := 0
+				if p.LeafNode.Kind >= 0 { // Use the leaf node's lookback
+					lookback = p.LeafNode.Lookback
+				}
+				part += fmt.Sprintf("[%s[t]=%.2f | %s[t-%d]=%.2f]",
+					p.FeatureA, p.Values[len(p.Values)-1], p.FeatureA, lookback, p.Values[0])
 			}
 		} else if p.Kind == "SlopeGT" || p.Kind == "SlopeLT" {
-			part += fmt.Sprintf("[slope=%.4f,threshold=%.2f]", p.ComputedSlope, p.Threshold)
+			part += fmt.Sprintf("[%s[slope]=%.4f | threshold=%.2f]", p.FeatureA, p.ComputedSlope, p.Threshold)
+		} else if p.Kind == "GT" || p.Kind == "LT" || p.Kind == "AbsGT" || p.Kind == "AbsLT" {
+			if len(p.Values) >= 1 {
+				part += fmt.Sprintf("[%s[t]=%.2f | threshold=%.2f]", p.FeatureA, p.Values[0], p.Threshold)
+			}
 		}
 
 		parts = append(parts, part)
 	}
+
+	// Add all 43 indicator values at the end
+	indicatorsPart := buildAllIndicatorsSummary(f, signalIdx)
+	parts = append(parts, indicatorsPart)
 
 	// Join with " | " separator and escape quotes
 	summary := strings.Join(parts, " | ")
@@ -688,23 +759,36 @@ func findMatchingORBranchFromProofs(node *RuleNode, proofs []LeafProof) string {
 		return "no_rule"
 	}
 
-	// Create a map of leaf feature index to their bytecode results
-	leafResults := make(map[int]bool)
+	// CRITICAL FIX: Use composite key for uniqueness (Kind, A, B, Lookback)
+	// Multiple leaves with same feature index (.A) but different operators/lookbacks were overwriting each other
+	leafResults := make(map[LeafKey]bool)
 	for _, p := range proofs {
-		leafResults[p.LeafNode.A] = p.Result
+		key := LeafKey{
+			Kind:     p.LeafNode.Kind,
+			A:        p.LeafNode.A,
+			B:        p.LeafNode.B,
+			Lookback: p.LeafNode.Lookback,
+		}
+		leafResults[key] = p.Result
 	}
 
 	return traceORBranch(node, leafResults)
 }
 
 // traceORBranch traces which branch of an OR tree was true based on leaf results
-func traceORBranch(node *RuleNode, leafResults map[int]bool) string {
+func traceORBranch(node *RuleNode, leafResults map[LeafKey]bool) string {
 	if node == nil {
 		return ""
 	}
 
 	if node.Op == OpLeaf {
-		if leafResults[node.Leaf.A] {
+		key := LeafKey{
+			Kind:     node.Leaf.Kind,
+			A:        node.Leaf.A,
+			B:        node.Leaf.B,
+			Lookback: node.Leaf.Lookback,
+		}
+		if leafResults[key] {
 			return leafKindToString(node.Leaf.Kind)
 		}
 		return ""
@@ -838,9 +922,9 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 	states := []StateRecord{} // Per-bar state tracking
 	signalProofs := make(map[int][]LeafProof) // Track proofs for signal bars
 
-	// Proof throttling: limit detailed proof building per leaf kind for performance
-	// This prevents the 33% slowdown (76.8/s -> 51.2/s) from excessive proof logging
-	const maxProofsPerLeafKind = 3
+	// Proof throttling DISABLED for full proof logging (set to high number)
+	// Original value was 3, which limited proofs to first 3 signals per leaf kind
+	const maxProofsPerLeafKind = 999999  // Essentially unlimited - log all proofs
 	proofCounts := make(map[string]int) // Track how many times we've built proofs for each leaf kind
 
 	// Smoothness metric: EMA volatility of equity changes (only if computeSmoothness is true)
@@ -872,10 +956,12 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 
 	// Warmup bars: use the MAX of tradeStartLocal and computed strategy warmup
 	// This ensures we have enough history for all indicators (entry, exit, regime)
-	warmupBars := tradeStartLocal
-	strategyWarmup := computeWarmup(st)
-	if strategyWarmup > warmupBars {
-		warmupBars = strategyWarmup
+	// CRITICAL FIX: Add indicator stabilization buffer (200 bars)
+	// EMAs need ~200 bars to stabilize from initial seed values
+	const stabilizationBars = 200
+	minEval := computeWarmup(st) + stabilizationBars
+	if minEval < 1 {
+		minEval = 1
 	}
 
 	atr7Idx, ok7 := f.Index["ATR7"]
@@ -1024,7 +1110,8 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		return result
 	}
 
-	for t := warmupBars; t < endLocal; t++ {
+	// Always loop from 1 so t-1 exists for indicator access
+	for t := 1; t < endLocal; t++ {
 		closePrice := s.Close[t]
 		highPrice := s.High[t]
 		lowPrice := s.Low[t]
@@ -1037,84 +1124,35 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		// Declare all variables at the top to avoid goto issues
 		var isActive bool
 		var regimeOk bool
-
-		// Mark-to-market: compute every bar for realistic DD tracking
 		var markEquity float32
 		var rawMarkEquity float32
-		if activeTrade != nil {
-			markPnL := float32(0.0)
-			if activeTrade.dir == 1 {
-				markPnL = (closePrice - activeTrade.entryPrice) / activeTrade.entryPrice
-			} else {
-				markPnL = (activeTrade.entryPrice - closePrice) / activeTrade.entryPrice
-			}
-			markEquity = equity * (1.0 + markPnL*st.RiskPct)
-			rawMarkEquity = rawEquity * (1.0 + markPnL)
-			statuses = append(statuses, "holding")
-		} else {
-			markEquity = equity
-			rawMarkEquity = rawEquity
-			statuses = append(statuses, "flat")
-		}
-
-		// Update raw equity peak and DD EVERY BAR
-		if rawMarkEquity > rawPeakMarkEquity {
-			rawPeakMarkEquity = rawMarkEquity
-		}
-		rawDD := float32(0.0)
-		if rawPeakMarkEquity > 0 {
-			rawDD = (rawPeakMarkEquity - rawMarkEquity) / rawPeakMarkEquity
-		}
-		if rawDD > rawMaxDD {
-			rawMaxDD = rawDD
-		}
-
-		// Update risk-adjusted peak and DD EVERY BAR
-		if markEquity > peakMarkEquity {
-			peakMarkEquity = markEquity
-		}
-
-		if markEquity < markTroughEquity {
-			markTroughEquity = markEquity
-		}
-		dd := float32(0.0)
-		if peakMarkEquity > 0 {
-			dd = (peakMarkEquity - markEquity) / peakMarkEquity
-		}
-		if dd > maxDD {
-			maxDD = dd
-		}
-
-		// Compute smoothness metrics if requested
-		if computeSmoothness && t > 0 {
-			r := (rawMarkEquity - prevMarkEquity) / prevMarkEquity
-			diff := r - ema
-			ema += alpha * diff
-			emaVar += alpha * (diff*diff - emaVar)
-			if r < 0 {
-				downsideSumSq += r * r
-				downsideCount++
-			}
-			prevMarkEquity = rawMarkEquity
-		}
+		var rawDD float32
+		var dd float32
 
 		// ============================================================
 		// STEP A: Execute pending entry first (at bar open)
 		// ============================================================
 		if pending != nil && pending.entryIdx == t {
+			// CRITICAL FIX: Use t-1 for all indicator access when executing at bar t open
+			// Bar t's close/high/low/volume are not known at bar t open
+			ref := t - 1
+			if ref < 0 {
+				ref = 0
+			}
+
 			// Check if still in regime and active (nil-safe guards)
-			regimeOk = st.RegimeFilter.Root == nil || (st.RegimeCompiled.Code != nil && evaluateCompiled(st.RegimeCompiled.Code, f.F, t))
+			regimeOk = st.RegimeFilter.Root == nil || (len(st.RegimeCompiled.Code) > 0 && evaluateCompiled(st.RegimeCompiled.Code, f.F, ref))
 			isActive = true
-			if okActive && activeIdx >= 0 && activeIdx < len(f.F) && t < len(f.F[activeIdx]) {
-				isActive = f.F[activeIdx][t] > 0
+			if okActive && activeIdx >= 0 && activeIdx < len(f.F) && ref < len(f.F[activeIdx]) {
+				isActive = f.F[activeIdx][ref] > 0
 			}
 
 			if regimeOk && isActive {
 				// Execute entry at open price with slippage
 				entryPrice := openPrice
 				slip := st.SlippageBps / 10000
-				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && t < len(f.F[volZIdx]) {
-					volZ := f.F[volZIdx][t]
+				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+					volZ := f.F[volZIdx][ref]
 					if volZ < -2.0 {
 						slip *= 4.0
 					} else if volZ < -1.0 {
@@ -1137,7 +1175,7 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 						sl = entryPrice * (1 + st.StopLoss.Value/100)
 					}
 				case "atr":
-					atr := getATR(t)
+					atr := getATR(ref)
 					if atr > 0 {
 						if pending.dir == 1 {
 							sl = entryPrice - atr*st.StopLoss.ATRMult
@@ -1152,14 +1190,14 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 						}
 					}
 				case "swing":
-					swingLow := closePrice
-					swingHigh := closePrice
-					for i := 1; i <= st.StopLoss.SwingIdx && t-i >= 0; i++ {
-						if s.Low[t-i] < swingLow {
-							swingLow = s.Low[t-i]
+					swingLow := s.Close[ref]
+					swingHigh := s.Close[ref]
+					for i := 1; i <= st.StopLoss.SwingIdx && ref-i >= 0; i++ {
+						if s.Low[ref-i] < swingLow {
+							swingLow = s.Low[ref-i]
 						}
-						if s.High[t-i] > swingHigh {
-							swingHigh = s.High[t-i]
+						if s.High[ref-i] > swingHigh {
+							swingHigh = s.High[ref-i]
 						}
 					}
 					if pending.dir == 1 {
@@ -1179,7 +1217,7 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 						tp = entryPrice * (1 - st.TakeProfit.Value/100)
 					}
 				case "atr":
-					atr := getATR(t)
+					atr := getATR(ref)
 					if atr > 0 {
 						if pending.dir == 1 {
 							tp = entryPrice + atr*st.TakeProfit.ATRMult
@@ -1277,39 +1315,89 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			// IMPORTANT: Skip gap-open checks on same bar as entry since we just entered at open
 			if !sameBarEntry {
 				if activeTrade.dir == 1 {
-				// LONG: gap-open TP if open >= tp, gap-open SL if open <= sl
-				if openPrice >= tpBefore {
-					if Verbose {
-						fmt.Printf("[DEBUG] Bar %d: gap-open TP hit (open=%.2f >= tp=%.2f)\n", t, openPrice, tpBefore)
+					// LONG: gap-open TP if open >= tp, gap-open SL if open <= sl
+					if openPrice >= tpBefore {
+						// Apply slippage for consistency
+						ref := slippageRef(t)
+						slip := st.SlippageBps / 10000.0
+						if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+							volZ := f.F[volZIdx][ref]
+							if volZ < -2.0 {
+								slip *= 4.0
+							} else if volZ < -1.0 {
+								slip *= 2.0
+							}
+						}
+						fillPrice := openPrice * (1.0 - slip) // long exit sells -> worse
+						if Verbose {
+							fmt.Printf("[DEBUG] Bar %d: gap-open TP hit (open=%.2f >= tp=%.2f)\n", t, openPrice, tpBefore)
+						}
+						closeTrade(t, fillPrice, "tp_gap_open", stopBefore, tpBefore, logx.ExitTriggerStatus{})
+						statuses = append(statuses, "exit_tp_gap_open")
+						goto END_BAR
 					}
-					closeTrade(t, openPrice, "tp_gap_open", stopBefore, tpBefore, logx.ExitTriggerStatus{})
-					statuses = append(statuses, "exit_tp_gap_open")
-					goto END_BAR
-				}
-				if openPrice <= stopBefore {
-					if Verbose {
-						fmt.Printf("[DEBUG] Bar %d: gap-open SL hit (open=%.2f <= sl=%.2f)\n", t, openPrice, stopBefore)
+					if openPrice <= stopBefore {
+						ref := slippageRef(t)
+						slip := st.SlippageBps / 10000.0
+						if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+							volZ := f.F[volZIdx][ref]
+							if volZ < -2.0 {
+								slip *= 4.0
+							} else if volZ < -1.0 {
+								slip *= 2.0
+							}
+						}
+						fillPrice := openPrice * (1.0 - slip) // long exit sells -> worse
+						if Verbose {
+							fmt.Printf("[DEBUG] Bar %d: gap-open SL hit (open=%.2f <= sl=%.2f)\n", t, openPrice, stopBefore)
+						}
+						closeTrade(t, fillPrice, "sl_gap_open", stopBefore, tpBefore, logx.ExitTriggerStatus{})
+						statuses = append(statuses, "exit_sl_gap_open")
+						goto END_BAR
 					}
-					closeTrade(t, openPrice, "sl_gap_open", stopBefore, tpBefore, logx.ExitTriggerStatus{})
-					statuses = append(statuses, "exit_sl_gap_open")
-					goto END_BAR
-				}
-			} else {
-				// SHORT: gap-open TP if open <= tp, gap-open SL if open >= sl
-				if openPrice <= tpBefore {
-					closeTrade(t, openPrice, "tp_gap_open", stopBefore, tpBefore, logx.ExitTriggerStatus{})
-					statuses = append(statuses, "exit_tp_gap_open")
-					goto END_BAR
-				}
-				if openPrice >= stopBefore {
-					closeTrade(t, openPrice, "sl_gap_open", stopBefore, tpBefore, logx.ExitTriggerStatus{})
-					statuses = append(statuses, "exit_sl_gap_open")
-					goto END_BAR
-				}
+				} else {
+					// SHORT: gap-open TP if open <= tp, gap-open SL if open >= sl
+					if openPrice <= tpBefore {
+						ref := slippageRef(t)
+						slip := st.SlippageBps / 10000.0
+						if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+							volZ := f.F[volZIdx][ref]
+							if volZ < -2.0 {
+								slip *= 4.0
+							} else if volZ < -1.0 {
+								slip *= 2.0
+							}
+						}
+						fillPrice := openPrice * (1.0 + slip) // short exit buys -> worse
+						closeTrade(t, fillPrice, "tp_gap_open", stopBefore, tpBefore, logx.ExitTriggerStatus{})
+						statuses = append(statuses, "exit_tp_gap_open")
+						goto END_BAR
+					}
+					if openPrice >= stopBefore {
+						ref := slippageRef(t)
+						slip := st.SlippageBps / 10000.0
+						if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+							volZ := f.F[volZIdx][ref]
+							if volZ < -2.0 {
+								slip *= 4.0
+							} else if volZ < -1.0 {
+								slip *= 2.0
+							}
+						}
+						fillPrice := openPrice * (1.0 + slip) // short exit buys -> worse
+						closeTrade(t, fillPrice, "sl_gap_open", stopBefore, tpBefore, logx.ExitTriggerStatus{})
+						statuses = append(statuses, "exit_sl_gap_open")
+						goto END_BAR
+					}
 				}
 			}
 
 			// B2: Intrabar TP/SL checks
+			// INTRABAR NOTE: Using VolZ20[t] is correct here since:
+			// 1. Gap-open checks (B1) already happened at bar t open (using t-1 data)
+			// 2. Intrabar SL/TP means price hit the level DURING bar t
+			// 3. By the time we check intrabar, bar t's price action is known
+			// 4. This differs from entry/exit at open where bar t is unknown
 			if activeTrade.dir == 1 {
 				// LONG: SL triggers if low <= sl, TP triggers if high >= tp
 				hitSL = lowPrice <= stopBefore
@@ -1325,8 +1413,9 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 				// Apply slippage
 				exitPrice := stopBefore
 				slip := (st.SlippageBps * 2.0) / 10000
-				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && t < len(f.F[volZIdx]) {
-					volZ := f.F[volZIdx][t]
+				ref := slippageRef(t)
+				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+					volZ := f.F[volZIdx][ref]
 					if volZ < -2.0 {
 						slip *= 4.0
 					} else if volZ < -1.0 {
@@ -1354,8 +1443,9 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			} else if hitTP {
 				exitPrice := tpBefore
 				slip := st.SlippageBps / 10000
-				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && t < len(f.F[volZIdx]) {
-					volZ := f.F[volZIdx][t]
+				ref := slippageRef(t)
+				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+					volZ := f.F[volZIdx][ref]
 					if volZ < -2.0 {
 						slip *= 4.0
 					} else if volZ < -1.0 {
@@ -1376,7 +1466,7 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			// IMPORTANT: Evaluate exit rule on t-1, exit at open of t to avoid lookahead bias
 			// If features include close/high/low of bar t, we can't know them at the open
 			exitRule := false
-			if t > activeTrade.entryIdx+1 && st.ExitCompiled.Code != nil {
+			if t > activeTrade.entryIdx && len(st.ExitCompiled.Code) > 0 {
 				exitRule = evaluateCompiled(st.ExitCompiled.Code, f.F, t-1)
 			}
 			maxHold := false
@@ -1385,10 +1475,17 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			}
 
 			if exitRule || maxHold {
+				// CRITICAL FIX: Use t-1 for slippage when exiting at bar t open
+				// Bar t's volatility is not known at bar t open
+				ref := t - 1
+				if ref < 0 {
+					ref = 0
+				}
+
 				exitPrice := openPrice
 				slip := st.SlippageBps / 10000
-				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && t < len(f.F[volZIdx]) {
-					volZ := f.F[volZIdx][t]
+				if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+					volZ := f.F[volZIdx][ref]
 					if volZ < -2.0 {
 						slip *= 4.0
 					} else if volZ < -1.0 {
@@ -1516,7 +1613,7 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		}
 
 		// Check for entry signal (nil-safe guard for EntryCompiled.Code)
-		if st.EntryCompiled.Code != nil && evaluateCompiled(st.EntryCompiled.Code, f.F, t) {
+		if len(st.EntryCompiled.Code) > 0 && evaluateCompiled(st.EntryCompiled.Code, f.F, t) {
 			// Check bust protection
 			busted := st.MaxConsecLosses > 0 && consecLosses >= st.MaxConsecLosses
 			if busted {
@@ -1524,8 +1621,9 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 				if debugSignals && debugSignalCount < debugMaxSignals {
 					fmt.Printf("  [BLOCKED] Busted: %d consecutive losses (MaxConsecLosses=%d)\n", consecLosses, st.MaxConsecLosses)
 				}
-			} else if t < warmupBars {
-				// Warmup guard: evaluate signals for tree node counts, but don't schedule trades
+			} else if t < tradeStartLocal {
+				statuses = append(statuses, "pre_trade_window")
+			} else if t < minEval {
 				statuses = append(statuses, "signal_warmup")
 			} else if t+1 >= endLocal {
 				// End-of-window guard: don't schedule entry past the end of data
@@ -1594,6 +1692,65 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			}
 		}
 
+		// ============================================================
+		// Mark-to-market: compute AFTER all entry/exit logic for consistency
+		// ============================================================
+		if activeTrade != nil {
+			markPnL := float32(0.0)
+			if activeTrade.dir == 1 {
+				markPnL = (closePrice - activeTrade.entryPrice) / activeTrade.entryPrice
+			} else {
+				markPnL = (activeTrade.entryPrice - closePrice) / activeTrade.entryPrice
+			}
+			markEquity = equity * (1.0 + markPnL*st.RiskPct)
+			rawMarkEquity = rawEquity * (1.0 + markPnL)
+			statuses = append(statuses, "holding")
+		} else {
+			markEquity = equity
+			rawMarkEquity = rawEquity
+			statuses = append(statuses, "flat")
+		}
+
+		// Update peaks and DD EVERY BAR
+		if rawMarkEquity > rawPeakMarkEquity {
+			rawPeakMarkEquity = rawMarkEquity
+		}
+		rawDD = float32(0.0)
+		if rawPeakMarkEquity > 0 {
+			rawDD = (rawPeakMarkEquity - rawMarkEquity) / rawPeakMarkEquity
+		}
+		if rawDD > rawMaxDD {
+			rawMaxDD = rawDD
+		}
+
+		// Update risk-adjusted peak and DD
+		if markEquity > peakMarkEquity {
+			peakMarkEquity = markEquity
+		}
+		if markEquity < markTroughEquity {
+			markTroughEquity = markEquity
+		}
+		dd = float32(0.0)
+		if peakMarkEquity > 0 {
+			dd = (peakMarkEquity - markEquity) / peakMarkEquity
+		}
+		if dd > maxDD {
+			maxDD = dd
+		}
+
+		// Compute smoothness metrics if requested (with safety guard)
+		if computeSmoothness && t > 0 && prevMarkEquity > 0 {
+			r := (rawMarkEquity - prevMarkEquity) / prevMarkEquity
+			diff := r - ema
+			ema += alpha * diff
+			emaVar += alpha * (diff*diff - emaVar)
+			if r < 0 {
+				downsideSumSq += r * r
+				downsideCount++
+			}
+			prevMarkEquity = rawMarkEquity
+		}
+
 		END_BAR:
 		// Finalize state for this bar - ALWAYS runs, no matter what path we took
 		states = append(states, StateRecord{BarIndex: t, Time: barTime, Statuses: stringJoin(statuses, ",")})
@@ -1635,9 +1792,13 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		} else if activeTrade != nil {
 			// Normal force-close path
 			// Apply slippage for consistency with other exits
+			ref := finalIdx
+			if ref > 0 {
+				ref = finalIdx - 1
+			}
 			slip := st.SlippageBps / 10000
-			if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) {
-				volZ := f.F[volZIdx][finalIdx]
+			if okVolZ && volZIdx >= 0 && volZIdx < len(f.F) && ref < len(f.F[volZIdx]) {
+				volZ := f.F[volZIdx][ref]
 				if volZ < -2.0 {
 					slip *= 4.0
 				} else if volZ < -1.0 {

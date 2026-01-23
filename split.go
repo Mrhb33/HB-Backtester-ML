@@ -71,11 +71,23 @@ func SliceFeatures(f Features, i0, i1 int) Features {
 	out := Features{
 		F:     make([][]float32, len(f.F)),
 		Names: f.Names,
-		Index: f.Index,
 	}
 	for k := range f.F {
 		out.F[k] = f.F[k][i0:i1]
 	}
+
+	// FIX: Rebuild index map for sliced data - indices are sequential 0..len(Names)-1
+	// DO NOT copy the old Index map as it points to wrong positions in sliced arrays
+	out.Index = make(map[string]int, len(f.Names))
+	for i := 0; i < len(out.Names); i++ {
+		out.Index[out.Names[i]] = i
+	}
+
+	// Copy Types and Stats arrays (they're already per-feature, not per-bar)
+	out.Types = f.Types
+	out.Stats = make([]FeatureStats, len(f.Stats))
+	copy(out.Stats, f.Stats)
+
 	return out
 }
 

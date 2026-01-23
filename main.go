@@ -221,7 +221,7 @@ func main() {
 	fmt.Println("HB Backtest Strategy Search Engine")
 	fmt.Println("====================================")
 
-	mode := flag.String("mode", "search", "search|test|golden|trace|validate")
+	mode := flag.String("mode", "search", "search|test|golden|trace|validate|diagnose|verify")
 	verbose := flag.Bool("verbose", false, "enable verbose debug logs")
 	scoringMode := flag.String("scoring", "balanced", "scoring mode: balanced or aggressive")
 	seedFlag := flag.Int64("seed", 0, "random seed (0 = time-based, nonzero = reproducible)")
@@ -376,6 +376,12 @@ func main() {
 	case "validate":
 		RunValidation("btc_5min_data.csv")
 		return
+	case "diagnose":
+		runDiagnosticMode()
+		return
+	case "verify":
+		runVerifyMode()
+		return
 	default: // search mode
 		// Continue to search logic
 	}
@@ -473,7 +479,7 @@ func main() {
 	const minTopScore = 0.65 // Lowered to allow tracking of realistic scores
 
 	// Initialize Hall of Fame for evolution
-	hof := NewHallOfFame(50) // keep top 50 by validation score (reduced from 200 to force exploration)
+	hof := NewHallOfFame(200) // keep top 200 by validation score (increased to preserve diversity)
 
 	// Initialize MAP-Elites archive for diversity preservation
 	archive := NewArchive()
@@ -1441,12 +1447,30 @@ func main() {
 							improved = true
 						}
 
-						// Update surrogate's exploration probability
+						// Update surrogate's exploration probability with adaptive scaling
 						stagnationMu.RLock()
 						currentSurExploreP := surExploreP
 						stagnationMu.RUnlock()
+
+						// Scale exploration probability based on hof size
+						// When hof.Len() is 50-100: higher exploration (70-90%) to limit rejection to 10-30%
+						// When hof.Len() >= 100: normal exploration (10%)
+						hof.mu.RLock()
+						hofLen := hof.Len()
+						hof.mu.RUnlock()
+
+						scaledExploreP := currentSurExploreP
+						if hofLen >= 50 && hofLen < 100 {
+							// Map 50->100 elites to exploreP 0.90->0.70
+							// This gives rej_sur ~10-30% (vs current ~72%)
+							t := float32(hofLen-50) / 50.0 // 0.0 at 50 elites, 1.0 at 100 elites
+							scaledExploreP = 0.90 - t*0.20 // 0.90 at 50, 0.70 at 100
+						} else if hofLen >= 100 {
+							scaledExploreP = currentSurExploreP // Use meta-controlled value (default 0.10)
+						}
+
 						sur.mu.Lock()
-						sur.exploreP = float64(currentSurExploreP)
+						sur.exploreP = float64(scaledExploreP)
 						sur.mu.Unlock()
 
 						// Train surrogate using validation results
@@ -1811,7 +1835,7 @@ func main() {
 							// CRITICAL FIX #2 & #3: Exit bootstrap mode once we have enough elites
 							// This enables normal cooldown (200) and MaxHoldBars (150-329) values
 							// and enables strict profit gates for elite acceptance
-							const bootstrapEliteThreshold = 10
+							const bootstrapEliteThreshold = 8
 							if hof.Len() >= bootstrapEliteThreshold && isBootstrapMode() {
 								setBootstrapMode(false)
 								logx.LogBootstrapComplete(hof.Len())
@@ -2320,11 +2344,14 @@ func main() {
 			stagnationCount := meta.Batches - meta.LastImprovementBatch
 			meta.mu.RUnlock()
 
-			immigrantP := float32(0.10) // Base: 10% when improving
-			if hof.Len() == 0 {
-				immigrantP = 1.00 // 100% immigrants when empty (bootstrap)
+			// FIX: Use normal generator proportions once we have >= 8 elites
+			// Bootstrap mode (elites < 8): 100% immigrants to seed the population
+			// Normal mode (elites >= 8): 25-40% immigrants, rest is evolution
+			immigrantP := float32(0.25) // Base: 25% when improving and elites >= 8
+			if hof.Len() < 8 {
+				immigrantP = 1.00 // 100% immigrants when elites < 8 (bootstrap phase)
 			} else if hof.Len() >= 50 {
-				immigrantP = 0.20 // Increase to 20% when elites full
+				immigrantP = 0.40 // Increase to 40% when elites full (more exploration)
 			}
 			if stagnationCount > 3 {
 				immigrantP += 0.15 // Additional boost when stagnating
@@ -2426,9 +2453,9 @@ func main() {
 
 			// Warm-start: don't let surrogate block exploration until we have stable elites
 			// When elites=0, the model can become an "everything is bad" bouncer
-			// CRITICAL FIX: Delay surrogate until elites >= 20 to avoid premature filtering
+			// CRITICAL FIX: Delay surrogate until elites >= 50 to avoid premature filtering
 			hof.mu.RLock()
-			haveElites := len(hof.Elites) >= 20
+			haveElites := len(hof.Elites) >= 50
 			hof.mu.RUnlock()
 
 			if useSurrogate && haveElites {
@@ -2499,6 +2526,15 @@ func main() {
 				totalRecentFingerprints = totalRecentFingerprints / 2
 			}
 			recentFingerprintsMu.Unlock()
+
+			// CRITICAL: Ensure trigger leaf after ALL generation (mutations, crossovers, immigrants)
+			// This prevents screen_entry_rate_dead rejections by guaranteeing entry capability
+			if !hasTriggerLeaf(s.EntryRule.Root) {
+				// Replace a random leaf with a trigger leaf
+				ensureTriggerLeaf(s.EntryRule.Root, rng, feats)
+				// Recompile since tree changed
+				s.EntryCompiled = compileRuleTree(s.EntryRule.Root)
+			}
 
 			select {
 			case <-ctx.Done():
@@ -2659,6 +2695,421 @@ func main() {
 
 	print("\n\nStopped. Total tested: %d\n", atomic.LoadUint64(&tested))
 	print("Results saved to: best_every_10000.txt")
+}
+
+// runDiagnosticMode exports indicator values at specific timestamp for TradingView comparison
+// Phase 1: Data Collection - Export local values at 2025-12-21 11:30:00
+func runDiagnosticMode() {
+	fmt.Println("Running in DIAGNOSE mode - exporting indicator values for TradingView comparison")
+	fmt.Println("===============================================================================")
+	fmt.Println()
+
+	// Load data
+	fmt.Println("Loading data...")
+	s, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	if err != nil {
+		fmt.Printf("Error loading data: %v\n", err)
+		return
+	}
+	fmt.Printf("Loaded %d candles\n", s.T)
+
+	// Compute features on FULL dataset
+	fmt.Println("Computing features on FULL dataset...")
+	f := computeAllFeatures(s)
+	fmt.Printf("Computed %d features\n", len(f.F))
+
+	// Find index for 2025-12-21 13:30:00 (matching actual data in CSV)
+	targetTime, err := time.Parse("2006-01-02 15:04:05", "2025-12-21 13:30:00")
+	if err != nil {
+		fmt.Printf("Error parsing target time: %v\n", err)
+		return
+	}
+	targetMs := targetTime.UnixMilli()
+
+	idx := -1
+	for i, t := range s.OpenTimeMs {
+		if t == targetMs {
+			idx = i
+			break
+		}
+	}
+
+	if idx == -1 {
+		fmt.Printf("Timestamp 2025-12-21 13:30:00 not found in data.\n")
+		fmt.Printf("Searching for nearby timestamps...\n")
+
+		// Find the closest timestamp
+		closestIdx := -1
+		minDiff := int64(1 << 62)
+		for i, t := range s.OpenTimeMs {
+			diff := t - targetMs
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < minDiff {
+				minDiff = diff
+				closestIdx = i
+			}
+		}
+
+		if closestIdx >= 0 {
+			closestTime := time.Unix(s.OpenTimeMs[closestIdx]/1000, 0)
+			fmt.Printf("Closest timestamp found at index %d: %s (diff: %d ms)\n",
+				closestIdx, closestTime.Format("2006-01-02 15:04:05"), minDiff)
+			fmt.Printf("Using index %d for diagnostic output.\n", closestIdx)
+			idx = closestIdx
+		} else {
+			fmt.Printf("Could not find any timestamp in data.\n")
+			return
+		}
+	}
+
+	fmt.Printf("\n=== DIAGNOSTIC REPORT: %s (Index %d) ===\n",
+		time.Unix(s.OpenTimeMs[idx]/1000, 0).Format("2006-01-02 15:04:05"), idx)
+
+	// Raw OHLCV
+	fmt.Printf("\nRAW DATA:\n")
+	fmt.Printf("  Open:   %.2f\n", s.Open[idx])
+	fmt.Printf("  High:   %.2f\n", s.High[idx])
+	fmt.Printf("  Low:    %.2f\n", s.Low[idx])
+	fmt.Printf("  Close:  %.2f\n", s.Close[idx])
+	fmt.Printf("  Volume: %.2f\n", s.Volume[idx])
+
+	// Previous bar (for EMA/RSI context)
+	if idx > 0 {
+		fmt.Printf("\nPREVIOUS BAR (Index %d):\n", idx-1)
+		fmt.Printf("  Open:  %.2f\n", s.Open[idx-1])
+		fmt.Printf("  High:  %.2f\n", s.High[idx-1])
+		fmt.Printf("  Low:   %.2f\n", s.Low[idx-1])
+		fmt.Printf("  Close: %.2f\n", s.Close[idx-1])
+	}
+
+	// Helper function to safely get feature value
+	getFeat := func(name string) float32 {
+		if i, ok := f.Index[name]; ok {
+			if idx < len(f.F[i]) {
+				return f.F[i][idx]
+			}
+		}
+		return -1
+	}
+
+	// Helper to get previous value
+	getFeatPrev := func(name string) float32 {
+		if i, ok := f.Index[name]; ok {
+			if idx-1 >= 0 && idx-1 < len(f.F[i]) {
+				return f.F[i][idx-1]
+			}
+		}
+		return -1
+	}
+
+	// Helper to get first value
+	getFeatFirst := func(name string) float32 {
+		if i, ok := f.Index[name]; ok {
+			if len(f.F[i]) > 0 {
+				return f.F[i][0]
+			}
+		}
+		return -1
+	}
+
+	// EMA20
+	ema20 := getFeat("EMA20")
+	ema20Prev := getFeatPrev("EMA20")
+	ema20First := getFeatFirst("EMA20")
+	fmt.Printf("\nEMA20: %.2f\n", ema20)
+	if ema20Prev >= 0 {
+		fmt.Printf("  Previous EMA20: %.2f\n", ema20Prev)
+	}
+	if ema20First >= 0 {
+		fmt.Printf("  First EMA20: %.2f (at index 0)\n", ema20First)
+	}
+
+	// RSI14
+	rsi14 := getFeat("RSI14")
+	fmt.Printf("\nRSI14: %.2f\n", rsi14)
+
+	// MACD
+	macd := getFeat("MACD")
+	signal := getFeat("MACD_Signal")
+	hist := getFeat("MACD_Hist")
+	fmt.Printf("\nMACD Line: %.2f\n", macd)
+	fmt.Printf("  Signal: %.2f\n", signal)
+	fmt.Printf("  Histogram: %.2f\n", hist)
+
+	// ADX
+	adxDx := getFeat("ADX")
+	adxFirst := getFeatFirst("ADX")
+	fmt.Printf("\nADX: %.2f\n", adxDx)
+	if adxFirst >= 0 {
+		fmt.Printf("  First ADX: %.2f (at index 0)\n", adxFirst)
+	}
+
+	// PlusDI and MinusDI
+	plusDI := getFeat("PlusDI")
+	minusDI := getFeat("MinusDI")
+	fmt.Printf("  PlusDI: %.2f\n", plusDI)
+	fmt.Printf("  MinusDI: %.2f\n", minusDI)
+
+	// ATR14
+	atr14 := getFeat("ATR14")
+	fmt.Printf("\nATR14: %.2f\n", atr14)
+
+	// Bollinger Bands 20
+	bbUpper := getFeat("BB_Upper20")
+	bbLower := getFeat("BB_Lower20")
+	bbWidth := getFeat("BB_Width20")
+	fmt.Printf("\nBB Upper20: %.2f\n", bbUpper)
+	fmt.Printf("BB Lower20: %.2f\n", bbLower)
+	fmt.Printf("BB Width20: %.4f\n", bbWidth)
+
+	// SMA20 (computed from BB_Upper20 basis - BB uses SMA)
+	// BB_Upper = SMA + 2*Std, BB_Lower = SMA - 2*Std
+	// So SMA = (BB_Upper + BB_Lower) / 2
+	sma20 := (bbUpper + bbLower) / 2
+	fmt.Printf("SMA20 (from BB): %.2f\n", sma20)
+
+	// Export for comparison
+	fmt.Printf("\n=== EXPORT FOR TRADINGVIEW COMPARISON ===\n")
+	fmt.Printf("Timestamp: %s\n", time.Unix(s.OpenTimeMs[idx]/1000, 0).Format("2006-01-02 15:04:05"))
+	fmt.Printf("Index: %d of %d\n", idx, s.T)
+	fmt.Printf("Close: %.2f\n", s.Close[idx])
+	if idx > 0 {
+		fmt.Printf("Previous Close: %.2f\n", s.Close[idx-1])
+	}
+	fmt.Printf("EMA20: %.2f\n", ema20)
+	fmt.Printf("RSI14: %.2f\n", rsi14)
+	fmt.Printf("MACD: %.2f, Signal: %.2f, Hist: %.2f\n", macd, signal, hist)
+	fmt.Printf("ADX: %.2f\n", adxDx)
+	fmt.Printf("PlusDI: %.2f\n", plusDI)
+	fmt.Printf("MinusDI: %.2f\n", minusDI)
+	fmt.Printf("ATR14: %.2f\n", atr14)
+	fmt.Printf("BB Upper20: %.2f\n", bbUpper)
+	fmt.Printf("BB Lower20: %.2f\n", bbLower)
+
+	// Also show values at different indices to check for warmup issues
+	fmt.Printf("\n=== WARMUP ANALYSIS - Values at different indices ===\n")
+	indicesToShow := []int{100, 500, 1000, 5000}
+	for _, showIdx := range indicesToShow {
+		if showIdx >= s.T {
+			continue
+		}
+		fmt.Printf("\nAt index %d (%s):\n", showIdx, time.Unix(s.OpenTimeMs[showIdx]/1000, 0).Format("2006-01-02 15:04:05"))
+
+		// Helper for this index
+		getAtIdx := func(name string) float32 {
+			if i, ok := f.Index[name]; ok {
+				if showIdx < len(f.F[i]) {
+					return f.F[i][showIdx]
+				}
+			}
+			return -1
+		}
+
+		fmt.Printf("  Close: %.2f\n", s.Close[showIdx])
+		fmt.Printf("  EMA20: %.2f\n", getAtIdx("EMA20"))
+		fmt.Printf("  RSI14: %.2f\n", getAtIdx("RSI14"))
+		fmt.Printf("  ADX: %.2f\n", getAtIdx("ADX"))
+	}
+
+	fmt.Printf("\n=== DIAGNOSTIC NOTES ===\n")
+	fmt.Printf("1. Compare the values above with TradingView at the same timestamp\n")
+	fmt.Printf("2. Note TradingView's EXACT settings:\n")
+	fmt.Printf("   - EMA source: Close (default)\n")
+	fmt.Printf("   - RSI length: 14 (default)\n")
+	fmt.Printf("   - MACD params: 12/26/9 (default)\n")
+	fmt.Printf("   - ADX length: 14 (default)\n")
+	fmt.Printf("   - BB params: 20, 2.0 (default)\n")
+	fmt.Printf("3. If ADX ≈ 1.4x TradingView value: Using EMA smoothing instead of Wilder\n")
+	fmt.Printf("4. If early values wrong but later values match: Warmup/seed issue\n")
+	fmt.Printf("5. If ALL values wrong: Data source or formula issue\n")
+
+	// Export to CSV for easy comparison
+	fmt.Printf("\n=== EXPORTING TO CSV ===\n")
+	csvPath := "diagnostic_values.csv"
+	csvFile, err := os.Create(csvPath)
+	if err != nil {
+		fmt.Printf("Error creating CSV file: %v\n", err)
+		return
+	}
+	defer csvFile.Close()
+
+	writer := csv.NewWriter(csvFile)
+	defer writer.Flush()
+
+	// Write header
+	header := []string{"Timestamp", "Index", "Open", "High", "Low", "Close", "Volume",
+		"EMA20", "RSI14", "MACD", "MACD_Signal", "MACD_Hist",
+		"ADX", "PlusDI", "MinusDI", "ATR14", "BB_Upper20", "BB_Lower20", "BB_Width20", "SMA20"}
+	if err := writer.Write(header); err != nil {
+		fmt.Printf("Error writing CSV header: %v\n", err)
+		return
+	}
+
+	// Helper to get value at specific index
+	getValueAtIdx := func(name string, idx int) float32 {
+		if i, ok := f.Index[name]; ok {
+			if idx >= 0 && idx < len(f.F[i]) {
+				return f.F[i][idx]
+			}
+		}
+		return -1
+	}
+
+	// Export the target bar
+	row := []string{
+		time.Unix(s.OpenTimeMs[idx]/1000, 0).Format("2006-01-02 15:04:05"),
+		fmt.Sprintf("%d", idx),
+		fmt.Sprintf("%.2f", s.Open[idx]),
+		fmt.Sprintf("%.2f", s.High[idx]),
+		fmt.Sprintf("%.2f", s.Low[idx]),
+		fmt.Sprintf("%.2f", s.Close[idx]),
+		fmt.Sprintf("%.2f", s.Volume[idx]),
+		fmt.Sprintf("%.2f", getFeat("EMA20")),
+		fmt.Sprintf("%.2f", getFeat("RSI14")),
+		fmt.Sprintf("%.2f", getFeat("MACD")),
+		fmt.Sprintf("%.2f", getFeat("MACD_Signal")),
+		fmt.Sprintf("%.2f", getFeat("MACD_Hist")),
+		fmt.Sprintf("%.2f", getFeat("ADX")),
+		fmt.Sprintf("%.2f", getFeat("PlusDI")),
+		fmt.Sprintf("%.2f", getFeat("MinusDI")),
+		fmt.Sprintf("%.2f", getFeat("ATR14")),
+		fmt.Sprintf("%.2f", getFeat("BB_Upper20")),
+		fmt.Sprintf("%.2f", getFeat("BB_Lower20")),
+		fmt.Sprintf("%.4f", getFeat("BB_Width20")),
+		fmt.Sprintf("%.2f", sma20),
+	}
+	if err := writer.Write(row); err != nil {
+		fmt.Printf("Error writing CSV row: %v\n", err)
+		return
+	}
+
+	// Also export warmup analysis bars
+	warmupIndices := []int{100, 500, 1000, 5000}
+	for _, showIdx := range warmupIndices {
+		if showIdx >= s.T {
+			continue
+		}
+		showSMA := (getValueAtIdx("BB_Upper20", showIdx) + getValueAtIdx("BB_Lower20", showIdx)) / 2
+		row := []string{
+			time.Unix(s.OpenTimeMs[showIdx]/1000, 0).Format("2006-01-02 15:04:05"),
+			fmt.Sprintf("%d", showIdx),
+			fmt.Sprintf("%.2f", s.Open[showIdx]),
+			fmt.Sprintf("%.2f", s.High[showIdx]),
+			fmt.Sprintf("%.2f", s.Low[showIdx]),
+			fmt.Sprintf("%.2f", s.Close[showIdx]),
+			fmt.Sprintf("%.2f", s.Volume[showIdx]),
+			fmt.Sprintf("%.2f", getValueAtIdx("EMA20", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("RSI14", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("MACD", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("MACD_Signal", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("MACD_Hist", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("ADX", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("PlusDI", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("MinusDI", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("ATR14", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("BB_Upper20", showIdx)),
+			fmt.Sprintf("%.2f", getValueAtIdx("BB_Lower20", showIdx)),
+			fmt.Sprintf("%.4f", getValueAtIdx("BB_Width20", showIdx)),
+			fmt.Sprintf("%.2f", showSMA),
+		}
+		if err := writer.Write(row); err != nil {
+			fmt.Printf("Error writing CSV warmup row: %v\n", err)
+			return
+		}
+	}
+
+	fmt.Printf("CSV exported to: %s\n", csvPath)
+	fmt.Printf("Open this file in Excel/Google Sheets to compare with TradingView values\n")
+}
+
+// runVerifyMode - Simple verification that indicators are computed from CSV OHLCV data
+// Loads data from btc_5min_data.csv, computes indicators, shows the values
+func runVerifyMode() {
+	fmt.Println("Running in VERIFY mode - Computing indicators from CSV OHLCV data")
+	fmt.Println("==================================================================")
+	fmt.Println()
+
+	// Load data from CSV
+	fmt.Println("Loading data from btc_5min_data.csv...")
+	s, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	if err != nil {
+		fmt.Printf("Error loading data: %v\n", err)
+		return
+	}
+	fmt.Printf("Loaded %d candles from CSV\n", s.T)
+
+	// Find the target timestamp: 2025-12-21 13:30:00
+	targetTime, _ := time.Parse("2006-01-02 15:04:05", "2025-12-21 13:30:00")
+	targetMs := targetTime.UnixMilli()
+
+	idx := -1
+	for i, t := range s.OpenTimeMs {
+		if t == targetMs {
+			idx = i
+			break
+		}
+	}
+
+	if idx == -1 {
+		// Find closest
+		minDiff := int64(1 << 62)
+		for i, t := range s.OpenTimeMs {
+			diff := t - targetMs
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < minDiff {
+				minDiff = diff
+				idx = i
+			}
+		}
+	}
+
+	fmt.Printf("\nTarget timestamp: %s (Index %d)\n",
+		time.Unix(s.OpenTimeMs[idx]/1000, 0).Format("2006-01-02 15:04:05"), idx)
+
+	// Show raw OHLCV from CSV
+	fmt.Printf("\n=== RAW OHLCV DATA FROM CSV ===\n")
+	fmt.Printf("  Open:   %.2f\n", s.Open[idx])
+	fmt.Printf("  High:   %.2f\n", s.High[idx])
+	fmt.Printf("  Low:    %.2f\n", s.Low[idx])
+	fmt.Printf("  Close:  %.2f\n", s.Close[idx])
+	fmt.Printf("  Volume: %.2f\n", s.Volume[idx])
+
+	// Compute indicators on FULL dataset
+	fmt.Printf("\nComputing indicators from CSV data...\n")
+	f := computeAllFeatures(s)
+
+	// Helper to get feature value
+	getFeat := func(name string) float32 {
+		if i, ok := f.Index[name]; ok {
+			if idx < len(f.F[i]) {
+				return f.F[i][idx]
+			}
+		}
+		return -1
+	}
+
+	// Show computed indicators
+	fmt.Printf("\n=== COMPUTED INDICATORS (from CSV OHLCV) ===\n")
+	fmt.Printf("  EMA20:       %.2f\n", getFeat("EMA20"))
+	fmt.Printf("  RSI14:       %.2f\n", getFeat("RSI14"))
+	fmt.Printf("  MACD:        %.2f\n", getFeat("MACD"))
+	fmt.Printf("  MACD Signal: %.2f\n", getFeat("MACD_Signal"))
+	fmt.Printf("  MACD Hist:   %.2f\n", getFeat("MACD_Hist"))
+	fmt.Printf("  ADX:         %.2f\n", getFeat("ADX"))
+	fmt.Printf("  PlusDI:      %.2f\n", getFeat("PlusDI"))
+	fmt.Printf("  MinusDI:     %.2f\n", getFeat("MinusDI"))
+	fmt.Printf("  ATR14:       %.2f\n", getFeat("ATR14"))
+	fmt.Printf("  BB_Upper20:  %.2f\n", getFeat("BB_Upper20"))
+	fmt.Printf("  BB_Lower20:  %.2f\n", getFeat("BB_Lower20"))
+
+	fmt.Printf("\n=== VERIFICATION RESULT ===\n")
+	fmt.Printf("All indicators above are computed FROM the CSV OHLCV data.\n")
+	fmt.Printf("Raw data source: btc_5min_data.csv\n")
+	fmt.Printf("If these match TradingView at the same timestamp, indicators are CORRECT.\n")
 }
 
 func runTestMode(feeBps, slipBps float32, fromIdx, toIdx int, fromTime, toTime string, warmupBars int) {
@@ -3797,12 +4248,23 @@ func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64, exportC
 	fmt.Println("\nRunning backtest on TEST window...")
 	result := evaluateStrategyWithTrades(series, feats, st, testW, false)
 
-	// Write states to CSV for debugging
-	fmt.Println("\nWriting per-bar states to states.csv...")
-	if err := WriteStatesToCSV(result.States, "states.csv"); err != nil {
-		fmt.Printf("Error writing states CSV: %v\n", err)
+	// Write states with proofs and indicators to CSV
+	// Only ONE CSV file is generated per run
+	if exportStates != "" {
+		fmt.Printf("\nWriting states with proofs to %s...\n", exportStates)
+		if err := WriteStatesWithProofsToCSV(result.States, series, st, feats, result.SignalProofs, result.WindowOffset, exportStates); err != nil {
+			fmt.Printf("Error writing states CSV: %v\n", err)
+		} else {
+			fmt.Printf("States written to %s (%d bars)\n", exportStates, len(result.States))
+		}
 	} else {
-		fmt.Printf("States written to states.csv (%d bars)\n", len(result.States))
+		// Default to states.csv if no export path specified
+		fmt.Println("\nWriting states to states.csv...")
+		if err := WriteStatesWithProofsToCSV(result.States, series, st, feats, result.SignalProofs, result.WindowOffset, "states.csv"); err != nil {
+			fmt.Printf("Error writing states CSV: %v\n", err)
+		} else {
+			fmt.Printf("States written to states.csv (%d bars)\n", len(result.States))
+		}
 	}
 
 	// Write trades to CSV if export path is specified
@@ -3812,16 +4274,6 @@ func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64, exportC
 			fmt.Printf("Error writing trades CSV: %v\n", err)
 		} else {
 			fmt.Printf("Trades written to %s (%d trades)\n", exportCSV, len(result.Trades))
-		}
-	}
-
-	// Write states with proofs to CSV if export path is specified
-	if exportStates != "" {
-		fmt.Printf("\nWriting states with proofs to %s...\n", exportStates)
-		if err := WriteStatesWithProofsToCSV(result.States, st, feats, result.SignalProofs, result.WindowOffset, exportStates); err != nil {
-			fmt.Printf("Error writing states CSV: %v\n", err)
-		} else {
-			fmt.Printf("States written to %s (%d bars)\n", exportStates, len(result.States))
 		}
 	}
 

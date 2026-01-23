@@ -272,9 +272,9 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		maxTrainDD = 0.50
 	case 1: // Normal
 		// minScreenScore = -0.20
-		minScreenTrades = 20
+		minScreenTrades = 5  // Lowered from 20 to 5 to allow more strategies through warm-start
 		// minTrainScore = -0.20
-		minTrainTrades = 60
+		minTrainTrades = 20  // Lowered from 60 to 20 for warm-start
 		maxTrainDD = 0.55
 	case 2: // Relaxed
 		// minScreenScore = -0.40
