@@ -229,8 +229,8 @@ func main() {
 	checkpointPath := flag.String("checkpoint", "checkpoint.json", "checkpoint output path")
 	checkpointEverySec := flag.Int("checkpoint_every", 60, "TEMP warm-start: auto-save checkpoint every N seconds")
 	// Cost override flags for production-level realism
-	feeBpsFlag := flag.Float64("fee_bps", 30, "transaction fee in basis points (0.01% per bps, default 30 = 0.3%)")
-	slipBpsFlag := flag.Float64("slip_bps", 8, "slippage in basis points (default 8 = 0.08%)")
+	feeBpsFlag := flag.Float64("fee_bps", 20, "transaction fee in basis points (0.01% per bps, default 20 = 0.2%)")
+	slipBpsFlag := flag.Float64("slip_bps", 5, "slippage in basis points (default 5 = 0.05%)")
 	// Golden mode flags
 	goldenSeed := flag.Int64("golden_seed", 0, "seed of winner strategy to run in golden mode")
 	goldenN := flag.Int("golden_print_trades", 10, "how many trades to print in golden mode")
