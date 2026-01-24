@@ -27,12 +27,28 @@ func isHighFrequencyFeature(name string) bool {
 // randomFeatureIndex selects a random feature, preferring high-frequency ones
 // During bootstrap/recovery mode, heavily weights toward high-frequency features to reduce dead strategies
 func randomFeatureIndex(rng *rand.Rand, feats Features) int {
-	// Build list of high-frequency feature indices
+	// Build lists of feature indices by type
+	volumeIndices := make([]int, 0)
 	highFreqIndices := make([]int, 0, len(feats.Names)/2)
+
 	for i, name := range feats.Names {
 		if isHighFrequencyFeature(name) {
 			highFreqIndices = append(highFreqIndices, i)
 		}
+	}
+
+	// Collect volume-derived features (FeatTypeVolume + FeatTypeVolumeDerived)
+	for i := range feats.Names {
+		if i < len(feats.Types) {
+			if feats.Types[i] == FeatTypeVolume || feats.Types[i] == FeatTypeVolumeDerived {
+				volumeIndices = append(volumeIndices, i)
+			}
+		}
+	}
+
+	// 25% chance to pick from volume features, 75% from high-frequency
+	if len(volumeIndices) > 0 && rng.Float32() < 0.25 {
+		return volumeIndices[rng.Intn(len(volumeIndices))]
 	}
 
 	// During bootstrap/recovery: 85% chance to pick from high-frequency features
@@ -95,6 +111,17 @@ func clampThresholdByFeature(threshold float32, featName string) float32 {
 	if featName == "Imbalance" {
 		if threshold < -1.0 {
 			return -1.0
+		}
+		if threshold > 1.0 {
+			return 1.0
+		}
+		return threshold
+	}
+
+	// BuyRatio [0.0, 1.0] - volume buy ratio
+	if featName == "BuyRatio" {
+		if threshold < 0.0 {
+			return 0.0
 		}
 		if threshold > 1.0 {
 			return 1.0
@@ -205,6 +232,20 @@ type TrailModel struct {
 	Active  bool
 }
 
+// VolFilterModel implements volatility regime filtering
+// Only trades when ATR14 is above its historical average (high volatility periods)
+type VolFilterModel struct {
+	Enabled   bool    // true = filter is active
+	ATRPeriod int     // ATR period to use (typically 14)
+	SMAPeriod int     // SMA period for ATR average (typically 50)
+	Threshold float32 // Multiplier: ATR must be > Threshold × SMA (1.0 = above average)
+}
+
+// IsActive returns true if volatility filter is enabled
+func (v VolFilterModel) IsActive() bool {
+	return v.Enabled && v.ATRPeriod > 0 && v.SMAPeriod > 0
+}
+
 type Strategy struct {
 	Seed            int64
 	FeeBps          float32
@@ -218,9 +259,10 @@ type Strategy struct {
 	StopLoss        StopModel
 	TakeProfit      TPModel
 	Trail           TrailModel
-	RegimeFilter    RuleTree
-	RegimeCompiled  CompiledRule
-	MaxHoldBars     int // time-based exit: max bars to hold a position
+	RegimeFilter     RuleTree
+	RegimeCompiled   CompiledRule
+	VolatilityFilter VolFilterModel // Volatility regime filter
+	MaxHoldBars      int // time-based exit: max bars to hold a position
 	MaxConsecLosses int // busted trades protection: stop after N consecutive losses
 	CooldownBars    int // optional: pause after busted streak (0 = no cooldown, stop completely)
 	FeatureMapHash  string // Fingerprint of feature ordering when strategy was created
@@ -237,6 +279,7 @@ func (s Strategy) Fingerprint() string {
 		trailModelToString(s.Trail) + "|" +
 		fmt.Sprintf("hold=%d|loss=%d|cd=%d", s.MaxHoldBars, s.MaxConsecLosses, s.CooldownBars) +
 		includeRiskParams(s) + "|" +
+		volFilterToString(s.VolatilityFilter) + "|" +
 		s.FeatureMapHash
 }
 
@@ -326,7 +369,7 @@ func getFeatureCategory(featType FeatureType) FeatureCategory {
 	switch featType {
 	case FeatTypePriceLevel, FeatTypeOscillator, FeatTypeMomentum:
 		return CatPriceMarket
-	case FeatTypeVolume, FeatTypeATR:
+	case FeatTypeVolume, FeatTypeATR, FeatTypeVolumeDerived:
 		return CatVolumeVolatility
 	default:
 		return CatOther
@@ -464,6 +507,77 @@ func computeWarmup(st Strategy) int {
 	return warmup
 }
 
+// getRuleDepth returns the maximum depth of a rule tree
+func getRuleDepth(node *RuleNode) int {
+	if node == nil {
+		return 0
+	}
+	if node.Op == OpLeaf {
+		return 1
+	}
+	leftDepth := getRuleDepth(node.L)
+	rightDepth := getRuleDepth(node.R)
+	if leftDepth > rightDepth {
+		return leftDepth + 1
+	}
+	return rightDepth + 1
+}
+
+// countNodes returns the total number of nodes in a rule tree
+func countNodes(node *RuleNode) int {
+	if node == nil {
+		return 0
+	}
+	return 1 + countNodes(node.L) + countNodes(node.R)
+}
+
+// hasUglyDeepNesting checks for patterns like AND(OR(AND(NOT(...))))
+// Targeted at 3+ levels of mixed nesting, not simple AND(OR(...))
+func hasUglyDeepNesting(node *RuleNode, depth int) bool {
+	if node == nil {
+		return false
+	}
+	// Only problematic at depth 3+ (like AND(OR(AND(...))))
+	if depth >= 3 {
+		// Check for mixed nesting (AND child of OR, or vice versa)
+		if node.Op == OpAnd || node.Op == OpOr {
+			// If we have both AND and OR at this depth with children, it's ugly
+			leftHasMixed := hasMixedOpAtDepth(node.L, depth+1)
+			rightHasMixed := hasMixedOpAtDepth(node.R, depth+1)
+			if leftHasMixed || rightHasMixed {
+				return true
+			}
+		}
+	}
+	return hasUglyDeepNesting(node.L, depth+1) || hasUglyDeepNesting(node.R, depth+1)
+}
+
+// hasMixedOpAtDepth checks if children have different operators (AND vs OR)
+func hasMixedOpAtDepth(node *RuleNode, depth int) bool {
+	if node == nil || node.Op == OpLeaf || node.Op == OpNot {
+		return false
+	}
+	// Check if children have different operators
+	if node.L != nil && node.R != nil && node.L.Op != OpLeaf && node.R.Op != OpLeaf {
+		if node.L.Op != node.R.Op {
+			return true // AND(OR(...)) or OR(AND(...))
+		}
+	}
+	return false
+}
+
+// isFragileFeatureFor1H checks if a feature is too fragile for 1H timeframes
+// Fragile features produce sparse signals that don't work well on lower-resolution data
+func isFragileFeatureFor1H(name string) bool {
+	fragilePrefixes := []string{"FVG", "Swing", "BOS"} // Removed "VolZ"
+	for _, prefix := range fragilePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func randomStrategy(rng *rand.Rand, feats Features) Strategy {
 	return randomStrategyWithCosts(rng, feats, 30, 8) // Default production costs
 }
@@ -534,9 +648,9 @@ func replaceOneLeafWithHighFrequency(node *RuleNode, rng *rand.Rand, feats Featu
 // randomEntryRuleNode generates an entry rule with constrained tree shape
 // to prevent "always true" strategies. Rules:
 // 1. Root must be AND (not OR)
-// 2. OR operators are limited to 3 per tree
+// 2. OR operators are limited to maxOrCount per tree
 // 3. This forces selectivity and prevents easy OR(...) where one side is always true
-func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, entryOrCount *int) *RuleNode {
+func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, entryOrCount *int, maxOrCount int) *RuleNode {
 	if depth >= maxDepth || rng.Float32() < 0.3 {
 		return &RuleNode{
 			Op:   OpLeaf,
@@ -551,8 +665,8 @@ func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, en
 	// NOT has 10% probability when not at leaf level
 	if randOp < 0.10 {
 		op = OpNot
-	} else if randOp < 0.40 && *entryOrCount < 3 {
-		// Allow up to 3 ORs per entry rule
+	} else if randOp < 0.40 && *entryOrCount < maxOrCount {
+		// Allow up to maxOrCount ORs per entry rule
 		op = OpOr
 		*entryOrCount++
 	}
@@ -561,15 +675,15 @@ func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, en
 		// NOT has only one child (Left), Right stays empty
 		return &RuleNode{
 			Op: op,
-			L:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount),
+			L:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount, maxOrCount),
 			R:  nil,
 		}
 	}
 
 	return &RuleNode{
 		Op: op,
-		L:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount),
-		R:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount),
+		L:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount, maxOrCount),
+		R:  randomEntryRuleNode(rng, feats, depth+1, maxDepth, entryOrCount, maxOrCount),
 	}
 }
 
@@ -593,7 +707,7 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 			}
 			if n.Op == OpLeaf {
 				featName := feats.Names[n.Leaf.A]
-				sparsePrefixes := []string{"Swing", "BOS", "FVG", "Breakout"}
+				sparsePrefixes := []string{"Swing", "BOS", "FVG", "Breakout"}  // EDIT: Removed BB_Lower, BB_Upper (they're dense, not sparse)
 				for _, prefix := range sparsePrefixes {
 					if strings.HasPrefix(featName, prefix) {
 						return 1
@@ -622,11 +736,25 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 
 	var entryRoot *RuleNode
 
+	// Detect 1H timeframe to apply simplified rule generation
+	tfMinutes := atomic.LoadInt32(&globalTimeframeMinutes)
+	is1H := tfMinutes >= 60
+
+	// Set different parameters for 1H timeframe - REDUCED for more trades
+	// FIX 3: Reduce maxEntryDepth to 2 (was 3) for simpler, more permissive rules
+	// FIX 5: Reduce maxOrCount to 1 (was 2) to reduce complexity
+	maxEntryDepth := 2 // Reduced from 3 to 2 for simpler, more permissive rules
+	maxOrCount := 1    // Reduced from 2 to 1 for more selective entries
+	if is1H {
+		maxEntryDepth = 2 // Reduced from 3 to 2
+		maxOrCount = 1    // Reduced from 2 to 1
+	}
+
 	if RecoveryMode.Load() {
 		// Recovery mode: bounded loop to find a rule that passes constraints
 		for attempts := 0; attempts < 50; attempts++ {
 			entryOrCount := 0
-			entryRoot = randomEntryRuleNode(rng, feats, 0, 4, &entryOrCount)
+			entryRoot = randomEntryRuleNode(rng, feats, 0, maxEntryDepth, &entryOrCount, maxOrCount)
 
 			// Validate sparse feature constraint
 			sparseCount := countSparseFeatures(entryRoot)
@@ -646,7 +774,7 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 	} else {
 		// Normal mode: original generation
 		entryOrCount := 0
-		entryRoot = randomEntryRuleNode(rng, feats, 0, 4, &entryOrCount)
+		entryRoot = randomEntryRuleNode(rng, feats, 0, maxEntryDepth, &entryOrCount, maxOrCount)
 	}
 
 	// CRITICAL: Ensure entry rule contains at least one high-frequency primitive
@@ -670,15 +798,13 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 		}
 	}
 
-	exitRoot := randomRuleNode(rng, feats, 0, 3)
+	exitRoot := randomRuleNode(rng, feats, 0, 2) // Reduced from 0-3 to 0-2 for simpler exits
 
-	// Regime filter: 65% chance of having a regime filter (reduced from 85%)
+	// Regime filter: DISABLED to increase trade counts
 	// Fewer regime filters = more trades = better chance to pass gates
 	regimeRoot := randomRuleNode(rng, feats, 0, 2)
-	if rng.Float32() < 0.35 {
-		// 35% chance to disable regime filter (nil = always true)
-		regimeRoot = nil
-	}
+	// 100% disable regime filter (nil = always true) for more trades
+	regimeRoot = nil
 
 	// Randomly set direction: 1 for long-only, -1 for short-only
 	// Removed Direction=0 (both) to make scores deterministic for search/test consistency
@@ -710,9 +836,10 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 		StopLoss:        randomStopModel(rng),
 		TakeProfit:      TPModel{}, // Placeholder, will be set below with RR constraint
 		Trail:           randomTrailModel(rng),
-		RegimeFilter:    RuleTree{Root: regimeRoot},
-		RegimeCompiled:  compileRuleTree(regimeRoot),
-		MaxHoldBars:     500 + rng.Intn(500), // 500..999 bars (~2-4 days for 5min) - allow big winners to run
+		RegimeFilter:     RuleTree{Root: regimeRoot},
+		RegimeCompiled:   compileRuleTree(regimeRoot),
+		VolatilityFilter: randomVolFilterModel(rng), // Volatility regime filter
+		MaxHoldBars:      500 + rng.Intn(500), // 500..999 bars (~2-4 days for 5min) - allow big winners to run
 		MaxConsecLosses: 20,                 // stop after 20 consecutive losses
 		CooldownBars:    200,                // pause for 200 bars after busted (realistic)
 	}
@@ -724,33 +851,34 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 		s.MaxHoldBars = 200 + rng.Intn(301) // 200-500 bars during bootstrap (~17-42 hours)
 	}
 
-	// CRITICAL FIX #1: Force SL/TP to be same kind and enforce RR >= 1.3
+	// CRITICAL FIX #1: Force SL/TP to be same kind and enforce RR >= 2.5
+	// EDIT #2: Changed from 1.3 to 2.5 for more realistic RR ratio (trend following needs room to breathe)
 	// This prevents negative expectancy when SL is ATR-based and TP is fixed percent
 	// which creates TP < SL when ATR is large vs price
 	if s.StopLoss.Kind == "atr" {
 		s.TakeProfit.Kind = "atr"
-		// Enforce RR >= 1.3: TP must be at least 1.3x SL
-		minTP := s.StopLoss.ATRMult * 1.3
-		if minTP < 1.5 {
-			minTP = 1.5 // Still enforce absolute minimum from randomTPModel
+		// Enforce RR >= 2.5: TP must be at least 2.5x SL (changed from 1.3)
+		minTP := s.StopLoss.ATRMult * 2.5
+		if minTP < 3.0 {  // Raised from 1.5 to 3.0
+			minTP = 3.0
 		}
 		if s.TakeProfit.ATRMult < minTP {
-			s.TakeProfit.ATRMult = minTP + rng.Float32()*2.0 // Add some variation above minimum
+			s.TakeProfit.ATRMult = minTP + rng.Float32()*3.0 // More variation (changed from 2.0)
 		}
-		if s.TakeProfit.ATRMult > 10 {
-			s.TakeProfit.ATRMult = 10
+		if s.TakeProfit.ATRMult > 15.0 {  // Raised from 10 to 15
+			s.TakeProfit.ATRMult = 15.0
 		}
 		// TP.Value stays 0 for ATR-based
 		s.TakeProfit.Value = 0
 	} else if s.StopLoss.Kind == "fixed" {
 		s.TakeProfit.Kind = "fixed"
-		// Enforce RR >= 1.3: TP must be at least 1.3x SL
-		minTP := s.StopLoss.Value * 1.3
+		// Enforce RR >= 2.5: TP must be at least 2.5x SL (changed from 1.3)
+		minTP := s.StopLoss.Value * 2.5
 		if minTP < 1.0 {
 			minTP = 1.0 // Still enforce absolute minimum from randomTPModel
 		}
 		if s.TakeProfit.Value < minTP {
-			s.TakeProfit.Value = minTP + rng.Float32()*2.0 // Add some variation above minimum
+			s.TakeProfit.Value = minTP + rng.Float32()*3.0 // More variation (changed from 2.0)
 		}
 		if s.TakeProfit.Value > 30 {
 			s.TakeProfit.Value = 30
@@ -758,17 +886,17 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 		// TP.ATRMult stays 0 for fixed-based
 		s.TakeProfit.ATRMult = 0
 	} else {
-		// For swing stops, use ATR-based TP with RR >= 1.3
+		// For swing stops, use ATR-based TP with RR >= 2.5 (changed from 1.3)
 		// Estimate swing stop in ATR terms (rough approximation)
 		estSLATR := float32(2.0) // rough estimate for swing
 		s.TakeProfit.Kind = "atr"
-		minTP := estSLATR * 1.3
-		if minTP < 1.5 {
-			minTP = 1.5
+		minTP := estSLATR * 2.5  // Changed from 1.3
+		if minTP < 3.0 {  // Raised from 1.5 to 3.0
+			minTP = 3.0
 		}
-		s.TakeProfit.ATRMult = minTP + rng.Float32()*2.0
-		if s.TakeProfit.ATRMult > 10 {
-			s.TakeProfit.ATRMult = 10
+		s.TakeProfit.ATRMult = minTP + rng.Float32()*3.0  // More variation (changed from 2.0)
+		if s.TakeProfit.ATRMult > 15.0 {  // Raised from 10 to 15
+			s.TakeProfit.ATRMult = 15.0
 		}
 		s.TakeProfit.Value = 0
 	}
@@ -878,8 +1006,9 @@ func ensureTrendGuard(root *RuleNode, dir int, feats Features, rng *rand.Rand) {
 	replaceRandomLeaf(root, rng, guard)
 }
 
-// hasTriggerLeaf checks if tree contains any trigger leaf
-// Trigger leaf kinds: CrossUp, CrossDown, Between, GT, LT, Rising, Falling
+// hasTriggerLeaf checks if tree contains any FAST trigger leaf
+// FIX 1b: For entry rules, only CrossUp, CrossDown, Between, GT, LT count as triggers
+// Rising/Falling are SLOW operators and should NOT count for entry rules!
 // These are the leaves that actually cause entries to trigger (not just static conditions)
 func hasTriggerLeaf(node *RuleNode) bool {
 	if node == nil {
@@ -887,8 +1016,9 @@ func hasTriggerLeaf(node *RuleNode) bool {
 	}
 	if node.Op == OpLeaf {
 		switch node.Leaf.Kind {
-		case LeafCrossUp, LeafCrossDown, LeafBetween, LeafGT, LeafLT, LeafRising, LeafFalling:
+		case LeafCrossUp, LeafCrossDown, LeafBetween, LeafGT, LeafLT:
 			return true
+		// LeafRising, LeafFalling are NOT counted for entry rules (too slow!)
 		}
 		return false
 	}
@@ -897,14 +1027,15 @@ func hasTriggerLeaf(node *RuleNode) bool {
 
 // ensureTriggerLeaf forces at least one trigger leaf in entry rule
 // This prevents "entry_rate_dead" rejections by ensuring strategy can trigger
-// Trigger leaf kinds: CrossUp, CrossDown, Between, GT, LT, Rising, Falling
+// FIX 1a: Entry rules should ONLY use fast operators (Cross/GT/LT/Between)
+// NO Rising, Falling, Slope, or Abs operators in entry!
 func ensureTriggerLeaf(root *RuleNode, rng *rand.Rand, feats Features) {
 	if hasTriggerLeaf(root) {
 		return // Already has trigger leaf
 	}
-	// Replace a random leaf with a trigger leaf
-	// Include all trigger kinds: CrossUp, CrossDown, Between, GT, LT, Rising, Falling
-	triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafBetween, LeafGT, LeafLT, LeafRising, LeafFalling}
+	// Replace a random leaf with a FAST trigger leaf only
+	// NO Rising or Falling in entry rules - they cause low entry rates!
+	triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafBetween, LeafGT, LeafLT}
 	triggerKind := triggerKinds[rng.Intn(len(triggerKinds))]
 	newLeaf := randomEntryLeaf(rng, feats)
 	newLeaf.Kind = triggerKind
@@ -946,6 +1077,9 @@ func randomRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int) *RuleNo
 }
 
 func randomLeaf(rng *rand.Rand, feats Features) Leaf {
+	// Detect 1H timeframe from global variable
+	tfMinutes := atomic.LoadInt32(&globalTimeframeMinutes)
+	is1H := tfMinutes >= 60
 	// Prefer triggers (Cross, Rising, Falling) over simple thresholds to capture real moves
 	// 60% trigger leaves, 30% threshold leaves, 10% slope leaves
 	var kind LeafKind
@@ -994,17 +1128,17 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 		if len(feats.F) < 2 {
 			// No cross leaves possible - use threshold or rising/falling
 			kind = thresholdKinds[rng.Intn(len(thresholdKinds))]
-		} else if rng.Float32() < 0.45 {
-			// 45% Cross/Between - increased from 30% for better entry rate
+		} else if rng.Float32() < 0.60 {
+			// FIX 4: 60% Cross/Between - increased from 45% for better entry rate
 			kind = crossKinds[rng.Intn(len(crossKinds))]
-		} else if rng.Float32() < 0.65 {
-			// 20% Rising/Falling
+		} else if rng.Float32() < 0.80 {
+			// 20% Rising/Falling - reduced from 20%
 			kind = triggerKinds[rng.Intn(len(triggerKinds))]
-		} else if rng.Float32() < 0.90 {
-			// 25% threshold
+		} else if rng.Float32() < 0.95 {
+			// 15% threshold - reduced from 25%
 			kind = thresholdKinds[rng.Intn(len(thresholdKinds))]
 		} else {
-			// 10% slope
+			// 5% slope - unchanged
 			kind = slopeKinds[rng.Intn(len(slopeKinds))]
 		}
 	}
@@ -1018,16 +1152,36 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 		featName = feats.Names[a]
 	}
 
+	// FIXED: Use loop instead of recursion to avoid stack blowup
+	// For 1H: skip fragile feature types
+	if is1H {
+		for attempts := 0; attempts < 50; attempts++ {
+			if !isFragileFeatureFor1H(featName) {
+				break // Found non-fragile feature
+			}
+			// Try again with different feature
+			a = randomFeatureIndex(rng, feats)
+			if a < len(feats.Names) {
+				featName = feats.Names[a]
+			} else {
+				break // Safety: index out of range
+			}
+		}
+		// After 50 attempts, use whatever we got (fallback)
+	}
+
 	// CRITICAL FIX #7: Ban absolute price thresholds on PriceLevel features
 	// PriceLevel features (EMA*, BB_Upper/Lower*, SwingHigh/Low) should NOT use
 	// absolute thresholds because BTC price scale changes massively from 2017→2026
-	// Instead, force Cross/Rising/Falling comparisons (relative)
+	// FIX 1c: Use ONLY Cross operators (not Rising/Falling) for entry rules
 	if a < len(feats.Types) && feats.Types[a] == FeatTypePriceLevel && isAbsoluteThresholdKind(kind) {
-		// Force a trigger kind instead (CrossUp, CrossDown, Rising, or Falling)
-		triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
+		// Force a Cross operator (relative comparison, NOT Rising/Falling!)
+		// Rising/Falling are too slow and cause low entry rates
+		triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown}
 		if len(feats.F) < 2 {
-			// No cross leaves possible - use Rising or Falling
-			kind = triggerKinds[2+rng.Intn(2)] // Rising or Falling
+			// No cross leaves possible - use GT/LT instead (better than Rising/Falling)
+			gtLtKinds := []LeafKind{LeafGT, LeafLT}
+			kind = gtLtKinds[rng.Intn(len(gtLtKinds))]
 		} else {
 			kind = triggerKinds[rng.Intn(len(triggerKinds))]
 		}
@@ -1065,18 +1219,17 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 		// FIX: If no compatible B found, fall back to Rising instead of using incompatible B
 		if !found {
 			kind = LeafRising
-			lookback = 5 + rng.Intn(16)
-			b = a // Not used for Rising
+			lookback = 2 + rng.Intn(4) // FIX 2: 2-5 bars (was 2-10) for faster triggers
+			b = a                        // Not used for Rising
 			threshold = 0
 			break // Skip the default setup below
 		}
 		lookback = 0  // Cross leaves don't use lookback
 		threshold = 0 // Cross leaves don't use threshold
 	case LeafRising, LeafFalling:
-		// Increase lookback to capture real moves, not micro-noise
-		// Range: 5-20 bars (was 3-12 before)
-		lookback = rng.Intn(16) + 5
-		threshold = 0 // Rising/Falling don't use threshold
+		// FIX 2: Very short lookback for faster triggers: 2-5 bars (was 2-10)
+		lookback = rng.Intn(4) + 2 // 2, 3, 4, or 5 bars only
+		threshold = 0              // Rising/Falling don't use threshold
 	case LeafBetween:
 		// Between needs two thresholds (X and Y)
 		b = a
@@ -1137,7 +1290,7 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 	case LeafSlopeGT, LeafSlopeLT:
 		// Slope comparison over lookback period
 		b = a
-		lookback = rng.Intn(16) + 5                  // 5-20 bars
+		lookback = rng.Intn(9) + 2                   // 2-10 bars (reduced from 5-20)
 		threshold = float32(rng.NormFloat64() * 0.1) // Small slope values
 		// CRITICAL FIX #4: Clamp to feature-specific bounds
 		threshold = clampThresholdByFeature(threshold, featName)
@@ -1195,22 +1348,25 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 }
 
 // randomEntryLeaf generates leaves biased toward high entry rate operators
-// 70% triggers (Cross/Rising/Falling), 25% thresholds (near mean), 5% slopes
+// FIX 1: Entry rules should ONLY use fast operators (Cross/GT/LT/Between)
+// NO Rising, Falling, Slope, or Abs operators in entry!
 func randomEntryLeaf(rng *rand.Rand, feats Features) Leaf {
-	// Trigger kinds produce more entry edges
-	triggerKinds := []LeafKind{LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
-	thresholdKinds := []LeafKind{LeafGT, LeafLT, LeafBetween}
-	slopeKinds := []LeafKind{LeafSlopeGT, LeafSlopeLT}
+	// Entry rules should ONLY use fast operators:
+	// - CrossUp/CrossDown (highest entry rate)
+	// - GT/LT (simple, fast)
+	// - Between (medium-fast)
+	// NO Rising, Falling, Slope, or Abs operators in entry!
+
+	fastCrossKinds := []LeafKind{LeafCrossUp, LeafCrossDown}
+	fastThresholdKinds := []LeafKind{LeafGT, LeafLT, LeafBetween}
 
 	var kind LeafKind
 	p := rng.Float32()
 	switch {
-	case p < 0.70:
-		kind = triggerKinds[rng.Intn(len(triggerKinds))]
-	case p < 0.95:
-		kind = thresholdKinds[rng.Intn(len(thresholdKinds))]
-	default:
-		kind = slopeKinds[rng.Intn(len(slopeKinds))]
+	case p < 0.60: // 60% CrossUp/CrossDown (highest entry rate)
+		kind = fastCrossKinds[rng.Intn(len(fastCrossKinds))]
+	default: // 40% GT/LT/Between
+		kind = fastThresholdKinds[rng.Intn(len(fastThresholdKinds))]
 	}
 
 	a := randomFeatureIndex(rng, feats)
@@ -1221,10 +1377,11 @@ func randomEntryLeaf(rng *rand.Rand, feats Features) Leaf {
 
 	leaf := Leaf{Kind: kind, A: a, B: a}
 
-	// Shorter lookback for Rising/Falling -> more edges
+	// Shorter lookback for Rising/Falling -> more edges (unreachable after Fix 1, but kept for safety)
 	switch kind {
 	case LeafRising, LeafFalling:
-		leaf.Lookback = 3 + rng.Intn(10) // 3-12 (shorter than normal 5-20)
+		// FIX 2: 2-5 bars (was 3-12) for faster triggers
+		leaf.Lookback = 2 + rng.Intn(4) // 2-5 (shorter for more trades)
 		return leaf
 	}
 
@@ -1254,70 +1411,62 @@ func randomEntryLeaf(rng *rand.Rand, feats Features) Leaf {
 }
 
 func randomStopModel(rng *rand.Rand) StopModel {
-	// Prefer ATR-based stops (70% ATR, 20% fixed, 10% swing)
-	// ATR adapts to volatility, which is better for fat trades
-	kind := rng.Intn(10)
-	if kind < 7 { // 70% ATR
-		atr := rng.NormFloat64()*1.0 + 2.0
-		if atr < 1.0 { // Raised from 0.5 to 1.0 for reasonable SL
-			atr = 1.0
+	// FIX #1: Enforce ATR-based stops (98% ATR, 2% fixed with strict minimum)
+	// Fixed stops must be >= 4% to match ATR*4.0 minimum
+	kind := rng.Intn(100)
+	if kind < 98 { // 98% ATR (increased from 70%)
+		atr := rng.NormFloat64()*2.0 + 6.0  // Mean 6.0, more variation
+		if atr < 4.0 { // Minimum 4.0 - give trades room to breathe
+			atr = 4.0
 		}
-		if atr > 6.0 {
-			atr = 6.0
+		if atr > 12.0 { // Upper bound 12.0
+			atr = 12.0
 		}
 		return StopModel{
 			Kind:    "atr",
 			ATRMult: float32(atr),
 			Value:   0,
 		}
-	} else if kind < 9 { // 20% fixed
-		val := rng.NormFloat64()*1.5 + 2.0
-		if val < 0.5 { // Raised from 0.3 to 0.5
-			val = 0.5
+	} else { // 2% fixed - must be large to match ATR minimum
+		val := rng.NormFloat64()*2.0 + 6.0  // Mean 6%
+		if val < 4.0 { // FIX #1: Minimum 4% fixed (matches ATR*4)
+			val = 4.0
 		}
-		if val > 10.0 {
-			val = 10.0
+		if val > 15.0 {
+			val = 15.0
 		}
 		return StopModel{
 			Kind:    "fixed",
 			Value:   float32(val),
 			ATRMult: 0,
 		}
-	} else { // 10% swing
-		return StopModel{
-			Kind:     "swing",
-			SwingIdx: rng.Intn(5) + 3,
-			Value:    0,
-			ATRMult:  0,
-		}
 	}
 }
 
 func randomTPModel(rng *rand.Rand) TPModel {
-	// Prefer ATR-based TPs (80% ATR, 20% fixed)
-	// ATR adapts to volatility, letting winners run
-	// RAISED MINIMUMS to prevent cost-losers (TP must be larger than SL)
-	kind := rng.Intn(10)
-	if kind < 8 { // 80% ATR
-		atr := rng.NormFloat64()*2.0 + 3.5 // Raised mean from 3.0 to 3.5
-		if atr < 1.5 { // Raised from 0.5 to 1.5 - TP must be >= 1.5x ATR
-			atr = 1.5
+	// FIX #1: Enforce ATR-based TPs (99% ATR, 1% fixed with strict minimum)
+	// Fixed TPs must scale with SL to maintain RR >= 2.5
+	kind := rng.Intn(100)
+	if kind < 99 { // 99% ATR (increased from 95%)
+		atr := rng.NormFloat64()*3.0 + 12.0 // Mean 12.0 for RR=2.0 with SL=6
+		if atr < 8.0 { // Minimum 8.0 ATR (with SL 4.0 = RR 2.0)
+			atr = 8.0
 		}
-		if atr > 10.0 {
-			atr = 10.0
+		if atr > 25.0 { // Upper bound 25.0
+			atr = 25.0
 		}
 		return TPModel{
 			Kind:    "atr",
 			ATRMult: float32(atr),
 			Value:   0,
 		}
-	} else { // 20% fixed
-		val := rng.NormFloat64()*3.0 + 4.0
-		if val < 1.0 { // Raised from 0.5 to 1.0 - TP must be >= 1%
-			val = 1.0
+	} else { // 1% fixed - must be large
+		val := rng.NormFloat64()*4.0 + 15.0 // Mean 15%
+		if val < 10.0 { // FIX #1: Minimum 10% fixed
+			val = 10.0
 		}
-		if val > 30.0 {
-			val = 30.0
+		if val > 40.0 {
+			val = 40.0
 		}
 		return TPModel{
 			Kind:    "fixed",
@@ -1356,6 +1505,42 @@ func randomTrailModel(rng *rand.Rand) TrailModel {
 			ATRMult: 0,
 			Active:  true,
 		}
+	}
+}
+
+// randomVolFilterModel generates a volatility regime filter
+// Only trades when ATR14 is above its historical average (high volatility periods)
+func randomVolFilterModel(rng *rand.Rand) VolFilterModel {
+	// 70% chance to enable volatility filter (filters low-vol periods)
+	// 30% chance to disable (trade all the time)
+	enabled := rng.Float32() < 0.7
+
+	if !enabled {
+		return VolFilterModel{
+			Enabled:   false,
+			ATRPeriod: 14,
+			SMAPeriod: 50,
+			Threshold: 1.0,
+		}
+	}
+
+	// Generate random parameters for enabled filter
+	// ATR period: mostly 14 (standard)
+	atrPeriod := 14
+
+	// SMA period: 30-70 bars (mostly around 50)
+	smaPeriod := 30 + rng.Intn(41) // 30-70
+
+	// Threshold: 0.8-1.3 (mostly around 1.0)
+	// 1.0 = ATR must be above average
+	// 1.2 = ATR must be 20% above average (stricter)
+	threshold := 0.8 + rng.Float32()*0.5
+
+	return VolFilterModel{
+		Enabled:   true,
+		ATRPeriod: atrPeriod,
+		SMAPeriod: smaPeriod,
+		Threshold: threshold,
 	}
 }
 

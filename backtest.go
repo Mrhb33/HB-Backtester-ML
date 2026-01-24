@@ -986,6 +986,42 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		return 0
 	}
 
+	// checkVolatilityFilter returns true if volatility is high enough to trade
+	// ATR14 must be > Threshold × ATR14_SMA50
+	checkVolatilityFilter := func(t int) bool {
+		if !st.VolatilityFilter.IsActive() {
+			return true // Filter disabled, always trade
+		}
+
+		// Get ATR14
+		atrIdx := atr14Idx
+		if !ok14 || atrIdx < 0 || atrIdx >= len(f.F) {
+			return true // Feature not available, allow trade
+		}
+		if t < 0 || t >= len(f.F[atrIdx]) {
+			return true // Out of bounds, allow trade
+		}
+		atr14 := f.F[atrIdx][t]
+
+		// Get ATR14_SMA50
+		smaIdx, okSMA := f.Index["ATR14_SMA50"]
+		if !okSMA || smaIdx < 0 || smaIdx >= len(f.F) {
+			return true // Feature not available, allow trade
+		}
+		if t < 0 || t >= len(f.F[smaIdx]) {
+			return true // Out of bounds, allow trade
+		}
+		atrSMA := f.F[smaIdx][t]
+
+		// Check if ATR14 is above threshold × SMA
+		threshold := st.VolatilityFilter.Threshold
+		if atrSMA <= 0 {
+			return true // Invalid SMA, allow trade
+		}
+
+		return atr14 >= (atrSMA * threshold)
+	}
+
 	// closeTrade is the "never lose track" helper - always resets position and sets cooldown in one place
 	closeTrade := func(exitIdx int, exitPrice float32, reason string, stopBefore, tpBefore float32, triggers logx.ExitTriggerStatus) {
 		if activeTrade == nil {
@@ -1124,6 +1160,7 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		// Declare all variables at the top to avoid goto issues
 		var isActive bool
 		var regimeOk bool
+		var volOk bool
 		var markEquity float32
 		var rawMarkEquity float32
 		var rawDD float32
@@ -1142,12 +1179,13 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 
 			// Check if still in regime and active (nil-safe guards)
 			regimeOk = st.RegimeFilter.Root == nil || (len(st.RegimeCompiled.Code) > 0 && evaluateCompiled(st.RegimeCompiled.Code, f.F, ref))
+			volOk = checkVolatilityFilter(ref)
 			isActive = true
 			if okActive && activeIdx >= 0 && activeIdx < len(f.F) && ref < len(f.F[activeIdx]) {
 				isActive = f.F[activeIdx][ref] > 0
 			}
 
-			if regimeOk && isActive {
+			if regimeOk && isActive && volOk {
 				// Execute entry at open price with slippage
 				entryPrice := openPrice
 				slip := st.SlippageBps / 10000
@@ -1602,13 +1640,14 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		}
 
 		regimeOk = st.RegimeFilter.Root == nil || (st.RegimeCompiled.Code != nil && evaluateCompiled(st.RegimeCompiled.Code, f.F, t))
+		volOk = checkVolatilityFilter(t)
 
 		// IMPORTANT: Check if we're already in a position (critical bug fix)
 		if position.State != Flat {
 			goto END_BAR
 		}
 
-		if !isActive || !regimeOk {
+		if !isActive || !regimeOk || !volOk {
 			goto END_BAR
 		}
 

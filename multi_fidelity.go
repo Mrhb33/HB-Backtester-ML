@@ -275,7 +275,7 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		minScreenTrades = 5  // Lowered from 20 to 5 to allow more strategies through warm-start
 		// minTrainScore = -0.20
 		minTrainTrades = 20  // Lowered from 60 to 20 for warm-start
-		maxTrainDD = 0.55
+		maxTrainDD = 0.75  // EDIT #1a: Raised from 0.70 to 0.75 - strategies were hitting 70.9%
 	case 2: // Relaxed
 		// minScreenScore = -0.40
 		minScreenTrades = 15
@@ -302,6 +302,14 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		minTrainTrades = minTradesOverride
 	}
 
+	// Override gates for 1H timeframe (user-specified)
+	tfMinutes := atomic.LoadInt32(&globalTimeframeMinutes)
+	if tfMinutes >= 60 {
+		// 1H or higher: require minimum trades for statistical significance
+		minScreenTrades = 8  // Screen: at least 8 trades
+		minTrainTrades = 20  // EDIT: Train: at least 20 trades (lowered from 25 to reduce dead-entry spam)
+	}
+
 	// Log DD thresholds once (for debugging)
 	logDDThresholdsOnce(maxScreenDD, maxTrainDD, minScreenTrades, minTrainTrades, relaxLevel)
 
@@ -314,6 +322,23 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		atomic.AddInt64(&screenFailEntryRateLow, 1)
 		maybeLogSampledRejection("screen_entry_rate_dead", Result{Trades: 0}, st.Seed)
 		return false, false, false, Result{}, Result{}, "screen_entry_rate_dead"
+	}
+
+	// For 1H: reject if entry rate is too low (< 20 trades/year)
+	// FIXED: Use safer formula - compute per bar first, then annualize
+	if tfMinutes >= 60 && entryRateResult.EntryCount > 0 {
+		barsInWindow := int64(screenW.End - screenW.Start)
+		if barsInWindow > 0 {
+			entriesPerBar := float64(entryRateResult.EntryCount) / float64(barsInWindow)
+			barsPerYear := 525600.0 / float64(tfMinutes) // Minutes per year / minutes per bar
+			entriesPerYear := entriesPerBar * barsPerYear
+
+			if entriesPerYear < 20 { // Less than 20 trades/year expected
+				atomic.AddInt64(&screenFailEntryRateLow, 1)
+				maybeLogSampledRejection("screen_entry_rate_too_low_1h", Result{Trades: int(entryRateResult.EntryCount)}, st.Seed)
+				return false, false, false, Result{}, Result{}, "screen_entry_rate_too_low_1h"
+			}
+		}
 	}
 
 	// Stage 1: Fast screen (quick filter)

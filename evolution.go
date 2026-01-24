@@ -50,9 +50,9 @@ func (h *HallOfFame) Add(e Elite) {
 		}
 	}
 
-	// If fingerprint is already at cap (2 elites), replace worst if new is better
-	// This allows up to 2 elites per coarse fingerprint family
-	if fpCount >= 2 {
+	// If fingerprint is already at cap (5 elites), replace worst if new is better
+	// EDIT #3: Changed from 2 to 5 - allows more diversity per fingerprint family
+	if fpCount >= 5 {
 		if e.ValScore <= worstScore || worstIndex == -1 {
 			// DEBUG: Log why elite was rejected
 			fmt.Printf("[HOF-REJECT] fpCount=%d newScore=%.4f <= worstScore=%.4f\n",
@@ -191,13 +191,13 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 		if leaf.A < len(feats.Stats) {
 			stats := feats.Stats[leaf.A]
 			if stats.Std > 0 {
-				// Mutate by a fraction of std dev (0.5-2.0 sigma)
-				sigmaChange := float32(rng.NormFloat64()) * stats.Std * (0.5 + rng.Float32()*1.5)
+				// FIX #2: Larger mutations for more diversity (1.0-4.0 sigma, was 0.5-2.0)
+				sigmaChange := float32(rng.NormFloat64()) * stats.Std * (1.0 + rng.Float32()*3.0)
 				leaf.X += sigmaChange
 
-				// Clamp to reasonable range (mean ± 5 std)
-				lower := stats.Mean - 5*stats.Std
-				upper := stats.Mean + 5*stats.Std
+				// Clamp to reasonable range (mean ± 6 std, was 5)
+				lower := stats.Mean - 6*stats.Std
+				upper := stats.Mean + 6*stats.Std
 				if leaf.X < lower {
 					leaf.X = lower
 				}
@@ -206,7 +206,7 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 				}
 			} else {
 				// Fallback for zero-variance features
-				leaf.X += float32(rng.NormFloat64() * 0.1)
+				leaf.X += float32(rng.NormFloat64() * 0.2)  // FIX #2: Increased from 0.1
 			}
 		}
 	case 1: // change feature A
@@ -237,7 +237,7 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 			// FIX: If no compatible B found, fall back to Rising
 			if !found {
 				leaf.Kind = LeafRising
-				leaf.Lookback = 5 + rng.Intn(16)
+				leaf.Lookback = 2 + rng.Intn(9) // Reduced from 5+16 to 2-10 for more trades
 			}
 		}
 	case 2: // change kind
@@ -271,7 +271,7 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 			// FIX: If no compatible B found, fall back to Rising
 			if !found {
 				leaf.Kind = LeafRising
-				leaf.Lookback = 5 + rng.Intn(16)
+				leaf.Lookback = 2 + rng.Intn(9) // Reduced from 5+16 to 2-10 for more trades
 			}
 		}
 	case 3: // tweak lookback (skip for CrossUp/CrossDown)
@@ -549,7 +549,7 @@ func sanitizeCrossOperations(rng *rand.Rand, root *RuleNode, feats Features) int
 				if leaf.A < 0 || leaf.A >= len(feats.Types) || leaf.B < 0 || leaf.B >= len(feats.Types) {
 					// Invalid indices - change to a safe leaf kind (Rising/Falling)
 					leaf.Kind = LeafRising
-					leaf.Lookback = 5 + rng.Intn(10)
+					leaf.Lookback = 2 + rng.Intn(6) // Reduced from 5+10 to 2-7 for more trades
 					fixedCount++
 					return
 				}
@@ -577,7 +577,7 @@ func sanitizeCrossOperations(rng *rand.Rand, root *RuleNode, feats Features) int
 					if !found {
 						// Couldn't find compatible B - change to a safe leaf kind
 						leaf.Kind = LeafRising
-						leaf.Lookback = 5 + rng.Intn(10)
+						leaf.Lookback = 2 + rng.Intn(6) // Reduced from 5+10 to 2-7 for more trades
 					}
 					fixedCount++
 				}
@@ -603,8 +603,8 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	child.ExitRule.Root = cloneRule(parent.ExitRule.Root)
 	child.RegimeFilter.Root = cloneRule(parent.RegimeFilter.Root)
 
-	// mutate 1–3 parts
-	for i := 0; i < 1+rng.Intn(3); i++ {
+	// FIX #2: mutate 2–4 parts (was 1–3) for more diversity
+	for i := 0; i < 2+rng.Intn(3); i++ {
 		switch rng.Intn(6) {
 		case 0:
 			child.EntryRule.Root = mutateRuleTree(rng, child.EntryRule.Root, feats, 4)
@@ -613,25 +613,25 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 		case 2:
 			child.RegimeFilter.Root = mutateRuleTree(rng, child.RegimeFilter.Root, feats, 2)
 		case 3:
-			// SL tweak - prefer looser ATR stops
+			// SL tweak - FIX #2: Larger steps for more diversity
 			if child.StopLoss.Kind == "atr" {
-				child.StopLoss.ATRMult += float32(rng.NormFloat64() * 0.3) // More conservative
-				if child.StopLoss.ATRMult < 1.0 {
-					child.StopLoss.ATRMult = 1.0 // Looser floor (was 0.5)
+				child.StopLoss.ATRMult += float32(rng.NormFloat64() * 1.2)  // FIX #2: Increased from 0.3
+				if child.StopLoss.ATRMult < 4.0 {
+					child.StopLoss.ATRMult = 4.0  // FIX #2: Raised floor to match minimum
 				}
-				if child.StopLoss.ATRMult > 8.0 {
-					child.StopLoss.ATRMult = 8.0
+				if child.StopLoss.ATRMult > 14.0 {  // FIX #2: Raised ceiling
+					child.StopLoss.ATRMult = 14.0
 				}
 			}
 		case 4:
-			// TP tweak - prefer larger ATR TPs to let winners run
+			// TP tweak - FIX #2: Larger steps for more diversity
 			if child.TakeProfit.Kind == "atr" {
-				child.TakeProfit.ATRMult += float32(rng.NormFloat64() * 0.4) // More variation
-				if child.TakeProfit.ATRMult < 1.0 {
-					child.TakeProfit.ATRMult = 1.0 // Looser floor (was 0.5)
+				child.TakeProfit.ATRMult += float32(rng.NormFloat64() * 2.0)  // FIX #2: Increased from 0.4
+				if child.TakeProfit.ATRMult < 8.0 {  // FIX #2: Raised floor
+					child.TakeProfit.ATRMult = 8.0
 				}
-				if child.TakeProfit.ATRMult > 15.0 {
-					child.TakeProfit.ATRMult = 15.0 // Higher ceiling (was 10.0)
+				if child.TakeProfit.ATRMult > 30.0 {  // FIX #2: Raised ceiling
+					child.TakeProfit.ATRMult = 30.0
 				}
 			}
 		case 5:
@@ -747,40 +747,40 @@ func bigMutation(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 		case 2:
 			child.RegimeFilter.Root = mutateRuleTree(rng, child.RegimeFilter.Root, feats, 2)
 		case 3:
-			// Big SL tweak - larger jumps
+			// Big SL tweak - FIX #2: Larger jumps with proper minimums
 			if child.StopLoss.Kind == "atr" {
-				child.StopLoss.ATRMult += float32(rng.NormFloat64() * 2.5) // 8x bigger step (was 1.5)
-				if child.StopLoss.ATRMult < 0.5 {
-					child.StopLoss.ATRMult = 0.5
+				child.StopLoss.ATRMult += float32(rng.NormFloat64() * 3.5)  // FIX #2: Increased from 2.5
+				if child.StopLoss.ATRMult < 4.0 {  // FIX #2: Raised floor to 4.0
+					child.StopLoss.ATRMult = 4.0
 				}
-				if child.StopLoss.ATRMult > 12.0 { // Increased ceiling
-					child.StopLoss.ATRMult = 12.0
+				if child.StopLoss.ATRMult > 14.0 {  // FIX #2: Raised ceiling
+					child.StopLoss.ATRMult = 14.0
 				}
 			} else if child.StopLoss.Kind == "fixed" {
-				child.StopLoss.Value += float32(rng.NormFloat64() * 3.0) // Larger jumps
-				if child.StopLoss.Value < 0.3 {
-					child.StopLoss.Value = 0.3
+				child.StopLoss.Value += float32(rng.NormFloat64() * 4.0)  // FIX #2: Increased from 3.0
+				if child.StopLoss.Value < 4.0 {  // FIX #2: Raised floor to 4.0%
+					child.StopLoss.Value = 4.0
 				}
-				if child.StopLoss.Value > 20.0 { // Increased ceiling
+				if child.StopLoss.Value > 20.0 {
 					child.StopLoss.Value = 20.0
 				}
 			}
 		case 4:
-			// Big TP tweak - larger jumps
+			// Big TP tweak - FIX #2: Larger jumps with proper minimums
 			if child.TakeProfit.Kind == "atr" {
-				child.TakeProfit.ATRMult += float32(rng.NormFloat64() * 3.0) // 7.5x bigger step (was 2.0)
-				if child.TakeProfit.ATRMult < 0.5 {
-					child.TakeProfit.ATRMult = 0.5
+				child.TakeProfit.ATRMult += float32(rng.NormFloat64() * 4.0)  // FIX #2: Increased from 3.0
+				if child.TakeProfit.ATRMult < 8.0 {  // FIX #2: Raised floor to 8.0
+					child.TakeProfit.ATRMult = 8.0
 				}
-				if child.TakeProfit.ATRMult > 25.0 { // Increased ceiling
-					child.TakeProfit.ATRMult = 25.0
+				if child.TakeProfit.ATRMult > 30.0 {  // FIX #2: Raised ceiling
+					child.TakeProfit.ATRMult = 30.0
 				}
 			} else if child.TakeProfit.Kind == "fixed" {
-				child.TakeProfit.Value += float32(rng.NormFloat64() * 7.0) // Larger jumps
-				if child.TakeProfit.Value < 0.5 {
-					child.TakeProfit.Value = 0.5
+				child.TakeProfit.Value += float32(rng.NormFloat64() * 8.0)  // FIX #2: Increased from 7.0
+				if child.TakeProfit.Value < 10.0 {  // FIX #2: Raised floor to 10%
+					child.TakeProfit.Value = 10.0
 				}
-				if child.TakeProfit.Value > 50.0 { // Increased ceiling
+				if child.TakeProfit.Value > 50.0 {
 					child.TakeProfit.Value = 50.0
 				}
 			}

@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,9 @@ var VerifyMode bool = false
 
 // Global debugPF flag - enables throttled PF debug logging
 var DebugPF bool = false
+
+// Global timeframe in minutes (default 5 for 5-minute bars)
+var globalTimeframeMinutes int32 = 5
 
 // Generator loop counters (atomic for thread safety)
 var (
@@ -217,6 +221,29 @@ func clampf(x, lo, hi float32) float32 {
 	return x
 }
 
+// parseTimeframe parses a timeframe string (e.g., "5m", "60m", "1h", "4h") and returns minutes
+// Accepts both "5m"/"15m"/"60m" format and "1h"/"4h" format
+func parseTimeframe(tf string) int32 {
+	// Accept "5m", "15m", "60m" OR "1h", "4h"
+	// Return minutes as int32
+	tf = strings.ToLower(strings.TrimSpace(tf))
+	if strings.HasSuffix(tf, "h") {
+		// Parse "1h", "4h" as hours
+		hoursStr := strings.TrimSuffix(tf, "h")
+		if hours, err := strconv.Atoi(hoursStr); err == nil {
+			return int32(hours * 60)
+		}
+	} else if strings.HasSuffix(tf, "m") {
+		// Parse "5m", "15m", "60m" as minutes
+		minStr := strings.TrimSuffix(tf, "m")
+		if mins, err := strconv.Atoi(minStr); err == nil {
+			return int32(mins)
+		}
+	}
+	// Default to 5 minutes if parsing fails
+	return 5
+}
+
 func main() {
 	fmt.Println("HB Backtest Strategy Search Engine")
 	fmt.Println("====================================")
@@ -257,7 +284,14 @@ func main() {
 	fromTime := flag.String("from", "", "custom start time (YYYY-MM-DD HH:MM:SS)")
 	toTime := flag.String("to", "", "custom end time (YYYY-MM-DD HH:MM:SS)")
 	warmupBars := flag.Int("warmup_bars", 2000, "warmup buffer before custom window")
+	// Data file selection
+	dataFile := flag.String("data", "btc_5min_data.csv", "CSV data file path (e.g., btc_5min_data.csv, btc_data_15m.csv, btc_data_60m.csv)")
+	timeframe := flag.String("timeframe", "5m", "Data timeframe (e.g., 5m, 15m, 60m, 1h, 4h)")
 	flag.Parse()
+
+	// Parse timeframe (e.g., "5m", "15m", "60m" OR "1h", "4h")
+	tfMinutes := parseTimeframe(*timeframe)
+	atomic.StoreInt32(&globalTimeframeMinutes, tfMinutes)
 
 	// Set global verbose flag from command line
 	Verbose = *verbose
@@ -365,22 +399,22 @@ func main() {
 	// Mode dispatch
 	switch *mode {
 	case "trace":
-		runTraceMode(*traceSeed, *traceCSVPath, *traceManual, *traceOpenCSV, *feeBpsFlag, *slipBpsFlag, *traceWindow)
+		runTraceMode(*dataFile, *traceSeed, *traceCSVPath, *traceManual, *traceOpenCSV, *feeBpsFlag, *slipBpsFlag, *traceWindow)
 		return
 	case "golden":
-		runGoldenMode(*goldenSeed, *goldenN, *feeBpsFlag, *slipBpsFlag, *exportCSVPath, *exportStatesPath)
+		runGoldenMode(*dataFile, *goldenSeed, *goldenN, *feeBpsFlag, *slipBpsFlag, *exportCSVPath, *exportStatesPath)
 		return
 	case "test":
-		runTestMode(feeBps, slipBps, *fromIdx, *toIdx, *fromTime, *toTime, *warmupBars)
+		runTestMode(*dataFile, feeBps, slipBps, *fromIdx, *toIdx, *fromTime, *toTime, *warmupBars)
 		return
 	case "validate":
 		RunValidation("btc_5min_data.csv")
 		return
 	case "diagnose":
-		runDiagnosticMode()
+		runDiagnosticMode(*dataFile)
 		return
 	case "verify":
-		runVerifyMode()
+		runVerifyMode(*dataFile)
 		return
 	default: // search mode
 		// Continue to search logic
@@ -435,7 +469,7 @@ func main() {
 	print("Loading data...")
 	startTime := time.Now()
 
-	series, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	series, err := LoadBinanceKlinesCSV(*dataFile)
 	if err != nil {
 		fmt.Printf("Error loading CSV: %v\n", err)
 		return
@@ -946,9 +980,10 @@ func main() {
 					RegimeFilter: RuleTree{
 						Root: parseRuleTree(log.RegimeFilter),
 					},
-					StopLoss:   parseStopModel(log.StopLoss),
-					TakeProfit: parseTPModel(log.TakeProfit),
-					Trail:      parseTrailModel(log.Trail),
+					StopLoss:        parseStopModel(log.StopLoss),
+					TakeProfit:      parseTPModel(log.TakeProfit),
+					Trail:           parseTrailModel(log.Trail),
+					VolatilityFilter: VolFilterModel{Enabled: false}, // Default disabled for old strategies
 				}
 
 				// SANITY CHECK: Validate cross operations when loading from disk
@@ -1172,8 +1207,13 @@ func main() {
 					w.WriteString("\n// FINAL TEST RESULTS (Top %d from HOF)\n" + fmt.Sprint(numToTest))
 					for i, elite := range elitesToTest {
 						testR := evaluateStrategyWindow(series, feats, elite.Strat, testW)
-						print("Test %d/%d: Score=%.4f Return=%.2f%% WinRate=%.1f%% Trades=%d\n",
-							i+1, numToTest, testR.Score, testR.Return*100, testR.WinRate*100, testR.Trades)
+						// Format score: show REJECTED for sentinel values, otherwise 3 decimals
+						scoreStr := "REJECTED"
+						if testR.Score > -1e20 {
+							scoreStr = fmt.Sprintf("%.3f", testR.Score)
+						}
+						print("Test %d/%d: Score=%s Return=%.2f%% WinRate=%.1f%% Trades=%d\n",
+							i+1, numToTest, scoreStr, testR.Return*100, testR.WinRate*100, testR.Trades)
 
 						testLine := ReportLine{
 							Batch:          batchID + 1000 + int64(i), // Use batch ID > 1000 for test results
@@ -2354,7 +2394,7 @@ func main() {
 				immigrantP = 0.40 // Increase to 40% when elites full (more exploration)
 			}
 			if stagnationCount > 3 {
-				immigrantP += 0.15 // Additional boost when stagnating
+				immigrantP += 0.08 // Additional boost when stagnating (reduced from 0.15 to prevent over-exploration)
 			}
 			// Cap at reasonable max
 			if immigrantP > 0.50 {
@@ -2370,15 +2410,15 @@ func main() {
 
 			// ADAPTIVE CROSSOVER: Increase crossover rate as elite pool grows
 			// More elites = more diverse gene pool = higher crossover value
-			// Base 10%, ramp to 15% when elites >= 50
+			// Base 20%, ramp to 25% when elites >= 50 (increased from 10-15% to better utilize elite diversity)
 			elitesCount := hof.Len()
 			crossBonus := float32(0.0)
 			if elitesCount >= 50 {
-				crossBonus = 0.05 // Increase from 10% to 15% crossover
+				crossBonus = 0.05 // Increase from 20% to 25% crossover
 			} else if elitesCount >= 25 {
-				crossBonus = 0.025 // Intermediate step: 12.5% crossover
+				crossBonus = 0.025 // Intermediate step: 22.5% crossover
 			}
-			crossP := heavyMutP + 0.10 + crossBonus // Adaptive: 10-15% crossover
+			crossP := heavyMutP + 0.20 + crossBonus // Adaptive: 20-25% crossover (increased from 0.10)
 			// normal mutation = 1.0 - crossP
 
 			x := rng.Float32()
@@ -2699,14 +2739,14 @@ func main() {
 
 // runDiagnosticMode exports indicator values at specific timestamp for TradingView comparison
 // Phase 1: Data Collection - Export local values at 2025-12-21 11:30:00
-func runDiagnosticMode() {
+func runDiagnosticMode(dataFile string) {
 	fmt.Println("Running in DIAGNOSE mode - exporting indicator values for TradingView comparison")
 	fmt.Println("===============================================================================")
 	fmt.Println()
 
 	// Load data
 	fmt.Println("Loading data...")
-	s, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	s, err := LoadBinanceKlinesCSV(dataFile)
 	if err != nil {
 		fmt.Printf("Error loading data: %v\n", err)
 		return
@@ -3026,14 +3066,14 @@ func runDiagnosticMode() {
 
 // runVerifyMode - Simple verification that indicators are computed from CSV OHLCV data
 // Loads data from btc_5min_data.csv, computes indicators, shows the values
-func runVerifyMode() {
+func runVerifyMode(dataFile string) {
 	fmt.Println("Running in VERIFY mode - Computing indicators from CSV OHLCV data")
 	fmt.Println("==================================================================")
 	fmt.Println()
 
 	// Load data from CSV
-	fmt.Println("Loading data from btc_5min_data.csv...")
-	s, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	fmt.Printf("Loading data from %s...\n", dataFile)
+	s, err := LoadBinanceKlinesCSV(dataFile)
 	if err != nil {
 		fmt.Printf("Error loading data: %v\n", err)
 		return
@@ -3112,7 +3152,7 @@ func runVerifyMode() {
 	fmt.Printf("If these match TradingView at the same timestamp, indicators are CORRECT.\n")
 }
 
-func runTestMode(feeBps, slipBps float32, fromIdx, toIdx int, fromTime, toTime string, warmupBars int) {
+func runTestMode(dataFile string, feeBps, slipBps float32, fromIdx, toIdx int, fromTime, toTime string, warmupBars int) {
 	fmt.Println("Running in TEST mode - evaluating saved winners on test data")
 	fmt.Println("=============================================================")
 	fmt.Printf("Cost overrides: Fee=%.1f bps (%.2f%%), Slippage=%.1f bps (%.2f%%)\n", feeBps, feeBps/100, slipBps, slipBps/100)
@@ -3122,7 +3162,7 @@ func runTestMode(feeBps, slipBps float32, fromIdx, toIdx int, fromTime, toTime s
 	fmt.Println("Loading data...")
 	startTime := time.Now()
 
-	series, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	series, err := LoadBinanceKlinesCSV(dataFile)
 	if err != nil {
 		fmt.Printf("Error loading CSV: %v\n", err)
 		return
@@ -3269,9 +3309,10 @@ func runTestMode(feeBps, slipBps float32, fromIdx, toIdx int, fromTime, toTime s
 				RegimeFilter: RuleTree{
 					Root: parseRuleTree(log.RegimeFilter),
 				},
-				StopLoss:   parseStopModel(log.StopLoss),
-				TakeProfit: parseTPModel(log.TakeProfit),
-				Trail:      parseTrailModel(log.Trail),
+				StopLoss:        parseStopModel(log.StopLoss),
+				TakeProfit:      parseTPModel(log.TakeProfit),
+				Trail:           parseTrailModel(log.Trail),
+				VolatilityFilter: VolFilterModel{Enabled: false}, // Default disabled for old strategies
 			}
 		}()
 
@@ -3407,8 +3448,13 @@ func runTestMode(feeBps, slipBps float32, fromIdx, toIdx int, fromTime, toTime s
 			// Build fingerprint from EliteLog fields directly
 			fp := r.EntryRule + "|" + r.ExitRule + "|" + r.RegimeFilter + "|" + r.StopLoss + "|" + r.TakeProfit + "|" + r.Trail
 			fpShort := shortFingerprint(fp)
-			fmt.Printf("#%2d | TestScore: %.4f | Ret: %6.2f%% | DD: %5.1f%% | Trades: %4d | ValScore: %.4f | FP: %s\n",
-				i+1, r.TestScore, r.TestReturn*100, r.TestMaxDD*100, r.TestTrades, r.ValScore, fpShort)
+			// Format TestScore: show REJECTED for sentinel values
+			testScoreStr := "REJECTED"
+			if r.TestScore > -1e20 {
+				testScoreStr = fmt.Sprintf("%.3f", r.TestScore)
+			}
+			fmt.Printf("#%2d | TestScore: %s | Ret: %6.2f%% | DD: %5.1f%% | Trades: %4d | ValScore: %.3f | FP: %s\n",
+				i+1, testScoreStr, r.TestReturn*100, r.TestMaxDD*100, r.TestTrades, r.ValScore, fpShort)
 		}
 	}
 
@@ -3435,8 +3481,17 @@ func runTestMode(feeBps, slipBps float32, fromIdx, toIdx int, fromTime, toTime s
 			// Build fingerprint from EliteLog fields directly
 			fp := r.EntryRule + "|" + r.ExitRule + "|" + r.RegimeFilter + "|" + r.StopLoss + "|" + r.TakeProfit + "|" + r.Trail
 			fpShort := shortFingerprint(fp)
-			fmt.Printf("#%2d | Test Score: %.4f | Test Return: %6.2f%% | Test WinRate: %5.1f%% | Test Trades: %4d | Test DD: %.2f%% | Val Score: %.4f | FP: %s\n",
-				i+1, r.TestScore, r.TestReturn*100, r.TestWinRate*100, r.TestTrades, r.TestMaxDD*100, r.ValScore, fpShort)
+			// Format TestScore: show REJECTED for sentinel values
+			testScoreStr := "REJECTED"
+			if r.TestScore > -1e20 {
+				testScoreStr = fmt.Sprintf("%.3f", r.TestScore)
+			}
+			valScoreStr := "REJECTED"
+			if r.ValScore > -1e20 {
+				valScoreStr = fmt.Sprintf("%.3f", r.ValScore)
+			}
+			fmt.Printf("#%2d | Test Score: %s | Test Return: %6.2f%% | Test WinRate: %5.1f%% | Test Trades: %4d | Test DD: %.2f%% | Val Score: %s | FP: %s\n",
+				i+1, testScoreStr, r.TestReturn*100, r.TestWinRate*100, r.TestTrades, r.TestMaxDD*100, valScoreStr, fpShort)
 		}
 	}
 
@@ -3519,14 +3574,21 @@ func createStrategyDetailsFile(rank int, log *EliteLog, testScore, testReturn, t
 	// Test Results Summary
 	buf.WriteString("TEST PERFORMANCE METRICS\n")
 	buf.WriteString("-" + strings.Repeat("-", 78) + "\n")
-	buf.WriteString(fmt.Sprintf("  Test Score:      %.4f\n", testScore))
+	// Format scores: show REJECTED for sentinel values
+	formatScore := func(s float32) string {
+		if s < -1e20 {
+			return "REJECTED"
+		}
+		return fmt.Sprintf("%.3f", s)
+	}
+	buf.WriteString(fmt.Sprintf("  Test Score:      %s\n", formatScore(testScore)))
 	buf.WriteString(fmt.Sprintf("  Test Return:     %.2f%%\n", testReturn*100))
 	buf.WriteString(fmt.Sprintf("  Test Win Rate:   %.1f%%\n", testWinRate*100))
 	buf.WriteString(fmt.Sprintf("  Test Trades:     %d\n", testTrades))
 	buf.WriteString(fmt.Sprintf("  Test Max DD:     %.2f%%\n", testMaxDD*100))
-	buf.WriteString(fmt.Sprintf("  Validation Score: %.4f\n", valScore))
+	buf.WriteString(fmt.Sprintf("  Validation Score: %s\n", formatScore(valScore)))
 	buf.WriteString(fmt.Sprintf("  Validation Ret:   %.2f%%\n", valReturn*100))
-	buf.WriteString(fmt.Sprintf("  Train Score:      %.4f\n", trainScore))
+	buf.WriteString(fmt.Sprintf("  Train Score:      %s\n", formatScore(trainScore)))
 	buf.WriteString(fmt.Sprintf("  Train Return:     %.2f%%\n", trainReturn*100))
 	buf.WriteString("\n")
 
@@ -3798,6 +3860,13 @@ func trailModelToString(tm TrailModel) string {
 	default:
 		return tm.Kind
 	}
+}
+
+func volFilterToString(vf VolFilterModel) string {
+	if !vf.Enabled {
+		return "vol_off"
+	}
+	return fmt.Sprintf("vol_ATR%d>SMA%d*%.2f", vf.ATRPeriod, vf.SMAPeriod, vf.Threshold)
 }
 
 func parseRuleTree(s string) *RuleNode {
@@ -4101,7 +4170,7 @@ func loadFirstWinner(path string) (*WinnerRow, error) {
 }
 
 // runGoldenMode runs a single winner strategy with detailed trade logging
-func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64, exportCSV, exportStates string) {
+func runGoldenMode(dataFile string, seed int64, printTrades int, feeBps, slipBps float64, exportCSV, exportStates string) {
 	fmt.Println("Running in GOLDEN mode - single strategy with trade logging")
 	fmt.Println("================================================================")
 	fmt.Printf("Seed: %d, FeeBps: %.1f, SlippageBps: %.1f\n", seed, feeBps, slipBps)
@@ -4109,7 +4178,7 @@ func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64, exportC
 
 	// Load data (same as test mode)
 	fmt.Println("Loading data...")
-	series, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	series, err := LoadBinanceKlinesCSV(dataFile)
 	if err != nil {
 		fmt.Printf("Error loading CSV: %v\n", err)
 		return
@@ -4173,9 +4242,10 @@ func runGoldenMode(seed int64, printTrades int, feeBps, slipBps float64, exportC
 		RegimeFilter: RuleTree{
 			Root: parseRuleTree(w.RegimeFilter),
 		},
-		StopLoss:   parseStopModel(w.StopLoss),
-		TakeProfit: parseTPModel(w.TakeProfit),
-		Trail:      parseTrailModel(w.Trail),
+		StopLoss:        parseStopModel(w.StopLoss),
+		TakeProfit:      parseTPModel(w.TakeProfit),
+		Trail:           parseTrailModel(w.Trail),
+		VolatilityFilter: VolFilterModel{Enabled: false}, // Default disabled for old strategies
 	}
 
 	// SANITY CHECK: Validate cross operations in golden mode
@@ -4754,20 +4824,21 @@ func buildManualEMA20x50(feats Features, feeBps, slipBps float32) Strategy {
 
 	// Fixed SL = 1%, TP = 2%, Trail off
 	st := Strategy{
-		Seed:            0, // Deterministic seed for manual strategy
-		FeeBps:          feeBps,
-		SlippageBps:     slipBps,
-		RiskPct:         0.01,
-		Direction:       1, // Long only
-		EntryRule:       RuleTree{Root: entryRoot},
-		ExitRule:        RuleTree{Root: exitRoot},
-		RegimeFilter:    RuleTree{Root: regimeRoot},
-		StopLoss:        StopModel{Kind: "fixed", Value: 1.0},
-		TakeProfit:      TPModel{Kind: "fixed", Value: 2.0},
-		Trail:           TrailModel{Active: false},
-		MaxHoldBars:     150,
-		MaxConsecLosses: 0,
-		CooldownBars:    0,
+		Seed:             0, // Deterministic seed for manual strategy
+		FeeBps:           feeBps,
+		SlippageBps:      slipBps,
+		RiskPct:          0.01,
+		Direction:        1, // Long only
+		EntryRule:        RuleTree{Root: entryRoot},
+		ExitRule:         RuleTree{Root: exitRoot},
+		RegimeFilter:     RuleTree{Root: regimeRoot},
+		StopLoss:         StopModel{Kind: "fixed", Value: 1.0},
+		TakeProfit:       TPModel{Kind: "fixed", Value: 2.0},
+		Trail:            TrailModel{Active: false},
+		VolatilityFilter: VolFilterModel{Enabled: false}, // Disabled for manual strategies
+		MaxHoldBars:      150,
+		MaxConsecLosses:  0,
+		CooldownBars:     0,
 	}
 
 	// Compile rules
@@ -4952,20 +5023,21 @@ func buildManualVolSMAEMAStrategy(feats Features, feeBps, slipBps float32) Strat
 
 	// Build strategy with original risk parameters
 	st := Strategy{
-		Seed:            6302889439695856639, // Original seed for reference
-		FeeBps:          feeBps,
-		SlippageBps:     slipBps,
-		RiskPct:         0.01,
-		Direction:       1, // Long only
-		EntryRule:       RuleTree{Root: entryRoot},
-		ExitRule:        RuleTree{Root: exitRoot},
-		RegimeFilter:    RuleTree{Root: regimeRoot},
-		StopLoss:        StopModel{Kind: "fixed", Value: 3.75},
-		TakeProfit:      TPModel{Kind: "fixed", Value: 6.09},
-		Trail:           TrailModel{Active: true, ATRMult: 2.50},
-		MaxHoldBars:     150,
-		MaxConsecLosses: 0,
-		CooldownBars:    0,
+		Seed:             6302889439695856639, // Original seed for reference
+		FeeBps:           feeBps,
+		SlippageBps:      slipBps,
+		RiskPct:          0.01,
+		Direction:        1, // Long only
+		EntryRule:        RuleTree{Root: entryRoot},
+		ExitRule:         RuleTree{Root: exitRoot},
+		RegimeFilter:     RuleTree{Root: regimeRoot},
+		StopLoss:         StopModel{Kind: "fixed", Value: 3.75},
+		TakeProfit:       TPModel{Kind: "fixed", Value: 6.09},
+		Trail:            TrailModel{Active: true, ATRMult: 2.50},
+		VolatilityFilter: VolFilterModel{Enabled: false}, // Disabled for manual strategies
+		MaxHoldBars:      150,
+		MaxConsecLosses:  0,
+		CooldownBars:     0,
 	}
 
 	// Debug: Print feature indices being used
@@ -5002,7 +5074,7 @@ func buildManualVolSMAEMAStrategy(feats Features, feeBps, slipBps float32) Strat
 }
 
 // runTraceMode runs a single strategy and outputs per-bar state CSV
-func runTraceMode(seed int64, csvPath, manual string, openCSV bool, feeBps, slipBps float64, traceWindow string) {
+func runTraceMode(dataFile string, seed int64, csvPath, manual string, openCSV bool, feeBps, slipBps float64, traceWindow string) {
 	fmt.Println("Running in TRACE mode - per-bar state output")
 	fmt.Println("============================================")
 	fmt.Printf("Seed: %d, CSV: %s, Manual: %s, FeeBps: %.1f, SlippageBps: %.1f\n", seed, csvPath, manual, feeBps, slipBps)
@@ -5010,7 +5082,7 @@ func runTraceMode(seed int64, csvPath, manual string, openCSV bool, feeBps, slip
 
 	// Load data
 	fmt.Println("Loading data...")
-	series, err := LoadBinanceKlinesCSV("btc_5min_data.csv")
+	series, err := LoadBinanceKlinesCSV(dataFile)
 	if err != nil {
 		fmt.Printf("Error loading CSV: %v\n", err)
 		return
@@ -5103,9 +5175,10 @@ func runTraceMode(seed int64, csvPath, manual string, openCSV bool, feeBps, slip
 			RegimeFilter: RuleTree{
 				Root: parseRuleTree(winnerRow.RegimeFilter),
 			},
-			StopLoss:   parseStopModel(winnerRow.StopLoss),
-			TakeProfit: parseTPModel(winnerRow.TakeProfit),
-			Trail:      parseTrailModel(winnerRow.Trail),
+			StopLoss:        parseStopModel(winnerRow.StopLoss),
+			TakeProfit:      parseTPModel(winnerRow.TakeProfit),
+			Trail:           parseTrailModel(winnerRow.Trail),
+			VolatilityFilter: VolFilterModel{Enabled: false}, // Default disabled for old strategies
 		}
 
 		// SANITY CHECK: Validate cross operations in trace mode

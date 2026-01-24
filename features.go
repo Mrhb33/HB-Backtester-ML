@@ -29,6 +29,7 @@ const (
 	FeatTypeNormalized   // Imbalance, BuyRatio, RangeWidth (0..1-ish)
 	FeatTypeEventFlag    // BOS/FVG/Active style
 	FeatTypeVolume       // OBV, VolPerTrade, VolSMA/EMA (volume units)
+	FeatTypeVolumeDerived // VolZ*, BuyRatio, Imbalance (volume-derived metrics)
 	FeatTypeATR          // ATR*
 	FeatTypeMomentum     // ROC*, MACD*, Hist (centered around 0)
 )
@@ -96,19 +97,21 @@ func getFeatureType(name string) FeatureType {
 	case name == "PlusDI" || name == "MinusDI":
 		return FeatTypeOscillator
 
-	// Z-score features
+	// Volume-derived z-score features
 	case name == "VolZ20" || name == "VolZ50":
-		return FeatTypeZScore
+		return FeatTypeVolumeDerived
 
-	// Normalized bounded features (0..1 ratios)
+	// Normalized bounded features (0..1 ratios) - non-volume
 	case name == "BB_Width20" || name == "BB_Width50":
 		return FeatTypeNormalized
 	case name == "RangeWidth":
 		return FeatTypeNormalized
+
+	// Volume-derived normalized features
 	case name == "Imbalance":
-		return FeatTypeNormalized
+		return FeatTypeVolumeDerived // Volume-based buy/sell imbalance
 	case name == "BuyRatio":
-		return FeatTypeNormalized
+		return FeatTypeVolumeDerived // Volume-based buy ratio
 
 	// Event flag features (binary/discrete)
 	case name == "BOS" || name == "Sweep" || name == "FVGUp" || name == "FVGDown":
@@ -125,7 +128,7 @@ func getFeatureType(name string) FeatureType {
 		return FeatTypeVolume
 
 	// ATR (volatility)
-	case name == "ATR7" || name == "ATR14":
+	case name == "ATR7" || name == "ATR14" || name == "ATR14_SMA50":
 		return FeatTypeATR
 
 	// Momentum / ROC-like features
@@ -309,6 +312,13 @@ func computeAllFeatures(s Series) Features {
 		computeATR(s.High, s.Low, s.Close, arr, p)
 		addFeature(fmt.Sprintf("ATR%d", p), arr)
 	}
+
+	// Add ATR14 SMA for volatility regime filter
+	atr14Idx := f.Index["ATR14"]
+	atr14 := f.F[atr14Idx]
+	atr14SMA50 := make([]float32, n)
+	computeSMA(atr14, atr14SMA50, 50)
+	addFeature("ATR14_SMA50", atr14SMA50)
 
 	adxPeriods := []int{14}
 	for _, p := range adxPeriods {
