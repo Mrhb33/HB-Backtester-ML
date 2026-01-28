@@ -11,6 +11,12 @@ import (
 	"hb_bactest_checker/logx"
 )
 
+const (
+	// InfiniteProfitFactor is the capped value used when profit factor would be infinite
+	// (all wins, no losses). Using 999.0 instead of math.Inf for stability in scoring.
+	InfiniteProfitFactor = 999.0
+)
+
 var pfDebugCount uint64 // package-level counter for throttled PF debug logging
 
 // slippageRef returns the last fully-known bar index at the time of a fill.
@@ -140,6 +146,16 @@ type Result struct {
 	DownsideVol  float32 // Downside volatility for Sortino ratio (negative returns only)
 	ValResult    *Result // Optional validation result from multi-fidelity
 	ExitReasons  map[string]int // Count of trades by exit reason
+
+	// OOS Stats (Walk-Forward Validation)
+	OOSGeoAvgMonthly float64  `json:"oos_geo_avg_monthly,omitempty"` // Geometric average monthly return
+	OOSMedianMonthly float64  `json:"oos_median_monthly,omitempty"`  // Median monthly return
+	OOSMinMonth      float64  `json:"oos_min_month,omitempty"`       // Worst single month return
+	OOSStdMonth      float64  `json:"oos_std_month,omitempty"`       // Std dev of monthly returns
+	OOSMaxDD         float64  `json:"oos_max_dd,omitempty"`          // Max drawdown across all OOS
+	OOSTotalMonths   int     `json:"oos_total_months,omitempty"`    // Total OOS months
+	OOSTotalTrades   int     `json:"oos_total_trades,omitempty"`    // Total OOS trades
+	OOSMonthlyReturns []MonthlyReturnJSON `json:"oos_monthly_returns,omitempty"` // Per-month breakdown
 }
 
 type PositionState int
@@ -258,23 +274,50 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 }
 
 func computeScore(ret, dd, expectancy float32, trades int, testedCount int64) float32 {
+	// PROBLEM C FIX: Comprehensive input validation - check for NaN, Inf, or absurd values
+	invalidScore := false
+	invalidReason := ""
+
+	// Check trades count
+	if trades < 0 {
+		invalidScore = true
+		invalidReason += fmt.Sprintf("trades=%d<0 ", trades)
+	}
+
+	// Check for NaN/Inf in inputs
+	if math.IsNaN(float64(ret)) || math.IsInf(float64(ret), 0) {
+		invalidScore = true
+		invalidReason += fmt.Sprintf("ret=%v ", ret)
+	}
+	if math.IsNaN(float64(dd)) || math.IsInf(float64(dd), 0) {
+		invalidScore = true
+		invalidReason += fmt.Sprintf("dd=%v ", dd)
+	}
+	if math.IsNaN(float64(expectancy)) || math.IsInf(float64(expectancy), 0) {
+		invalidScore = true
+		invalidReason += fmt.Sprintf("exp=%v ", expectancy)
+	}
+
+	// Check for absurd values (indicates calculation error)
+	if math.Abs(float64(ret)) > 1e9 {
+		invalidScore = true
+		invalidReason += fmt.Sprintf("ret=abs(>1e9) ")
+	}
+	if dd < 0 || dd > 1 {
+		invalidScore = true
+		invalidReason += fmt.Sprintf("dd=%v(out_of_0_1) ", dd)
+	}
+
 	// Hard-reject broken strategies
-	// Tightened DD threshold from 0.80 to 0.45 to prevent near-bankruptcy strategies from ever being "good"
-	if trades == 0 || dd >= 0.45 {
+	// PROBLEM B FIX: Raised DD threshold from 0.45 to 0.60 for discovery (safety while allowing more exploration)
+	if trades == 0 || dd >= 0.60 {
 		return -1e30
 	}
 
-	// CRITICAL FIX: Log if inputs are already broken before scoring
-	if math.IsInf(float64(ret), 0) || math.IsNaN(float64(ret)) {
-		fmt.Printf("[SCORE-BUG] ret=Inf/NaN trades=%d dd=%.4f exp=%.4f\n", trades, dd, expectancy)
-		return -1e30
-	}
-	if math.IsInf(float64(dd), 0) || math.IsNaN(float64(dd)) {
-		fmt.Printf("[SCORE-BUG] dd=Inf/NaN trades=%d ret=%.4f exp=%.4f\n", trades, ret, expectancy)
-		return -1e30
-	}
-	if math.IsInf(float64(expectancy), 0) || math.IsNaN(float64(expectancy)) {
-		fmt.Printf("[SCORE-BUG] exp=Inf/NaN trades=%d ret=%.4f dd=%.4f\n", trades, ret, dd)
+	// PROBLEM C FIX: Log invalid score with components
+	if invalidScore {
+		fmt.Printf("[TRAIN_SCORE_INVALID] %s| ret=%.4f dd=%.4f exp=%.4f trades=%d tested=%d\n",
+			invalidReason, ret, dd, expectancy, trades, testedCount)
 		return -1e30
 	}
 
@@ -322,6 +365,20 @@ func computeScore(ret, dd, expectancy float32, trades int, testedCount int64) fl
 
 	baseScore := logReturn + 2.0*calmar + expReward + tradesReward - ddPenalty + tradePenalty + retPenalty + holdPenalty
 
+	// DEBUG: Log score components (once per 1000 evaluations to avoid spam)
+	doLog := false
+	if testedCount > 0 && testedCount%1000 == 1 {
+		doLog = true
+	}
+	if doLog {
+		deflationPenalty := float32(0.0)
+		if testedCount > 0 {
+			deflationPenalty = float32(0.5 * math.Log(1.0 + float64(testedCount)/10000.0))
+		}
+		fmt.Printf("[SCORE_COMPONENTS] logRet=%.3f calmar=%.3f exp=%.3f trdRew=%.3f ddPen=%.3f trdPen=%.3f retPen=%.3f holPen=%.3f def=%.3f => base=%.3f\n",
+			logReturn, calmar*2, expReward, tradesReward, ddPenalty, tradePenalty, retPenalty, holdPenalty, deflationPenalty, baseScore)
+	}
+
 	// DSR-lite: apply deflation penalty as tested count grows
 	// This forces strategies to have higher significance as we test more
 	// Formula: deflated = baseScore - k * log(1 + testedCount / 10000)
@@ -330,6 +387,13 @@ func computeScore(ret, dd, expectancy float32, trades int, testedCount int64) fl
 	if testedCount > 0 && baseScore > -1e29 {
 		deflationPenalty := float32(0.5 * math.Log(1.0 + float64(testedCount)/10000.0))
 		baseScore -= deflationPenalty
+	}
+
+	// PROBLEM C FIX: Final sanity check on computed score
+	if math.IsNaN(float64(baseScore)) || math.IsInf(float64(baseScore), 0) || math.Abs(float64(baseScore)) > 1e9 {
+		fmt.Printf("[TRAIN_SCORE_INVALID] computed_score=%s ret=%.4f dd=%.4f exp=%.4f trades=%d\n",
+			fmt.Sprintf("%v", baseScore), ret, dd, expectancy, trades)
+		return -1e30
 	}
 
 	return baseScore
@@ -351,13 +415,22 @@ func IsValidScore(score float32) bool {
 
 // computeScoreWithSmoothness applies a smoothness penalty to strategies with volatile equity curves
 // and includes Sortino ratio for downside risk focus
+// PROBLEM B FIX: Reduced stability weight by 4x (from 0.5 to 0.125) during discovery
 func computeScoreWithSmoothness(ret, dd, expectancy, smoothVol, downsideVol float32, trades int, testedCount int64) float32 {
 	baseScore := computeScore(ret, dd, expectancy, trades, testedCount)
 
 	// CRITICAL FIX: Don't operate on sentinel values
 	// If computeScore returned -1e30 (hard rejection), return it directly
+	// Use a slightly more lenient check to catch values close to sentinel
 	if baseScore <= -1e29 {
 		return baseScore
+	}
+
+	// CRITICAL: Check if baseScore is already close to sentinel (possible corruption)
+	if math.Abs(float64(baseScore)) > 1e20 {
+		fmt.Printf("[SCORE_WARNING] baseScore too large: %.6e ret=%.4f dd=%.4f trades=%d - clamping to sentinel\n",
+			baseScore, ret, dd, trades)
+		return -1e30
 	}
 
 	// ---- Guardrails to prevent score explosion ----
@@ -378,15 +451,17 @@ func computeScoreWithSmoothness(ret, dd, expectancy, smoothVol, downsideVol floa
 		sortino = -10
 	}
 
-	// Smoothness penalty (keep as-is)
+	// PROBLEM B FIX: Reduced smoothness penalty by 4x (from 0.5 to 0.125) for discovery
+	// This prevents "monthly consistency" from killing profitable strategies
 	smoothPenalty := float32(0)
 	if trades >= 50 {
 		denom := float32(math.Abs(float64(ret))) + 1e-6
 		normalized := smoothVol / denom
-		smoothPenalty = normalized * 0.5
+		smoothPenalty = normalized * 0.125 // Reduced from 0.5 to 0.125 (4x reduction)
 	}
 
-	return baseScore + 0.5*sortino - smoothPenalty
+	// PROBLEM B FIX: Reduced Sortino weight by 4x (from 0.5 to 0.125) for discovery
+	return baseScore + 0.125*sortino - smoothPenalty // Reduced from 0.5 to 0.125
 }
 
 // evaluateStrategyWithTrades runs a backtest and returns detailed trade information
@@ -452,6 +527,13 @@ type coreBacktestResult struct {
 	downsideVol   float32 // Downside volatility for Sortino ratio
 	states        []StateRecord // Per-bar state tracking for debugging
 	signalProofs  map[int][]LeafProof // Proofs for each signal bar (local index)
+	signalCount   int // DEBUG: Count of entry signals generated
+	entryCount    int // DEBUG: Count of entries executed
+	exitCount     int // DEBUG: Count of exits executed
+
+	// MTMEquity curves for accurate monthly returns
+	MTMEquity     []float64  // Risk-adjusted MTM equity (uses st.RiskPct)
+	RawMTMEquity  []float64  // Raw MTM equity (RiskPct=1.0)
 }
 
 // WriteStatesToCSV writes the per-bar state tracking to a CSV file
@@ -885,6 +967,8 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			downsideVol:   0,
 			states:        []StateRecord{},
 			signalProofs:  make(map[int][]LeafProof),
+			MTMEquity:     nil,
+			RawMTMEquity:  nil,
 		}
 	}
 
@@ -906,6 +990,8 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			downsideVol:   0,
 			states:        []StateRecord{},
 			signalProofs:  make(map[int][]LeafProof),
+			MTMEquity:     nil,
+			RawMTMEquity:  nil,
 		}
 	}
 
@@ -916,6 +1002,10 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 	rawPeakEquity := float32(1.0)
 	maxDD := float32(0.0)
 	rawMaxDD := float32(0.0)
+
+	// Initialize MTM equity tracking
+	mtmEquityCurve := make([]float64, 0, endLocal-tradeStartLocal)
+	rawMTMEquityCurve := make([]float64, 0, endLocal-tradeStartLocal)
 
 	trades := []Trade{}
 	exitReasons := make(map[string]int)
@@ -953,6 +1043,11 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 	// Cooldown / bust protection: track consecutive losses and cooldown state
 	consecLosses := 0
 	cooldownUntil := -1
+
+	// DEBUG: Track signals, entries, exits for fold debugging
+	signalCount := 0
+	entryCount := 0
+	exitCount := 0
 
 	// Warmup bars: use the MAX of tradeStartLocal and computed strategy warmup
 	// This ensures we have enough history for all indicators (entry, exit, regime)
@@ -1030,6 +1125,8 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			}
 			return
 		}
+		// DEBUG: Count executed exits
+		exitCount++
 		tr := &trades[activeTrade.tradeIdx]
 		tr.ExitIdx = exitIdx
 		tr.ExitPrice = exitPrice
@@ -1167,6 +1264,24 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		var dd float32
 
 		// ============================================================
+		// STEP 0: Compute mark-to-market equity EARLY (before exit logic)
+		// This ensures markEquity is available for recording even if goto END_BAR is triggered
+		// ============================================================
+		if activeTrade != nil {
+			markPnL := float32(0.0)
+			if activeTrade.dir == 1 {
+				markPnL = (closePrice - activeTrade.entryPrice) / activeTrade.entryPrice
+			} else {
+				markPnL = (activeTrade.entryPrice - closePrice) / activeTrade.entryPrice
+			}
+			markEquity = equity * (1.0 + markPnL*st.RiskPct)
+			rawMarkEquity = rawEquity * (1.0 + markPnL)
+		} else {
+			markEquity = equity
+			rawMarkEquity = rawEquity
+		}
+
+		// ============================================================
 		// STEP A: Execute pending entry first (at bar open)
 		// ============================================================
 		if pending != nil && pending.entryIdx == t {
@@ -1186,6 +1301,9 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			}
 
 			if regimeOk && isActive && volOk {
+				// DEBUG: Count executed entries
+				entryCount++
+
 				// Execute entry at open price with slippage
 				entryPrice := openPrice
 				slip := st.SlippageBps / 10000
@@ -1668,6 +1786,9 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 				// End-of-window guard: don't schedule entry past the end of data
 				statuses = append(statuses, "signal_skipped_end_of_data")
 			} else {
+				// DEBUG: Count confirmed signals (passed all filters)
+				signalCount++
+
 				// Build sub-conditions string for logging
 				subConds := buildSubConditionString(st, f, t)
 
@@ -1735,18 +1856,8 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		// Mark-to-market: compute AFTER all entry/exit logic for consistency
 		// ============================================================
 		if activeTrade != nil {
-			markPnL := float32(0.0)
-			if activeTrade.dir == 1 {
-				markPnL = (closePrice - activeTrade.entryPrice) / activeTrade.entryPrice
-			} else {
-				markPnL = (activeTrade.entryPrice - closePrice) / activeTrade.entryPrice
-			}
-			markEquity = equity * (1.0 + markPnL*st.RiskPct)
-			rawMarkEquity = rawEquity * (1.0 + markPnL)
 			statuses = append(statuses, "holding")
 		} else {
-			markEquity = equity
-			rawMarkEquity = rawEquity
 			statuses = append(statuses, "flat")
 		}
 
@@ -1792,7 +1903,19 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 
 		END_BAR:
 		// Finalize state for this bar - ALWAYS runs, no matter what path we took
+		// Record MTM equity for ALL bars (here at END_BAR so it runs even after goto)
+		// This ensures MTMEquity[i] corresponds to local bar i for proper index alignment
+		mtmEquityCurve = append(mtmEquityCurve, float64(markEquity))
+		rawMTMEquityCurve = append(rawMTMEquityCurve, float64(rawMarkEquity))
 		states = append(states, StateRecord{BarIndex: t, Time: barTime, Statuses: stringJoin(statuses, ",")})
+	}
+
+	// ASSERT: Verify MTM equity length matches expected for early bug detection
+	// Loop starts at t=1, so we expect endLocal-1 entries
+	expectedLen := endLocal - 1
+	if len(mtmEquityCurve) != expectedLen {
+		panic(fmt.Sprintf("MTM equity length mismatch: got %d, expected %d (endLocal=%d)",
+			len(mtmEquityCurve), expectedLen, endLocal))
 	}
 
 	// CRITICAL: Force-close any remaining open positions at end of backtest
@@ -1926,8 +2049,8 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 			// Normal case: both wins and losses
 			profitFactor = totalWinPnL / totalLossPnL
 		} else if totalLossPnL == 0 && totalWinPnL > 0 {
-			// All wins, no losses - PF is effectively infinite, cap at 999
-			profitFactor = 999.0
+			// All wins, no losses - PF is effectively infinite, cap at InfiniteProfitFactor
+			profitFactor = InfiniteProfitFactor
 		} else if totalLossPnL > 0 && totalWinPnL == 0 {
 			// All losses, no wins - PF = 0 (already initialized)
 			profitFactor = 0
@@ -1950,6 +2073,20 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 					totalTrades, wins, losses, totalWinPnL, totalLossPnL, profitFactor, expectancy)
 			}
 		}
+	}
+
+	// PNL VALIDATION: Print detailed breakdown for profit factor calculation (only when DebugPF enabled)
+	// If grossProfit stays 0, your PnL calc is wrong
+	if DebugPF && Verbose && totalTrades > 0 {
+		var avgWin, avgLoss float32
+		if wins > 0 {
+			avgWin = totalWinPnL / float32(wins)
+		}
+		if losses > 0 {
+			avgLoss = totalLossPnL / float32(losses)
+		}
+		fmt.Printf("[PNL-VAL] trades=%d | wins=%d grossWin=%.6f avgWin=%.6f | losses=%d grossLoss=%.6f avgLoss=%.6f | PF=%.2f\n",
+			totalTrades, wins, totalWinPnL, avgWin, losses, totalLossPnL, avgLoss, profitFactor)
 	}
 
 	returnPct := equity - 1.0
@@ -2026,5 +2163,10 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		downsideVol:   downsideVol,
 		states:        states,
 		signalProofs:  signalProofs,
+		signalCount:   signalCount,
+		entryCount:    entryCount,
+		exitCount:     exitCount,
+		MTMEquity:     mtmEquityCurve,
+		RawMTMEquity:  rawMTMEquityCurve,
 	}
 }

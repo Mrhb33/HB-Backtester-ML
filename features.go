@@ -76,9 +76,17 @@ func getFeatureType(name string) FeatureType {
 	// Price-level features (EMA*, BB_Upper/Lower*, SwingHigh/Low)
 	case name == "EMA10" || name == "EMA20" || name == "EMA50" || name == "EMA100" || name == "EMA200":
 		return FeatTypePriceLevel
+	case name == "HMA9" || name == "HMA20" || name == "HMA50" || name == "HMA100" || name == "HMA200":
+		return FeatTypePriceLevel
+	case name == "Kijun26":
+		return FeatTypePriceLevel
 	case name == "BB_Lower20" || name == "BB_Lower50" || name == "BB_Upper20" || name == "BB_Upper50":
 		return FeatTypePriceLevel
 	case name == "SwingHigh" || name == "SwingLow":
+		return FeatTypePriceLevel
+	case name == "HH_20_prev" || name == "HH_50_prev" || name == "HH_100_prev" || name == "HH_200_prev":
+		return FeatTypePriceLevel
+	case name == "LL_20_prev" || name == "LL_50_prev" || name == "LL_100_prev" || name == "LL_200_prev":
 		return FeatTypePriceLevel
 
 	// Price-range features (in dollar units: Body, HighLowDiff)
@@ -106,6 +114,8 @@ func getFeatureType(name string) FeatureType {
 		return FeatTypeNormalized
 	case name == "RangeWidth":
 		return FeatTypeNormalized
+	case name == "BodyPct" || name == "WickUpPct" || name == "WickDownPct" || name == "ClosePos":
+		return FeatTypeNormalized
 
 	// Volume-derived normalized features
 	case name == "Imbalance":
@@ -115,6 +125,10 @@ func getFeatureType(name string) FeatureType {
 
 	// Event flag features (binary/discrete)
 	case name == "BOS" || name == "Sweep" || name == "FVGUp" || name == "FVGDown":
+		return FeatTypeEventFlag
+	case name == "SweepUp_20" || name == "SweepUp_50" || name == "SweepUp_100" || name == "SweepUp_200":
+		return FeatTypeEventFlag
+	case name == "SweepDown_20" || name == "SweepDown_50" || name == "SweepDown_100" || name == "SweepDown_200":
 		return FeatTypeEventFlag
 	case name == "Displacement":
 		return FeatTypeNormalized // it's a 0..1 ratio
@@ -132,13 +146,61 @@ func getFeatureType(name string) FeatureType {
 		return FeatTypeATR
 
 	// Momentum / ROC-like features
-	case name == "ROC10" || name == "ROC20":
+	case name == "ROC5" || name == "ROC10" || name == "ROC20":
 		return FeatTypeMomentum
 	case name == "MACD" || name == "MACD_Signal" || name == "MACD_Hist":
 		return FeatTypeMomentum
 
+	// Extended features (VOLRET, SLOPE)
+	case name == "VOLRET_20":
+		return FeatTypeVolumeDerived // Volatility-of-returns
+	case name == "SLOPE_20":
+		return FeatTypeMomentum // Trend slope
+
 	// Active bars count
 	case name == "Active":
+		return FeatTypeEventFlag
+
+	// ========== PHASE 1: HIGH-IMPACT NEW INDICATORS ==========
+	// Keltner Channels (price level features like BB)
+	case name == "KC_Middle20" || name == "KC_Upper20" || name == "KC_Lower20":
+		return FeatTypePriceLevel
+
+	// Stochastic Oscillator (0-100 bounded like RSI)
+	case name == "StochK_14" || name == "StochD_14" || name == "StochK_5" || name == "StochD_5":
+		return FeatTypeOscillator
+
+	// Donchian Channels (price level features)
+	case name == "Donchian_Upper20" || name == "Donchian_Lower20":
+		return FeatTypePriceLevel
+	case name == "Donchian_Upper55" || name == "Donchian_Lower55":
+		return FeatTypePriceLevel
+
+	// SuperTrend (price level feature)
+	case name == "SuperTrend10":
+		return FeatTypePriceLevel
+	case name == "SuperTrendDir10":
+		return FeatTypeEventFlag // Direction is +1/-1 flag
+
+	// Williams %R (-100 to 0 oscillator)
+	case name == "WilliamsR_14" || name == "WilliamsR_7":
+		return FeatTypeOscillator
+
+	// Force Index (momentum/volume-derived)
+	case name == "ForceIndex2" || name == "ForceIndex13":
+		return FeatTypeMomentum
+
+	// Momentum (rate of return features)
+	case name == "Momentum60" || name == "Momentum240":
+		return FeatTypeMomentum
+
+	// ========== PHASE 2: HIGH-VALUE EVENT FLAGS ==========
+	// BB-KC Squeeze flags
+	case name == "Squeeze20" || name == "SqueezeBreakUp" || name == "SqueezeBreakDown":
+		return FeatTypeEventFlag
+
+	// Stochastic cross signals
+	case name == "StochBullCross" || name == "StochBearCross":
 		return FeatTypeEventFlag
 
 	default:
@@ -150,35 +212,59 @@ func getFeatureType(name string) FeatureType {
 // CRITICAL FIX #5: Only allow crossing within same semantic scale group.
 // This blocks nonsense like: CrossUp(BB_Upper50, MACD_Hist), CrossDown(BB_Width50, SwingHigh)
 func canCrossFeatures(typeA, typeB FeatureType) bool {
-	// SAFETY: Unknown types can never cross (prevents "silent nonsense")
 	if typeA == FeatTypeUnknown || typeB == FeatTypeUnknown {
 		return false
 	}
 
-	// Only allow CrossUp/CrossDown inside the same semantic scale group.
+	// Same type can cross (except EventFlag)
 	if typeA == typeB {
-		// Disallow crossing binary/event flags even if same type
 		if typeA == FeatTypeEventFlag {
 			return false
 		}
 		return true
 	}
 
-	// OPTIONAL: allow ATR to cross price-range features (both are "volatility magnitude")
-	if (typeA == FeatTypeATR && typeB == FeatTypePriceRange) ||
-		(typeB == FeatTypeATR && typeA == FeatTypePriceRange) {
+	// Price family: PriceLevel / PriceRange / ATR
+	priceFamily := []FeatureType{FeatTypePriceLevel, FeatTypePriceRange, FeatTypeATR}
+	if inSlice(priceFamily, typeA) && inSlice(priceFamily, typeB) {
 		return true
 	}
 
-	// Everything else: NO.
-	// This blocks nonsense like:
-	// - PriceLevel vs Momentum (BB_Upper50 vs MACD_Hist)
-	// - PriceRange vs PriceLevel (BB_Width50 vs SwingHigh)
-	// - Oscillator vs PriceLevel, etc.
+	// Oscillator family
+	oscFamily := []FeatureType{FeatTypeOscillator}
+	if inSlice(oscFamily, typeA) && inSlice(oscFamily, typeB) {
+		return true
+	}
+
+	// Volume family
+	volFamily := []FeatureType{FeatTypeVolume, FeatTypeVolumeDerived}
+	if inSlice(volFamily, typeA) && inSlice(volFamily, typeB) {
+		return true
+	}
+
+	// Momentum family
+	momFamily := []FeatureType{FeatTypeMomentum}
+	if inSlice(momFamily, typeA) && inSlice(momFamily, typeB) {
+		return true
+	}
+
 	return false
 }
 
-// validateCrossSanity checks all CrossUp/CrossDown nodes in a rule tree for feature type compatibility
+// inSlice checks if a FeatureType is in a slice
+func inSlice(slice []FeatureType, item FeatureType) bool {
+	for _, v := range slice {
+		if v == item {
+			return true
+		}
+	}
+	return false
+}
+
+// validateCrossSanity checks all CrossUp/CrossDown/BreakUp/BreakDown nodes in a rule tree for:
+// 1. Feature type compatibility (can these feature types be crossed?)
+// 2. FIX B1: Self-comparison (A == B, which is always false)
+// 3. FIX B2: Degenerate leaves (Between with min==max)
 // Returns (isValid, invalidCount) - if invalidCount > 0, the tree has invalid cross operations
 func validateCrossSanity(root *RuleNode, feats Features) (bool, int) {
 	if root == nil {
@@ -196,8 +282,16 @@ func validateCrossSanity(root *RuleNode, feats Features) (bool, int) {
 
 		if node.Op == OpLeaf {
 			leaf := node.Leaf
-			// Check CrossUp and CrossDown leaves
-			if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+
+			// FIX B1: Check for degenerate self-comparison leaves
+			// CrossUp(A,A), BreakDown(A,A), etc. are always false
+			if leaf.IsDegenerate() {
+				invalidCount++
+				return
+			}
+
+			// Check CrossUp, CrossDown, BreakUp, and BreakDown leaves for type compatibility
+			if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown || leaf.Kind == LeafBreakUp || leaf.Kind == LeafBreakDown {
 				// Validate feature indices
 				if leaf.A >= 0 && leaf.A < len(feats.Types) && leaf.B >= 0 && leaf.B < len(feats.Types) {
 					typeA := feats.Types[leaf.A]
@@ -222,7 +316,7 @@ func validateCrossSanity(root *RuleNode, feats Features) (bool, int) {
 	return invalidCount == 0, invalidCount
 }
 
-// validateLoadedStrategy checks all CrossUp/CrossDown operations in a complete strategy
+// validateLoadedStrategy checks all CrossUp/CrossDown/BreakUp/BreakDown operations in a complete strategy
 // Returns error if any invalid cross operations are found
 // Use this when loading strategies from disk/checkpoint to reject invalid ones
 func validateLoadedStrategy(s Strategy, feats *Features) error {
@@ -243,7 +337,7 @@ func validateLoadedStrategy(s Strategy, feats *Features) error {
 	}
 
 	if totalInvalid > 0 {
-		return fmt.Errorf("strategy has %d invalid CrossUp/CrossDown operations", totalInvalid)
+		return fmt.Errorf("strategy has %d invalid CrossUp/CrossDown/BreakUp/BreakDown operations", totalInvalid)
 	}
 	return nil
 }
@@ -270,6 +364,19 @@ func computeAllFeatures(s Series) Features {
 		computeEMA(s.Close, arr, p)
 		addFeature(fmt.Sprintf("EMA%d", p), arr)
 	}
+
+	// HMA - Hull Moving Average
+	hmaPeriods := []int{9, 20, 50, 100, 200}
+	for _, p := range hmaPeriods {
+		arr := make([]float32, n)
+		computeHMA(s.Close, arr, p)
+		addFeature(fmt.Sprintf("HMA%d", p), arr)
+	}
+
+	// Ichimoku Kijun-sen (Base Line)
+	kijun := make([]float32, n)
+	computeIchimokuKijun(s.High, s.Low, kijun, 26)
+	addFeature("Kijun26", kijun)
 
 	rsiPeriods := []int{7, 14, 21}
 	for _, p := range rsiPeriods {
@@ -363,9 +470,9 @@ func computeAllFeatures(s Series) Features {
 		if s.Trades[i] > 0 {
 			volPerTrade[i] = s.Volume[i] / float32(s.Trades[i])
 		}
-		// FIX: Active = 1 when volume >= 20% of average (detects real spikes)
+		// FIX: Active = 1 when volume >= 10% of average (more permissive threshold)
 		// Guard: i >= 19 for warmup, volSMA20[i] > 0 to avoid early bars
-		if i >= 19 && volSMA20[i] > 0 && s.Volume[i] >= volSMA20[i]*0.2 {
+		if i >= 19 && volSMA20[i] > 0 && s.Volume[i] >= volSMA20[i]*0.1 {
 			active[i] = 1
 		}
 	}
@@ -388,6 +495,65 @@ func computeAllFeatures(s Series) Features {
 	addFeature("HighLowDiff", highLowDiff)
 	addFeature("Body", body)
 	addFeature("RangeWidth", rangeWidth)
+
+	// ========== CANDLE ANATOMY FEATURES (normalized 0-1) ==========
+	// Pure price action without indicators - body/wick/position ratios
+	bodyPct := make([]float32, n)
+	wickUpPct := make([]float32, n)
+	wickDownPct := make([]float32, n)
+	closePos := make([]float32, n)
+
+	const epsCandle = 1e-9
+
+	for i := 0; i < n; i++ {
+		range_val := s.High[i] - s.Low[i]
+		maxRange := range_val
+		if maxRange < epsCandle {
+			maxRange = epsCandle
+		}
+
+		openVal := s.Open[i]
+		closeVal := s.Close[i]
+		highVal := s.High[i]
+		lowVal := s.Low[i]
+
+		// BodyPct = |Close - Open| / Range (0..1)
+		bodyPct[i] = float32(math.Abs(float64(closeVal - openVal))) / maxRange
+
+		// WickUpPct = (High - max(Open,Close)) / Range (clamp >= 0)
+		upperWick := highVal - openVal
+		if closeVal > openVal {
+			upperWick = highVal - closeVal
+		}
+		if upperWick < 0 {
+			upperWick = 0
+		}
+		wickUpPct[i] = upperWick / maxRange
+
+		// WickDownPct = (min(Open,Close) - Low) / Range (clamp >= 0)
+		lowerWick := openVal - lowVal
+		if closeVal < openVal {
+			lowerWick = closeVal - lowVal
+		}
+		if lowerWick < 0 {
+			lowerWick = 0
+		}
+		wickDownPct[i] = lowerWick / maxRange
+
+		// ClosePos = (Close - Low) / Range (clamp 0..1)
+		closePos[i] = (closeVal - lowVal) / maxRange
+		if closePos[i] < 0 {
+			closePos[i] = 0
+		}
+		if closePos[i] > 1 {
+			closePos[i] = 1
+		}
+	}
+
+	addFeature("BodyPct", bodyPct)
+	addFeature("WickUpPct", wickUpPct)
+	addFeature("WickDownPct", wickDownPct)
+	addFeature("ClosePos", closePos)
 
 	swingHigh := make([]float32, n)
 	swingLow := make([]float32, n)
@@ -478,6 +644,68 @@ func computeAllFeatures(s Series) Features {
 	addFeature("Displacement", displacement)
 	addFeature("FVGUp", fvgUp)
 	addFeature("FVGDown", fvgDown)
+
+	// ========== MARKET STRUCTURE LEVELS (HH/LL) ==========
+	// Rolling max/min price levels (NO lookahead - exclude current candle)
+	hhLookbacks := []int{20, 50, 100, 200}
+	for _, lookback := range hhLookbacks {
+		hh := make([]float32, n)
+		ll := make([]float32, n)
+
+		for i := 0; i < n; i++ {
+			if i >= lookback {
+				// Window is [i-lookback ... i-1] - EXCLUDE current candle i
+				maxH := s.High[i-lookback]
+				minL := s.Low[i-lookback]
+				for j := i - lookback + 1; j < i; j++ {
+					if s.High[j] > maxH {
+						maxH = s.High[j]
+					}
+					if s.Low[j] < minL {
+						minL = s.Low[j]
+					}
+				}
+				hh[i] = maxH
+				ll[i] = minL
+			}
+			// For i < lookback, hh[i] and ll[i] remain 0 (warmup period)
+		}
+
+		addFeature(fmt.Sprintf("HH_%d_prev", lookback), hh)
+		addFeature(fmt.Sprintf("LL_%d_prev", lookback), ll)
+	}
+
+	// ========== LIQUIDITY SWEEP FLAGS ==========
+	// Liquidity sweep detection (false breakouts) - EventFlag features (0/1)
+	sweepLookbacks := []int{20, 50, 100, 200}
+	for _, lookback := range sweepLookbacks {
+		sweepUp := make([]float32, n)
+		sweepDown := make([]float32, n)
+
+		// Fetch HH/LL indices and slices ONCE per lookback (not per iteration)
+		hhName := fmt.Sprintf("HH_%d_prev", lookback)
+		llName := fmt.Sprintf("LL_%d_prev", lookback)
+		hhIdx := f.Index[hhName]
+		llIdx := f.Index[llName]
+		hh := f.F[hhIdx]
+		ll := f.F[llIdx]
+
+		// Loop with i++ (CRITICAL: was missing in original plan)
+		for i := 1; i < n; i++ {
+			// SweepUp: High > HH_prev && Close < HH_prev (bullish trap)
+			if hh[i] > 0 && s.High[i] > hh[i] && s.Close[i] < hh[i] {
+				sweepUp[i] = 1
+			}
+
+			// SweepDown: Low < LL_prev && Close > LL_prev (bearish trap)
+			if ll[i] > 0 && s.Low[i] < ll[i] && s.Close[i] > ll[i] {
+				sweepDown[i] = 1
+			}
+		}
+
+		addFeature(fmt.Sprintf("SweepUp_%d", lookback), sweepUp)
+		addFeature(fmt.Sprintf("SweepDown_%d", lookback), sweepDown)
+	}
 
 	// Compute statistics for scale-aware mutations (will be recomputed on train window in main)
 	f.Stats = make([]FeatureStats, len(f.F))
@@ -580,6 +808,63 @@ func computeEMA(src, dst []float32, period int) {
 	multiplier := float32(2.0 / float32(period+1))
 	for i := period; i < len(src); i++ {
 		dst[i] = (src[i]-dst[i-1])*multiplier + dst[i-1]
+	}
+}
+
+func computeWMA(src, dst []float32, period int) {
+	if len(src) < period {
+		return
+	}
+	for i := period - 1; i < len(src); i++ {
+		sum := float32(0)
+		weight := float32(1)
+		for j := i; j >= i-period+1; j-- {
+			sum += src[j] * weight
+			weight++
+		}
+		dst[i] = sum / (float32(period) * float32(period+1) / 2)
+	}
+}
+
+func computeHMA(src, dst []float32, period int) {
+	n := len(src)
+	if n < period {
+		return
+	}
+
+	halfPeriod := period / 2
+	sqrtPeriod := int(math.Sqrt(float64(period)))
+
+	wmaHalf := make([]float32, n)
+	wmaFull := make([]float32, n)
+	temp := make([]float32, n)
+
+	computeWMA(src, wmaHalf, halfPeriod)
+	computeWMA(src, wmaFull, period)
+
+	for i := 0; i < n; i++ {
+		temp[i] = 2*wmaHalf[i] - wmaFull[i]
+	}
+
+	computeWMA(temp, dst, sqrtPeriod)
+}
+
+func computeIchimokuKijun(high, low, dst []float32, period int) {
+	if len(high) < period {
+		return
+	}
+	for i := period - 1; i < len(high); i++ {
+		highestHigh := high[i]
+		lowestLow := low[i]
+		for j := i - period + 1; j <= i; j++ {
+			if high[j] > highestHigh {
+				highestHigh = high[j]
+			}
+			if low[j] < lowestLow {
+				lowestLow = low[j]
+			}
+		}
+		dst[i] = (highestHigh + lowestLow) / 2
 	}
 }
 

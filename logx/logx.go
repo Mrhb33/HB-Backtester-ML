@@ -143,7 +143,11 @@ func Checkmark(passed bool) string {
 
 // ScoreColor returns color-coded score based on value
 // Positive scores are green, negative are red
+// Sentinel values (-1e30) are displayed as "REJECTED"
 func ScoreColor(score float32) string {
+	if score < -1e20 {
+		return Error("REJECTED")
+	}
 	if score > 0 {
 		return Success(fmt.Sprintf("%.4f", score))
 	}
@@ -198,4 +202,40 @@ func FormatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh%dm", hours, minutes)
 	}
 	return fmt.Sprintf("%dh", hours)
+}
+
+// Icon returns a colored icon for quick visual scanning
+// Common status icons: success, error, warn, info, elite, progress, reject, gen
+func Icon(status string) string {
+	icons := map[string]string{
+		"success":  "✅",
+		"error":    "❌",
+		"warn":     "⚠️ ",
+		"info":     "ℹ️ ",
+		"elite":    "👑",
+		"progress": "📊",
+		"reject":   "🚫",
+		"gen":      "🧬",
+	}
+	icon, ok := icons[status]
+	if !ok {
+		return "  "
+	}
+	// Add color based on status type
+	switch status {
+	case "success", "elite":
+		return C(green, icon)
+	case "error", "reject":
+		return C(red, icon)
+	case "warn":
+		return C(yellow, icon)
+	case "info":
+		return C(cyan, icon)
+	case "progress":
+		return C(blue, icon)
+	case "gen":
+		return C(magenta, icon)
+	default:
+		return icon
+	}
 }

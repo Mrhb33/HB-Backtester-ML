@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"hb_bactest_checker/logx"
@@ -46,8 +48,7 @@ func LoadBinanceKlinesCSV(path string) (Series, error) {
 	}
 
 	var s Series
-	var nextCloseTime int64 // For 6-column format, derive close_time from next row's timestamp
-	csvRowIndex := 0        // Track actual CSV row number (1-based, after header)
+	csvRowIndex := 0 // Track actual CSV row number (1-based, after header)
 
 	for {
 		rec, err := r.Read()
@@ -77,16 +78,9 @@ func LoadBinanceKlinesCSV(path string) (Series, error) {
 
 		var closeT time.Time
 		if isSimpleFormat {
-			// For 6-column format, close_time is derived from next row's open_time
-			// Store current open_time as the next row's potential close_time
-			if nextCloseTime > 0 {
-				closeT = time.UnixMilli(nextCloseTime)
-			} else {
-				// First row - approximate close_time as open_time + 5 minutes
-				// This will be corrected if we detect the actual interval later
-				closeT = openT.Add(5 * time.Minute)
-			}
-			nextCloseTime = openT.UnixMilli()
+			// For 6-column format, use temporary close time
+			// Will be recalculated correctly after loading based on detected interval
+			closeT = openT.Add(60 * time.Minute) // Placeholder
 		} else {
 			// For 11-column format, close_time is in column 6
 			closeT, err = time.Parse(timeLayout, rec[6])
@@ -186,15 +180,162 @@ func LoadBinanceKlinesCSV(path string) (Series, error) {
 		s.CSVRowIndex = append(s.CSVRowIndex, csvRowIndex)
 	}
 
-	// Fix last row's close_time for 6-column format
-	if len(s.CloseTimeMs) > 0 && s.CloseTimeMs[len(s.CloseTimeMs)-1] == s.OpenTimeMs[len(s.OpenTimeMs)-1] {
-		// Use the same interval as the previous row
-		if len(s.CloseTimeMs) >= 2 {
-			interval := s.CloseTimeMs[len(s.CloseTimeMs)-2] - s.OpenTimeMs[len(s.OpenTimeMs)-2]
-			s.CloseTimeMs[len(s.CloseTimeMs)-1] = s.OpenTimeMs[len(s.OpenTimeMs)-1] + interval
+	// === FIX CLOSE TIMES FOR 6-COLUMN FORMAT ===
+	// Detect the median interval from open times and recalculate close times
+	if len(s.OpenTimeMs) > 1 {
+		// Collect intervals between consecutive open times
+		intervals := make([]int64, 0, len(s.OpenTimeMs)-1)
+		for i := 1; i < len(s.OpenTimeMs); i++ {
+			delta := s.OpenTimeMs[i] - s.OpenTimeMs[i-1]
+			if delta > 0 {
+				intervals = append(intervals, delta)
+			}
+		}
+
+		if len(intervals) > 0 {
+			// Use median interval to avoid outliers
+			sort.Slice(intervals, func(i, j int) bool { return intervals[i] < intervals[j] })
+			medianInterval := intervals[len(intervals)/2]
+
+			// Recalculate all CloseTimeMs as open_time + median_interval
+			for i := 0; i < len(s.CloseTimeMs); i++ {
+				s.CloseTimeMs[i] = s.OpenTimeMs[i] + medianInterval
+			}
+
+			// Log detected interval
+			intervalMinutes := medianInterval / (60 * 1000)
+			fmt.Printf("[DATA] Detected %d-minute bar interval from %d samples\n", intervalMinutes, len(intervals))
+
+			// FIX PROBLEM B: Update globalTimeframeMinutes from detected interval
+			// This ensures trades/year calculations use the correct timeframe
+			atomic.StoreInt32(&globalTimeframeMinutes, int32(intervalMinutes))
+			fmt.Printf("[DATA] Updated global timeframe to %dm (was using command-line flag)\n", intervalMinutes)
+		}
+	}
+	// ==========================================
+
+	s.T = len(s.Close)
+
+	// === TIMESTAMP ORDERING FIX ===
+	// Step 1: Reverse if fully descending (newest first common case)
+	if len(s.CloseTimeMs) > 1 && s.CloseTimeMs[0] > s.CloseTimeMs[len(s.CloseTimeMs)-1] {
+		reverseInt64(s.OpenTimeMs)
+		reverseInt64(s.CloseTimeMs)
+		reverseFloat32(s.Open)
+		reverseFloat32(s.High)
+		reverseFloat32(s.Low)
+		reverseFloat32(s.Close)
+		reverseFloat32(s.Volume)
+		reverseFloat32(s.QuoteVolume)
+		reverseFloat32(s.TakerBuyBase)
+		reverseFloat32(s.TakerBuyQuote)
+		reverseInt32(s.Trades)
+		reverseInt(s.CSVRowIndex)
+		fmt.Printf("[DATA] Reversed %d bars - timestamps were descending\n", len(s.CloseTimeMs))
+	}
+
+	// Step 2: Remove duplicates (keep LAST occurrence for same CloseTimeMs)
+	s = deduplicateByCloseTime(s)
+
+	// Step 3: Final validation - fail with detailed error if still invalid
+	// Uses validateTimestampOrderingDetailed() defined in walkforward.go
+	valid, badIdx, prevTs, curTs := validateTimestampOrderingDetailed(s)
+	if !valid {
+		csvRow := "unknown"
+		if badIdx >= 0 && badIdx < len(s.CSVRowIndex) {
+			csvRow = fmt.Sprintf("%d", s.CSVRowIndex[badIdx])
+		}
+		return Series{}, fmt.Errorf("timestamp ordering failed at index %d (CSV row %s): %d < %d - data has corrupted/out-of-order blocks",
+			badIdx, csvRow, curTs, prevTs)
+	}
+
+	// Step 2A: Verify timestamps are in milliseconds (not seconds)
+	const minMillisecondTs = 1000000000000 // Sep 2001 in milliseconds
+	if len(s.CloseTimeMs) > 0 && s.CloseTimeMs[0] < minMillisecondTs {
+		firstDate := time.UnixMilli(s.CloseTimeMs[0]).UTC().Format("2006-01-02")
+		lastDate := time.UnixMilli(s.CloseTimeMs[len(s.CloseTimeMs)-1]).UTC().Format("2006-01-02")
+		panic(fmt.Sprintf("CloseTimeMs looks like seconds, not milliseconds. First TS=%d (%s), Last TS=%d (%s). Convert to ms in CSV loader.",
+			s.CloseTimeMs[0], firstDate, s.CloseTimeMs[len(s.CloseTimeMs)-1], lastDate))
+	}
+	// ============================
+
+	return s, nil
+}
+
+func reverseInt64(slice []int64) {
+	for i, j := 0, len(slice)-1; i < j; i, j = i+1, j-1 {
+		slice[i], slice[j] = slice[j], slice[i]
+	}
+}
+
+func reverseFloat32(slice []float32) {
+	for i, j := 0, len(slice)-1; i < j; i, j = i+1, j-1 {
+		slice[i], slice[j] = slice[j], slice[i]
+	}
+}
+
+func reverseInt32(slice []int32) {
+	for i, j := 0, len(slice)-1; i < j; i, j = i+1, j-1 {
+		slice[i], slice[j] = slice[j], slice[i]
+	}
+}
+
+func reverseInt(slice []int) {
+	for i, j := 0, len(slice)-1; i < j; i, j = i+1, j-1 {
+		slice[i], slice[j] = slice[j], slice[i]
+	}
+}
+
+// deduplicateByCloseTime removes duplicate rows with same CloseTimeMs (keeps LAST)
+func deduplicateByCloseTime(s Series) Series {
+	if len(s.CloseTimeMs) <= 1 {
+		return s
+	}
+
+	// First pass: find last occurrence index for each timestamp
+	lastSeen := make(map[int64]int)
+	for i := 0; i < len(s.CloseTimeMs); i++ {
+		lastSeen[s.CloseTimeMs[i]] = i
+	}
+
+	// Second pass: keep row only if it's the last occurrence
+	filtered := Series{
+		OpenTimeMs:    make([]int64, 0, len(lastSeen)),
+		CloseTimeMs:   make([]int64, 0, len(lastSeen)),
+		Open:          make([]float32, 0, len(lastSeen)),
+		High:          make([]float32, 0, len(lastSeen)),
+		Low:           make([]float32, 0, len(lastSeen)),
+		Close:         make([]float32, 0, len(lastSeen)),
+		Volume:        make([]float32, 0, len(lastSeen)),
+		QuoteVolume:   make([]float32, 0, len(lastSeen)),
+		TakerBuyBase:  make([]float32, 0, len(lastSeen)),
+		TakerBuyQuote: make([]float32, 0, len(lastSeen)),
+		Trades:        make([]int32, 0, len(lastSeen)),
+		CSVRowIndex:   make([]int, 0, len(lastSeen)),
+	}
+
+	for i := 0; i < len(s.CloseTimeMs); i++ {
+		ts := s.CloseTimeMs[i]
+		if lastSeen[ts] == i {
+			filtered.OpenTimeMs = append(filtered.OpenTimeMs, s.OpenTimeMs[i])
+			filtered.CloseTimeMs = append(filtered.CloseTimeMs, s.CloseTimeMs[i])
+			filtered.Open = append(filtered.Open, s.Open[i])
+			filtered.High = append(filtered.High, s.High[i])
+			filtered.Low = append(filtered.Low, s.Low[i])
+			filtered.Close = append(filtered.Close, s.Close[i])
+			filtered.Volume = append(filtered.Volume, s.Volume[i])
+			filtered.QuoteVolume = append(filtered.QuoteVolume, s.QuoteVolume[i])
+			filtered.TakerBuyBase = append(filtered.TakerBuyBase, s.TakerBuyBase[i])
+			filtered.TakerBuyQuote = append(filtered.TakerBuyQuote, s.TakerBuyQuote[i])
+			filtered.Trades = append(filtered.Trades, s.Trades[i])
+			filtered.CSVRowIndex = append(filtered.CSVRowIndex, s.CSVRowIndex[i])
 		}
 	}
 
-	s.T = len(s.Close)
-	return s, nil
+	filtered.T = len(filtered.CloseTimeMs)
+	removed := len(s.CloseTimeMs) - len(filtered.CloseTimeMs)
+	if removed > 0 {
+		fmt.Printf("[DATA] Removed %d duplicate timestamp rows (kept last occurrence)\n", removed)
+	}
+	return filtered
 }

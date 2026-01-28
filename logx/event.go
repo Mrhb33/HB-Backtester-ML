@@ -8,6 +8,22 @@ import (
 
 const eventSep = "═══════════════════════════════════════════════════════════════════"
 
+// verboseEventMode controls whether event blocks use verbose (true) or compact (false) format
+// Use SetEventVerboseMode(true) for debugging, SetEventVerboseMode(false) for monitoring
+var verboseEventMode = false
+
+// SetEventVerboseMode sets the verbosity mode for event logging
+// true = verbose multi-line blocks (for debugging)
+// false = compact single-line format (for monitoring)
+func SetEventVerboseMode(verbose bool) {
+	verboseEventMode = verbose
+}
+
+// IsEventVerbose returns the current event verbosity mode
+func IsEventVerbose() bool {
+	return verboseEventMode
+}
+
 // LogSignalBlock - signal detected event block at bar close (t)
 // bar: true bar index (absolute position in full dataset)
 // ts: timestamp of the signal bar
@@ -18,21 +34,42 @@ const eventSep = "════════════════════�
 func LogSignalBlock(bar int, ts time.Time, closePrice float64,
 	regimeResult, entryResult bool, subConditions string,
 ) {
-	subCondLine := ""
-	if subConditions != "" {
-		subCondLine = fmt.Sprintf("Sub-conditions: %s\n", subConditions)
+	if verboseEventMode {
+		// Verbose mode (original)
+		subCondLine := ""
+		if subConditions != "" {
+			subCondLine = fmt.Sprintf("Sub-conditions: %s\n", subConditions)
+		}
+		fmt.Printf("%s\n%s  [SIG ]  SIGNAL DETECT (t close)\nTimestamp:    %s\nBar Index:    %d\nClose Price:  %.6f\nRegime Filter: %v\nEntry Rule:    %v\n%s%s\n",
+			eventSep,
+			C(cyan, time.Now().UTC().Format("15:04:05.000Z")),
+			C(gray, ts.UTC().Format("2006-01-02 15:04:05.000Z")),
+			bar,
+			closePrice,
+			boolStr(regimeResult),
+			boolStr(entryResult),
+			subCondLine,
+			eventSep,
+		)
+	} else {
+		// Compact mode (new)
+		entryIcon := Icon("success")
+		if !entryResult {
+			entryIcon = Icon("error")
+		}
+		regimeIcon := Icon("success")
+		if !regimeResult {
+			regimeIcon = Icon("error")
+		}
+		fmt.Printf("%s  [SIG] t=%d %s Entry: %v │ Regime: %s │ Price: %.4f\n",
+			C(gray, time.Now().UTC().Format("15:04:05Z")),
+			bar,
+			entryIcon,
+			entryResult,
+			regimeIcon,
+			closePrice,
+		)
 	}
-	fmt.Printf("%s\n%s  [SIG ]  SIGNAL DETECT (t close)\nTimestamp:    %s\nBar Index:    %d\nClose Price:  %.6f\nRegime Filter: %v\nEntry Rule:    %v\n%s%s\n",
-		eventSep,
-		C(cyan, time.Now().UTC().Format("15:04:05.000Z")),
-		C(gray, ts.UTC().Format("2006-01-02 15:04:05.000Z")),
-		bar,
-		closePrice,
-		boolStr(regimeResult),
-		boolStr(entryResult),
-		subCondLine,
-		eventSep,
-	)
 }
 
 // LeafProof provides mathematical proof of leaf evaluation to demonstrate no lookahead bias
@@ -171,15 +208,35 @@ func boolStr(b bool) string {
 // entryPrice: entry price including slippage/fee
 // dir: LONG or SHORT
 func LogEntryBlock(bar int, ts time.Time, entryPrice float64, dir string) {
-	fmt.Printf("%s\n%s  [ENT ]  ENTRY EXEC (t+1 open)\nTimestamp:    %s\nBar Index:    %d\nSide:         %s\nEntry Price:  %.6f (incl. slippage/fee)\n%s\n",
-		eventSep,
-		C(cyan, time.Now().UTC().Format("15:04:05.000Z")),
-		C(gray, ts.UTC().Format("2006-01-02 15:04:05.000Z")),
-		bar,
-		dir,
-		entryPrice,
-		eventSep,
-	)
+	if verboseEventMode {
+		// Verbose mode (original)
+		fmt.Printf("%s\n%s  [ENT ]  ENTRY EXEC (t+1 open)\nTimestamp:    %s\nBar Index:    %d\nSide:         %s\nEntry Price:  %.6f (incl. slippage/fee)\n%s\n",
+			eventSep,
+			C(cyan, time.Now().UTC().Format("15:04:05.000Z")),
+			C(gray, ts.UTC().Format("2006-01-02 15:04:05.000Z")),
+			bar,
+			dir,
+			entryPrice,
+			eventSep,
+		)
+	} else {
+		// Compact mode (new)
+		dirIcon := "📈"
+		if dir == "SHORT" {
+			dirIcon = "📉"
+		}
+		dirColor := C(green, dir)
+		if dir == "SHORT" {
+			dirColor = C(red, dir)
+		}
+		fmt.Printf("%s  [ENT] t=%d %s %s │ Price: %.4f\n",
+			C(gray, time.Now().UTC().Format("15:04:05Z")),
+			bar,
+			dirIcon,
+			dirColor,
+			entryPrice,
+		)
+	}
 }
 
 // LogExitBlock - exit event block at bar close (t) with execution at next bar open (t+1)
@@ -192,28 +249,47 @@ func LogEntryBlock(bar int, ts time.Time, entryPrice float64, dir string) {
 // pnl: profit/loss percentage
 func LogExitBlock(evalBar, execBar int, evalTs, execTs time.Time, exitPrice float64, reason, pnl string) {
 	reasonStr := reason
+	reasonIcon := "ℹ️"
 	switch reason {
 	case "sl_hit", "sl_gap_open":
 		reasonStr = C(red, reason)
+		reasonIcon = Icon("error")
 	case "tp_hit", "tp_gap_open":
 		reasonStr = C(green, reason)
+		reasonIcon = Icon("success")
 	case "trail_hit":
 		reasonStr = C(yellow, reason)
+		reasonIcon = Icon("warn")
 	case "exit_rule":
 		reasonStr = C(cyan, reason)
+		reasonIcon = Icon("info")
 	case "max_hold":
 		reasonStr = C(magenta, reason)
+		reasonIcon = "⏱️"
 	}
-	fmt.Printf("%s\n%s  [EXT ]  EXIT (t close + t+1 open)\nEval Timestamp: %s (bar %d)\nExec Timestamp: %s (bar %d)\nReason:       %s\nExit Price:    %.6f (incl. slippage/fee)\nPnL:          %s\n%s\n",
-		eventSep,
-		C(cyan, time.Now().UTC().Format("15:04:05.000Z")),
-		C(gray, evalTs.UTC().Format("2006-01-02 15:04:05.000Z")), evalBar,
-		C(gray, execTs.UTC().Format("2006-01-02 15:04:05.000Z")), execBar,
-		reasonStr,
-		exitPrice,
-		pnl,
-		eventSep,
-	)
+
+	if verboseEventMode {
+		// Verbose mode (original)
+		fmt.Printf("%s\n%s  [EXT ]  EXIT (t close + t+1 open)\nEval Timestamp: %s (bar %d)\nExec Timestamp: %s (bar %d)\nReason:       %s\nExit Price:    %.6f (incl. slippage/fee)\nPnL:          %s\n%s\n",
+			eventSep,
+			C(cyan, time.Now().UTC().Format("15:04:05.000Z")),
+			C(gray, evalTs.UTC().Format("2006-01-02 15:04:05.000Z")), evalBar,
+			C(gray, execTs.UTC().Format("2006-01-02 15:04:05.000Z")), execBar,
+			reasonStr,
+			exitPrice,
+			pnl,
+			eventSep,
+		)
+	} else {
+		// Compact mode (new)
+		fmt.Printf("%s  [EXT] t=%d→%d %s %s │ PnL: %s\n",
+			C(gray, time.Now().UTC().Format("15:04:05Z")),
+			evalBar, execBar,
+			reasonIcon,
+			reasonStr,
+			pnl,
+		)
+	}
 }
 
 // ExitTriggerStatus captures the state of all exit triggers at exit time
@@ -341,92 +417,225 @@ func LogExitBlockWithTriggers(evalBar, execBar int, evalTs, execTs time.Time, ex
 // trailPrice: current trailing stop price (0 if not active)
 // holdBars: number of bars held so far
 func LogHoldingBlock(bar int, ts time.Time, currentPnL float64, stopPrice, tpPrice, trailPrice float64, holdBars int) {
-	trailLine := ""
-	if trailPrice > 0 {
-		trailLine = fmt.Sprintf("Trail Stop:  %.6f\n", trailPrice)
-	}
 	pnlStr := fmt.Sprintf("%.2f%%", currentPnL)
+	pnlIcon := "➖"
 	if currentPnL > 0 {
 		pnlStr = C(green, pnlStr)
+		pnlIcon = "📈"
 	} else if currentPnL < 0 {
 		pnlStr = C(red, pnlStr)
+		pnlIcon = "📉"
 	}
-	fmt.Printf("%s\n%s  [HLD ]  HOLDING (heartbeat)\nTimestamp:    %s\nBar Index:    %d (held %d bars)\nCurrent PnL:  %s\nStop Loss:    %.6f\nTake Profit:  %.6f\n%s%s\n",
-		eventSep,
-		C(cyan, time.Now().UTC().Format("15:04:05.000Z")),
-		C(gray, ts.UTC().Format("2006-01-02 15:04:05.000Z")),
-		bar, holdBars,
-		pnlStr,
-		stopPrice,
-		tpPrice,
-		trailLine,
-		eventSep,
-	)
+
+	if verboseEventMode {
+		// Verbose mode (original)
+		trailLine := ""
+		if trailPrice > 0 {
+			trailLine = fmt.Sprintf("Trail Stop:  %.6f\n", trailPrice)
+		}
+		fmt.Printf("%s\n%s  [HLD ]  HOLDING (heartbeat)\nTimestamp:    %s\nBar Index:    %d (held %d bars)\nCurrent PnL:  %s\nStop Loss:    %.6f\nTake Profit:  %.6f\n%s%s\n",
+			eventSep,
+			C(cyan, time.Now().UTC().Format("15:04:05.000Z")),
+			C(gray, ts.UTC().Format("2006-01-02 15:04:05.000Z")),
+			bar, holdBars,
+			pnlStr,
+			stopPrice,
+			tpPrice,
+			trailLine,
+			eventSep,
+		)
+	} else {
+		// Compact mode (new)
+		trailInfo := ""
+		if trailPrice > 0 {
+			trailInfo = fmt.Sprintf(" │ Trail: %.4f", trailPrice)
+		}
+		fmt.Printf("%s  [HLD] t=%d %s PnL: %s │ SL: %.4f │ TP: %.4f%s\n",
+			C(gray, time.Now().UTC().Format("15:04:05Z")),
+			bar,
+			pnlIcon,
+			pnlStr,
+			stopPrice,
+			tpPrice,
+			trailInfo,
+		)
+	}
 }
 
 // LogValidationReject - validation rejection event block
 func LogValidationReject(score, ret, pf, exp, dd float32, trades int, reason string) {
-	fmt.Printf("%s\n%s  %s  %s\n",
-		eventSep,
-		C(gray, time.Now().UTC().Format("15:04:05Z")),
-		Channel("VAL "),
-		C(bold, "VALIDATION REJECT"),
-	)
-	fmt.Printf("  score=%.4f  ret=%.2f%%  pf=%.2f  exp=%.5f  dd=%.3f  trades=%d\n",
-		score, ret*100, pf, exp, dd, trades,
-	)
-	fmt.Printf("  reason: %s\n%s\n", reason, eventSep)
+	if verboseEventMode {
+		// Verbose mode (original)
+		fmt.Printf("%s\n%s  %s  %s\n",
+			eventSep,
+			C(gray, time.Now().UTC().Format("15:04:05Z")),
+			Channel("VAL "),
+			C(bold, "VALIDATION REJECT"),
+		)
+		fmt.Printf("  score=%.4f  ret=%.2f%%  pf=%.2f  exp=%.5f  dd=%.3f  trades=%d\n",
+			score, ret*100, pf, exp, dd, trades,
+		)
+		fmt.Printf("  reason: %s\n%s\n", reason, eventSep)
+	} else {
+		// Compact mode (new)
+		reasonShort := reason
+		if len(reason) > 40 {
+			reasonShort = reason[:37] + "..."
+		}
+		fmt.Printf("%s  [VAL] %s Reject: score=%.4f │ ret=%.2f%% │ %s\n",
+			C(gray, time.Now().UTC().Format("15:04:05Z")),
+			Icon("reject"),
+			score, ret*100,
+			reasonShort,
+		)
+	}
 }
 
-// LogRejectionStatsHeader - rejection statistics header
+// LogRejectionStatsHeader - rejection statistics header with compact box
 func LogRejectionStatsHeader() {
-	fmt.Printf("\n%s  %s  REJECTION STATISTICS\n",
-		C(gray, time.Now().UTC().Format("15:04:05Z")),
-		Channel("VAL "),
-	)
+	fmt.Printf("\n%s  %s\n", C(gray, time.Now().UTC().Format("15:04:05Z")), Channel("VAL "))
+	fmt.Printf("%s", BoxHeader("REJECTION STATISTICS", 50))
 }
 
-// LogRejectionStatsSummary - rejection statistics summary
+// LogRejectionStatsSummary - rejection statistics summary in compact format
 func LogRejectionStatsSummary(totalEval, totalRejected, strategiesPassed int64) {
-	fmt.Printf("Total Evaluated: %d\n", totalEval)
-	fmt.Printf("Strategies Passed: %d\n", strategiesPassed)
-	fmt.Printf("Total Rejected: %d\n", totalRejected)
+	passRate := 0.0
+	if totalEval > 0 {
+		passRate = 100.0 * float64(strategiesPassed) / float64(totalEval)
+	}
+	fmt.Printf("│ Eval: %s │ Pass: %s (%.1f%%) │ Rej: %s │\n",
+		formatNumber(int(totalEval)),
+		formatNumber(int(strategiesPassed)),
+		passRate,
+		formatNumber(int(totalRejected)),
+	)
+	fmt.Printf("%s\n", BoxFooter(50))
 }
 
-// LogRejectionStatsScreen - screen stage failures
+// LogRejectionStatsScreen - screen stage failures in compact table format
 func LogRejectionStatsScreen(entryRateLow, entryRateHigh, trades, tooManyTrades, dd int64, totalRejected int64) {
 	if totalRejected > 0 {
-		fmt.Printf("\nScreen Stage Failures:\n")
-		fmt.Printf("  Entry rate too low (<3 edges): %d (%.1f%%)\n", entryRateLow, float64(entryRateLow)*100/float64(totalRejected))
-		fmt.Printf("  Entry rate too high (>120 edges): %d (%.1f%%)\n", entryRateHigh, float64(entryRateHigh)*100/float64(totalRejected))
-		fmt.Printf("  Not enough trades: %d (%.1f%%)\n", trades, float64(trades)*100/float64(totalRejected))
-		fmt.Printf("  Too many trades (>2000): %d (%.1f%%)\n", tooManyTrades, float64(tooManyTrades)*100/float64(totalRejected))
-		fmt.Printf("  Drawdown too high: %d (%.1f%%)\n", dd, float64(dd)*100/float64(totalRejected))
+		fmt.Printf("\n%s  %s\n", C(gray, time.Now().UTC().Format("15:04:05Z")), Channel("VAL "))
+		fmt.Printf("%s", BoxHeader("STAGE FAILURES", 50))
+
+		// Screen row with detailed breakdown
+		fmt.Printf("│ SCREEN │ entry_rate_low: %s │ too_many_trades: %s │ DD: %s │\n",
+			formatNumber(int(entryRateLow)),
+			formatNumber(int(tooManyTrades)),
+			formatNumber(int(dd)),
+		)
+
+		fmt.Printf("%s\n", BoxFooter(50))
 	}
 }
 
-// LogRejectionStatsTrain - train stage failures
+// LogRejectionStatsTrain - train stage failures in compact table format
 func LogRejectionStatsTrain(trades, tooManyTrades, dd int64, totalRejected int64) {
 	if totalRejected > 0 {
-		fmt.Printf("\nTrain Stage Failures:\n")
-		fmt.Printf("  Not enough trades: %d (%.1f%%)\n", trades, float64(trades)*100/float64(totalRejected))
-		fmt.Printf("  Too many trades (>5000): %d (%.1f%%)\n", tooManyTrades, float64(tooManyTrades)*100/float64(totalRejected))
-		fmt.Printf("  Drawdown too high: %d (%.1f%%)\n", dd, float64(dd)*100/float64(totalRejected))
+		tradeRej := trades + tooManyTrades
+		tradePct := float64(tradeRej) * 100.0 / float64(totalRejected)
+		ddPct := float64(dd) * 100.0 / float64(totalRejected)
+
+		fmt.Printf("│ TRAIN  │ Trades: %s (%.0f%%) │ DD: %s (%.0f%%) │\n",
+			formatNumber(int(tradeRej)), tradePct,
+			formatNumber(int(dd)), ddPct,
+		)
 	}
 }
 
-// LogRejectionStatsFooter - rejection statistics footer
+// LogRejectionStatsOOS - OOS (walk-forward) stage failures in compact table format
+func LogRejectionStatsOOS(tradesTooLow, maxDDTooHigh, worstMonthTooBad, otherReject int64,
+	entryRateLow, tooSparseMonths, activeMonthsLow, minMonthFail, geoMonthlyFail, medianMonthlyFail, tooComplex int64,
+	totalRejected int64) {
+	if totalRejected > 0 {
+		totalOOS := tradesTooLow + maxDDTooHigh + worstMonthTooBad + otherReject +
+			entryRateLow + tooSparseMonths + activeMonthsLow + minMonthFail +
+			geoMonthlyFail + medianMonthlyFail + tooComplex
+		if totalOOS > 0 {
+			// Build a detailed breakdown line
+			categories := []struct {
+				name  string
+				count int64
+			}{
+				{"trades_low", tradesTooLow},
+				{"entry_rate_low", entryRateLow},
+				{"too_sparse", tooSparseMonths},
+				{"active_months_low", activeMonthsLow},
+				{"min_month", minMonthFail},
+				{"geo_monthly", geoMonthlyFail},
+				{"median_monthly", medianMonthlyFail},
+				{"DD_high", maxDDTooHigh},
+				{"too_complex", tooComplex},
+				{"other", otherReject},
+			}
+
+			// Filter to only show non-zero categories
+			var parts []string
+			for _, cat := range categories {
+				if cat.count > 0 {
+					parts = append(parts, fmt.Sprintf("%s:%s", cat.name, formatNumber(int(cat.count))))
+				}
+			}
+
+			// Print the breakdown
+			line := strings.Join(parts, ", ")
+			if len(line) > 0 {
+				fmt.Printf("│ OOS    │ %s │\n", line)
+			}
+			fmt.Printf("%s\n", BoxFooter(50))
+		}
+	}
+}
+
+// LogRejectionStatsSimple - simplified rejection statistics (single line)
+func LogRejectionStatsSimple(totalEval, totalRejected, strategiesPassed int64,
+	entryRateLow, tooSparse, ddHigh int64) {
+	if totalEval == 0 {
+		return
+	}
+	passRate := 100.0 * float64(strategiesPassed) / float64(totalEval)
+
+	var parts []string
+	if entryRateLow > 0 {
+		parts = append(parts, fmt.Sprintf("entry_low=%s", formatNumber(int(entryRateLow))))
+	}
+	if tooSparse > 0 {
+		parts = append(parts, fmt.Sprintf("sparse=%s", formatNumber(int(tooSparse))))
+	}
+	if ddHigh > 0 {
+		parts = append(parts, fmt.Sprintf("dd_high=%s", formatNumber(int(ddHigh))))
+	}
+
+	line := strings.Join(parts, ", ")
+	if line != "" {
+		fmt.Printf("Rejects: %s | Pass: %.1f%%\n", line, passRate)
+	} else {
+		fmt.Printf("Pass: %.1f%%\n", passRate)
+	}
+}
+
+// LogRejectionStatsFooter - rejection statistics footer in compact format
 func LogRejectionStatsFooter(zeroTrades, crossSanityMutation, crossSanitySurrogate, crossSanityLoad int64) {
-	fmt.Printf("\nZero-Trade Strategies: %d\n", zeroTrades)
+	if zeroTrades > 0 {
+		fmt.Printf("\n%s  %s  Zero-trade strategies: %s\n",
+			C(gray, time.Now().UTC().Format("15:04:05Z")),
+			Channel("VAL "),
+			formatNumber(int(zeroTrades)),
+		)
+	}
+
 	totalCrossSanity := crossSanityMutation + crossSanitySurrogate + crossSanityLoad
 	if totalCrossSanity > 0 {
-		fmt.Printf("\nCross Sanity Check Rejections:\n")
-		fmt.Printf("  rejected_sanity_cross_mutation: %d\n", crossSanityMutation)
-		fmt.Printf("  rejected_sanity_cross_surrogate: %d\n", crossSanitySurrogate)
-		fmt.Printf("  rejected_sanity_cross_load: %d\n", crossSanityLoad)
-		fmt.Printf("  TOTAL: %d\n", totalCrossSanity)
+		fmt.Printf("\n%s  %s\n", C(gray, time.Now().UTC().Format("15:04:05Z")), Channel("VAL "))
+		fmt.Printf("%s", BoxHeader("CROSS SANITY", 50))
+		fmt.Printf("│ Mutation: %s │ Surrogate: %s │ Load: %s │ Total: %s │\n",
+			formatNumber(int(crossSanityMutation)),
+			formatNumber(int(crossSanitySurrogate)),
+			formatNumber(int(crossSanityLoad)),
+			formatNumber(int(totalCrossSanity)),
+		)
+		fmt.Printf("%s\n", BoxFooter(50))
 	}
-	fmt.Printf("===========================\n\n")
 }
 
 // LogAutoAdjust - automatic adjustment message

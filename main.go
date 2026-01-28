@@ -45,6 +45,12 @@ var VerifyMode bool = false
 // Global debugPF flag - enables throttled PF debug logging
 var DebugPF bool = false
 
+// Global debugWalkForward flag - enables walk-forward debug logging
+var DebugWalkForward bool = false
+
+// Global walk-forward configuration
+var wfConfig WFConfig
+
 // Global timeframe in minutes (default 5 for 5-minute bars)
 var globalTimeframeMinutes int32 = 5
 
@@ -274,6 +280,7 @@ func main() {
 	holdingHeartbeat := flag.Int("holding_heartbeat", 0, "holding log interval in bars (0 = disabled, e.g., 50 = log every 50 bars)")
 	// Debug flags
 	debugPF := flag.Bool("debug_pf", false, "enable throttled PF debug logging")
+	debugWalkForward := flag.Bool("debug_wf", false, "enable walk-forward debug logging")
 	// Recovery mode flag
 	recoveryMode := flag.Bool("recovery", false, "enable recovery mode (relaxed screening, expanded seeding)")
 	// Verification flags
@@ -287,6 +294,24 @@ func main() {
 	// Data file selection
 	dataFile := flag.String("data", "btc_5min_data.csv", "CSV data file path (e.g., btc_5min_data.csv, btc_data_15m.csv, btc_data_60m.csv)")
 	timeframe := flag.String("timeframe", "5m", "Data timeframe (e.g., 5m, 15m, 60m, 1h, 4h)")
+	// Walk-forward validation flags
+	wfEnable := flag.Bool("wf", false, "enable walk-forward validation mode")
+	wfTrainDays := flag.Int("wf_train_days", 360, "walk-forward training window size in days")
+	wfTestDays := flag.Int("wf_test_days", 90, "walk-forward test window size in days")
+	wfStepDays := flag.Int("wf_step_days", 60, "walk-forward step size in days")
+	wfMinTradesOOS := flag.Int("wf_min_trades_oos", 30, "minimum total trades in OOS period")
+	wfMaxDD := flag.Float64("wf_max_dd", 0.70, "maximum drawdown allowed (0-1)")
+	wfMaxSparseMonthsRatio := flag.Float64("wf_max_sparse_months_ratio", 0.80, "maximum ratio of sparse months to total months")
+	wfMinActiveMonthsRatio := flag.Float64("wf_min_active_months_ratio", 0.25, "minimum ratio of active months to total months")
+	wfEnableMinMonth := flag.Bool("wf_enable_min_month", true, "enable minimum monthly return constraint")
+	wfMinMonth := flag.Float64("wf_min_month", -0.35, "minimum monthly return threshold")
+	wfMinMedianMonthly := flag.Float64("wf_min_median_monthly", 0.003, "minimum median monthly return")
+	wfMinGeoMonthly := flag.Float64("wf_min_geo_monthly", 0.005, "minimum geometric average monthly return")
+	wfMinEdgesPerYear := flag.Float64("wf_min_edges_per_year", 0.03, "minimum edges per year threshold")
+	wfFoldMinEdgesPerYear := flag.Float64("wf_fold_min_edges_per_year", 0, "minimum edges per year per-fold threshold")
+	wfDDLambda := flag.Float64("wf_dd_lambda", 0.008, "drawdown penalty lambda")
+	wfVolLambda := flag.Float64("wf_vol_lambda", 0.004, "volatility penalty lambda")
+	_ = flag.Float64("target_geo_monthly", 0.12, "target geometric monthly return for scoring (reserved for future use)")
 	flag.Parse()
 
 	// Parse timeframe (e.g., "5m", "15m", "60m" OR "1h", "4h")
@@ -298,7 +323,39 @@ func main() {
 	LogTrades = *logTrades
 	HoldingHeartbeat = *holdingHeartbeat
 	DebugPF = *debugPF
+	DebugWalkForward = *debugWalkForward
 	RecoveryMode.Store(*recoveryMode)
+	VerifyMode = *verifyMode
+
+	// Set walk-forward configuration from flags
+	wfConfig = WFConfig{
+		Enable:           *wfEnable,
+		TrainDays:        *wfTrainDays,
+		TestDays:         *wfTestDays,
+		StepDays:         *wfStepDays,
+		MinFolds:         3,
+		MinTradesPerFold: 10,
+		MinMonths:                3,
+		MinTotalTradesOOS:        *wfMinTradesOOS,
+		MinTradesPerMonth:        2,
+		MaxDrawdown:              *wfMaxDD,
+		MinMonthReturn:           *wfMinMonth,
+		EnableMinMonthConstraint: *wfEnableMinMonth,
+		MinGeoMonthlyReturn:      *wfMinGeoMonthly,
+		MinActiveMonthsRatio:     *wfMinActiveMonthsRatio,
+		MaxSparseMonthsRatio:     *wfMaxSparseMonthsRatio,
+		MinMedianMonthly:         *wfMinMedianMonthly,
+		MaxStdMonth:              0.5,
+		MonthlyVolLambda:         *wfVolLambda,
+		DDPenaltyLambda:          *wfDDLambda,
+		LambdaNodes:              0.001,
+		LambdaFeats:              0.001,
+		LambdaDepth:              0.001,
+		MaxNodes:                 50,
+		MaxFeatures:              12,
+		MinEdgesPerYear:          *wfMinEdgesPerYear,
+		FoldMinEdgesPerYear:      *wfFoldMinEdgesPerYear,
+	}
 	VerifyMode = *verifyMode
 
 	// Convert flag values to float32
@@ -2263,8 +2320,8 @@ func main() {
 						// Evaluate remaining strategies using multi-fidelity pipeline
 						testedNow := int64(atomic.LoadUint64(&tested))
 						for _, s := range localBatch {
-							// Use multi-fidelity: screen -> train -> val
-							passedScreen, passedFull, _, trainR, valR, _ := evaluateMultiFidelity(series, feats, s, screenW, trainW, valW, testedNow)
+							// Use multi-fidelity: screen -> train -> val (or walk-forward if enabled)
+							passedScreen, passedFull, _, trainR, valR, _ := evaluateWithWalkForward(series, feats, s, screenW, trainW, valW, testedNow, wfConfig)
 							if !passedScreen {
 								continue // failed fast screen
 							}
@@ -2304,8 +2361,8 @@ func main() {
 						localResults = localResults[:0]
 						testedNow := int64(atomic.LoadUint64(&tested))
 						for _, strat := range localBatch {
-							// Use multi-fidelity: screen -> train -> val
-							passedScreen, passedFull, _, trainR, valR, _ := evaluateMultiFidelity(series, feats, strat, screenW, trainW, valW, testedNow)
+							// Use multi-fidelity: screen -> train -> val (or walk-forward if enabled)
+							passedScreen, passedFull, _, trainR, valR, _ := evaluateWithWalkForward(series, feats, strat, screenW, trainW, valW, testedNow, wfConfig)
 							if !passedScreen {
 								continue // failed fast screen
 							}

@@ -2,26 +2,22 @@ package logx
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
-// LogProgress - single-line progress log
+// LogProgress - single line progress log
 // tested: total strategies tested
 // rate: strategies per second
-// bestVal: best validation score seen
+// bestValScore: best validation score seen (global)
 // elites: number of elites in HOF
-// rejSeen: percentage rejected by seen/dedup
-// rejNovelty: percentage rejected by novelty pressure (too similar)
-// rejSur: percentage rejected by surrogate
+// rejSeen: percentage rejected by seen/dedup (unused in simplified output)
+// rejNovelty: percentage rejected by novelty pressure (unused in simplified output)
+// rejSur: percentage rejected by surrogate (unused in simplified output)
 // gen: generation/batch count
-func LogProgress(tested int64, rate float64, bestVal float64, elites int, rejSeen float64, rejNovelty float64, rejSur float64, gen int64) {
-	fmt.Printf("%s  %s  tested=%d  rate=%.1f/s  bestVal=%.4f  elites=%d  rej_seen=%s  rej_novelty=%s  rej_sur=%s  gen=%d\n",
-		C(gray, time.Now().UTC().Format("15:04:05Z")),
-		Channel("PROG"),
-		tested, rate, bestVal, elites,
-		ColorPercent(rejSeen), ColorPercent(rejNovelty), ColorPercent(rejSur),
-		gen,
-	)
+func LogProgress(tested int64, rate float64, bestValScore float64, elites int, _, _, _ float64, gen int64) {
+	fmt.Printf("Tested: %s | Rate: %.0f/s | Best: %.4f | Elites: %d | Gen: %s\n",
+		formatNumber(int(tested)), rate, bestValScore, elites, formatNumber(int(gen)))
 }
 
 // ColorPercent returns a color-coded percentage string
@@ -53,28 +49,36 @@ func LogGenerator(generated, rejectedSur, rejectedSeen, sentToJobs int64) {
 	)
 }
 
-// LogGenTypes - generation type statistics
+// LogGenTypes - generation type statistics (simplified single line)
 func LogGenTypes(immigrant, heavyMut, cross, normalMut int64) {
 	total := immigrant + heavyMut + cross + normalMut
 	if total == 0 {
 		return
 	}
 	immPct := 100.0 * float64(immigrant) / float64(total)
-	hmPct := 100.0 * float64(heavyMut) / float64(total)
-	crPct := 100.0 * float64(cross) / float64(total)
-	nmPct := 100.0 * float64(normalMut) / float64(total)
 
-	fmt.Printf("%s  %s  immigrant=%d(%.1f%%)  heavyMut=%d(%.1f%%)  crossover=%d(%.1f%%)  normalMut=%d(%.1f%%)  total=%d\n",
-		C(gray, time.Now().UTC().Format("15:04:05Z")),
-		Channel("GEN "),
-		immigrant, immPct, heavyMut, hmPct, cross, crPct, normalMut, nmPct, total,
-	)
+	// Show total with dominant type (typically immigrant)
+	genType := ""
+	if immPct > 90 {
+		genType = fmt.Sprintf(" (imm: %s%%", formatNumber(int(immPct)))
+	} else if heavyMut > 0 {
+		genType = " (heavy_mut)"
+	} else if cross > 0 {
+		genType = " (crossover)"
+	} else if normalMut > 0 {
+		genType = " (mut)"
+	}
+	if genType != "" {
+		genType += ")"
+	}
+
+	fmt.Printf("Gen: %s%s\n", formatNumber(int(total)), genType)
 }
 
 // LogBatchProgress - batch completion progress
 func LogBatchProgress(batchID int64, tested uint64, trainScore, valScore float32, trainReturn, valReturn, winRate float32,
 	trades int, rate float64, elapsed time.Duration, fingerprint string) {
-	fmt.Printf("%s  %s  Batch %d: Tested %d | Train: %s | Val: %s | Ret: %s | WR: %s | Trds: %d | Rate: %.0f/s | Runtime: %s | fp: %s\n",
+	fmt.Printf("%s  %s  Batch %d: Tested %d | Train: %s | batchValScore: %s | Ret: %s | WR: %s | Trds: %d | Rate: %.0f/s | Runtime: %s | fp: %s\n",
 		C(gray, time.Now().UTC().Format("15:04:05Z")),
 		Channel("PROG"),
 		batchID, tested,
@@ -98,21 +102,17 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh%dm", hours, minutes)
 }
 
-// LogCheckpoint - checkpoint saved message
-func LogCheckpoint(path string, batches int64, bestVal float32, elitesCount int, elapsed time.Duration) {
-	fmt.Printf("%s  %s  CHECKPOINT saved: %s (batches=%d, bestVal=%.4f, elites=%d, runtime=%s)\n",
-		C(gray, time.Now().UTC().Format("15:04:05Z")),
-		Channel("PROG"),
-		path, batches, bestVal, elitesCount, formatDuration(elapsed),
-	)
+// LogCheckpoint - checkpoint saved message (simplified)
+func LogCheckpoint(path string, batches int64, bestValScore float32, elitesCount int, elapsed time.Duration) {
+	fmt.Printf("Checkpoint saved (runtime: %s)\n", formatDuration(elapsed))
 }
 
 // LogCheckpointLoad - checkpoint loaded message
-func LogCheckpointLoad(path string, batches int64, bestVal float32, elitesCount int) {
-	fmt.Printf("%s  %s  CHECKPOINT loaded: %s (batches=%d, bestVal=%.4f, elites=%d)\n",
+func LogCheckpointLoad(path string, batches int64, bestValScore float32, elitesCount int) {
+	fmt.Printf("%s  %s  CHECKPOINT loaded: %s (batches=%d, bestValScore=%.4f, elites=%d)\n",
 		C(gray, time.Now().UTC().Format("15:04:05Z")),
 		Channel("PROG"),
-		path, batches, bestVal, elitesCount,
+		path, batches, bestValScore, elitesCount,
 	)
 }
 
@@ -141,4 +141,126 @@ func LogBootstrapComplete(elitesCount int) {
 		Channel("PROG"),
 		elitesCount,
 	)
+}
+
+// Box formatting helpers for compact display
+
+// BoxHeader creates a top border for a boxed section with title
+func BoxHeader(title string, width int) string {
+	if width < 20 {
+		width = 50
+	}
+	// Create border like: ┌─ TITLE ─────────────────┐
+	padding := width - len(title) - 6
+	if padding < 2 {
+		padding = 2
+	}
+	return fmt.Sprintf("┌─ %s %s┐\n", C(bold, title), C(gray, strings.Repeat("─", padding)+"─"))
+}
+
+// BoxFooter creates a bottom border for a boxed section
+func BoxFooter(width int) string {
+	if width < 20 {
+		width = 50
+	}
+	return C(gray, "└"+strings.Repeat("─", width-2)+"┘") + "\n"
+}
+
+// BoxRow creates a content row for a boxed section (auto-pads to width)
+func BoxRow(content string, width int) string {
+	if width < 20 {
+		width = 50
+	}
+	padding := width - len(content) - 4 // -4 for "│ " and " │"
+	if padding < 0 {
+		padding = 0
+	}
+	return fmt.Sprintf("│ %s%s │\n", content, C(gray, strings.Repeat(" ", padding)))
+}
+
+// formatNumber formats a number with thousands separators (e.g., 12,345)
+func formatNumber(n int) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var result []string
+	for i := len(s); i > 0; i -= 3 {
+		start := i - 3
+		if start < 0 {
+			start = 0
+		}
+		result = append([]string{s[start:i]}, result...)
+	}
+	return strings.Join(result, ",")
+}
+
+// FormatNumberSimple formats a number with thousands separators (exported version)
+func FormatNumberSimple(n int) string {
+	return formatNumber(n)
+}
+
+// MetricsSnapshot holds comprehensive metrics for dashboard display
+type MetricsSnapshot struct {
+	// Performance metrics
+	BestScore      float32
+	BestReturn     float32
+	BestWinRate    float32
+	BestProfitFact float32
+
+	// Progress metrics
+	Tested       int64
+	Rate         float64
+	Elites       int
+	Generation   int64
+
+	// Rejection metrics (last N strategies)
+	RejSeen      float64
+	RejNovelty   float64
+	RejSur       float64
+
+	// Runtime
+	Elapsed      time.Duration
+}
+
+// LogMetricsDashboard - comprehensive metrics summary dashboard
+// Displays key performance, progress, and rejection metrics in a scannable format
+func LogMetricsDashboard(m MetricsSnapshot) {
+	fmt.Printf("\n%s  %s\n", C(gray, time.Now().UTC().Format("15:04:05Z")), Channel("PROG"))
+	fmt.Printf("%s", BoxHeader("DASHBOARD", 54))
+
+	// PERFORMANCE row
+	fmt.Printf("│ %s PERFORMANCE %s\n",
+		C(bold, "│"), C(bold, "                             │"))
+	fmt.Printf("│ Score: %s │ Ret: %s │ WR: %s │ PF: %.2f │\n",
+		ScoreColor(m.BestScore),
+		ReturnColor(m.BestReturn),
+		WinRateColor(m.BestWinRate),
+		m.BestProfitFact,
+	)
+
+	// PROGRESS row
+	fmt.Printf("│ Tested: %s │ Rate: %d/s │ Elites: %d │ Gen: %s │\n",
+		formatNumber(int(m.Tested)),
+		int(m.Rate),
+		m.Elites,
+		formatNumber(int(m.Generation)),
+	)
+
+	// REJECTIONS row
+	totalRej := m.RejSeen + m.RejNovelty + m.RejSur
+	fmt.Printf("│ %s Rej: %s │ Seen: %s │ Nov: %s │ Sur: %s │\n",
+		Icon("reject"),
+		ColorPercent(totalRej),
+		ColorPercent(m.RejSeen),
+		ColorPercent(m.RejNovelty),
+		ColorPercent(m.RejSur),
+	)
+
+	// RUNTIME row
+	fmt.Printf("│ Runtime: %s │\n",
+		C(gray, FormatDuration(m.Elapsed)),
+	)
+
+	fmt.Printf("%s\n", BoxFooter(54))
 }

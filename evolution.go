@@ -2,17 +2,23 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"hb_bactest_checker/logx"
 )
 
+// MaxElitesPerFingerprint is the maximum number of elites allowed per fingerprint family
+const MaxElitesPerFingerprint = 5
+
 type Elite struct {
-	Strat     Strategy
-	Train     Result
-	Val       Result
-	ValScore  float32
+	Strat      Strategy
+	Train      Result
+	Val        Result
+	ValScore   float32
 	IsPreElite bool // True if added via recovery mode (not fully validated)
 }
 
@@ -31,6 +37,32 @@ func (h *HallOfFame) Add(e Elite) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// CRITICAL FIX: Reject elites with invalid scores (sentinel corruption)
+	// Sentinel -1e30 means uninitialized/overflow score - these should not be in HallOfFame
+	if e.ValScore < -1e20 || math.IsNaN(float64(e.ValScore)) || math.IsInf(float64(e.ValScore), 0) {
+		if Verbose {
+			fmt.Printf("[HOF-REJECT] Invalid score=%.4f - rejecting corrupted elite\n", e.ValScore)
+		}
+		return
+	}
+
+	// CRITICAL FIX: Reject negative scores when pool is full
+	// Once elite pool is full, only admit strategies with positive scores
+	// This prevents the elite set from becoming noisy with junk strategies
+	poolFull := len(h.Elites) >= h.K
+	if poolFull && e.ValScore <= 0 {
+		// Find worst score for logging
+		worstOverallScore := float32(0.0)
+		if len(h.Elites) > 0 {
+			worstOverallScore = h.Elites[len(h.Elites)-1].ValScore
+		}
+		if Verbose {
+			fmt.Printf("[HOF-REJECT] Pool full (%d/%d), newScore=%.4f <= 0, worstScore=%.4f\n",
+				len(h.Elites), h.K, e.ValScore, worstOverallScore)
+		}
+		return
+	}
+
 	// Use CoarseFingerprint for diversity tracking (threshold buckets)
 	// This allows more threshold variation than SkeletonFingerprint while preventing duplicates
 	fingerprint := e.Strat.CoarseFingerprint()
@@ -39,6 +71,12 @@ func (h *HallOfFame) Add(e Elite) {
 	fpCount := 0
 	worstIndex := -1
 	worstScore := e.ValScore
+
+	// Track previous best score for event logging
+	prevBestScore := float32(0)
+	if len(h.Elites) > 0 {
+		prevBestScore = h.Elites[0].ValScore
+	}
 
 	for i, elite := range h.Elites {
 		if elite.Strat.CoarseFingerprint() == fingerprint {
@@ -50,13 +88,15 @@ func (h *HallOfFame) Add(e Elite) {
 		}
 	}
 
-	// If fingerprint is already at cap (5 elites), replace worst if new is better
-	// EDIT #3: Changed from 2 to 5 - allows more diversity per fingerprint family
-	if fpCount >= 5 {
+	// If fingerprint is already at cap, replace worst if new is better
+	// EDIT #3: Changed from 2 to MaxElitesPerFingerprint - allows more diversity per fingerprint family
+	if fpCount >= MaxElitesPerFingerprint {
 		if e.ValScore <= worstScore || worstIndex == -1 {
 			// DEBUG: Log why elite was rejected
-			fmt.Printf("[HOF-REJECT] fpCount=%d newScore=%.4f <= worstScore=%.4f\n",
-				fpCount, e.ValScore, worstScore)
+			if Verbose {
+				fmt.Printf("[HOF-REJECT] fpCount=%d newScore=%.4f <= worstScore=%.4f\n",
+					fpCount, e.ValScore, worstScore)
+			}
 			// Not better than worst or no fingerprint found (shouldn't happen), reject
 			return
 		}
@@ -79,11 +119,23 @@ func (h *HallOfFame) Add(e Elite) {
 	snapshot := make([]Elite, len(h.Elites))
 	copy(snapshot, h.Elites)
 	h.snapshot.Store(snapshot)
+
+	// Log elite added event to TUI
+	logx.LogEliteAdded(e.ValScore, len(h.Elites))
+
+	// Log if best score improved
+	if len(h.Elites) > 0 && h.Elites[0].ValScore > prevBestScore {
+		logx.LogNewBestScore(prevBestScore, h.Elites[0].ValScore)
+	}
 }
 
 func (h *HallOfFame) Len() int {
 	if elites := h.snapshot.Load(); elites != nil {
-		return len(elites.([]Elite))
+		elitesSlice, ok := elites.([]Elite)
+		if ok {
+			return len(elitesSlice)
+		}
+		// Type mismatch - fall through to locked read
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -97,7 +149,14 @@ func (h *HallOfFame) Sample(rng *rand.Rand) (Elite, bool) {
 	var elites []Elite
 
 	if elitesInterface != nil {
-		elites = elitesInterface.([]Elite)
+		var ok bool
+		elites, ok = elitesInterface.([]Elite)
+		if !ok {
+			// Type mismatch - fallback to locked read
+			h.mu.RLock()
+			defer h.mu.RUnlock()
+			elites = h.Elites
+		}
 	} else {
 		// Fallback for initialization
 		h.mu.RLock()
@@ -206,13 +265,13 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 				}
 			} else {
 				// Fallback for zero-variance features
-				leaf.X += float32(rng.NormFloat64() * 0.2)  // FIX #2: Increased from 0.1
+				leaf.X += float32(rng.NormFloat64() * 0.2) // FIX #2: Increased from 0.1
 			}
 		}
 	case 1: // change feature A
 		leaf.A = rng.Intn(len(feats.F))
 		// SANITY CHECK: For cross leaves, ensure B is compatible with new A
-		if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+		if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown || leaf.Kind == LeafBreakUp || leaf.Kind == LeafBreakDown {
 			// Get type of new feature A
 			var typeA FeatureType
 			if leaf.A < len(feats.Types) {
@@ -241,10 +300,10 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 			}
 		}
 	case 2: // change kind
-		kinds := []LeafKind{LeafGT, LeafLT, LeafCrossUp, LeafCrossDown, LeafRising, LeafFalling}
+		kinds := []LeafKind{LeafGT, LeafLT, LeafCrossUp, LeafCrossDown, LeafBreakUp, LeafBreakDown, LeafRising, LeafFalling}
 		leaf.Kind = kinds[rng.Intn(len(kinds))]
 		// SANITY CHECK: For new cross leaves, ensure A and B are compatible
-		if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+		if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown || leaf.Kind == LeafBreakUp || leaf.Kind == LeafBreakDown {
 			if leaf.A >= len(feats.F) {
 				leaf.A = rng.Intn(len(feats.F))
 			}
@@ -274,8 +333,8 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 				leaf.Lookback = 2 + rng.Intn(9) // Reduced from 5+16 to 2-10 for more trades
 			}
 		}
-	case 3: // tweak lookback (skip for CrossUp/CrossDown)
-		if leaf.Kind != LeafCrossUp && leaf.Kind != LeafCrossDown {
+	case 3: // tweak lookback (skip for CrossUp/CrossDown/BreakUp/BreakDown)
+		if leaf.Kind != LeafCrossUp && leaf.Kind != LeafCrossDown && leaf.Kind != LeafBreakUp && leaf.Kind != LeafBreakDown {
 			leaf.Lookback += rng.Intn(5) - 2
 			// Use minimum of 2 for Rising/Falling to avoid noise (lookback=1 is too short)
 			if leaf.Lookback < 2 {
@@ -285,7 +344,7 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 	}
 }
 
-func mutateRuleTree(rng *rand.Rand, root *RuleNode, feats Features, maxDepth int) *RuleNode {
+func mutateRuleTree(rng *rand.Rand, root *RuleNode, feats Features, maxDepth int, ruleType string) *RuleNode {
 	if root == nil {
 		return root
 	}
@@ -297,7 +356,8 @@ func mutateRuleTree(rng *rand.Rand, root *RuleNode, feats Features, maxDepth int
 	// 6: NOT insert/remove (10%)
 	// 7: swap branches (10%)
 	// 8: prune (10%)
-	mutType := rng.Intn(9)
+	// PROBLEM A FIX: 9: simplify/remove constraint (NEW - for rate-aware mutation)
+	mutType := rng.Intn(10)
 
 	switch mutType {
 	case 0, 1, 2, 3: // leaf mutations (pick a random leaf)
@@ -317,7 +377,12 @@ func mutateRuleTree(rng *rand.Rand, root *RuleNode, feats Features, maxDepth int
 		}
 	case 4: // subtree replace
 		// pick a random node and replace it with new random subtree
-		newSubtree := randomRuleNode(rng, feats, 0, maxDepth)
+		var newSubtree *RuleNode
+		if ruleType == "exit" {
+			newSubtree = randomExitRuleNode(rng, feats, 0, maxDepth)
+		} else {
+			newSubtree = randomRuleNode(rng, feats, 0, maxDepth)
+		}
 		if rng.Float32() < 0.5 {
 			// replace root
 			return newSubtree
@@ -340,7 +405,8 @@ func mutateRuleTree(rng *rand.Rand, root *RuleNode, feats Features, maxDepth int
 			// insert NOT at random internal node
 			if !applyNOTInsert(rng, root) {
 				// fallback: wrap root in NOT
-				if root.Op != OpLeaf && root.Op != OpNot {
+				// CRITICAL FIX #2: Skip if root contains rare event leaves
+				if root.Op != OpLeaf && root.Op != OpNot && !containsRareEventLeaf(root) {
 					oldRoot := cloneRule(root)
 					return &RuleNode{Op: OpNot, L: oldRoot, R: nil}
 				}
@@ -380,8 +446,27 @@ func mutateRuleTree(rng *rand.Rand, root *RuleNode, feats Features, maxDepth int
 				}
 			}
 		}
+	case 9: // PROBLEM A FIX: simplify/remove constraint to increase entry rate
+		// For AND nodes, replace with one child (removes constraint)
+		// For NOT(AND), remove NOT to simplify
+		if !applySimplifyMutation(rng, root) {
+			// fallback: prune root to one child
+			if root.Op == OpAnd && root.L != nil && root.R != nil {
+				// Keep the simpler child (fewer nodes)
+				if countNodes(root.L) <= countNodes(root.R) {
+					return root.L
+				} else {
+					return root.R
+				}
+			} else if root.Op == OpNot && root.L != nil {
+				return root.L
+			}
+		}
 	}
 
+	// Simplify the tree by removing redundant patterns after mutation
+	// This cleans up things like (A AND A) -> A, (A AND True) -> A, NOT(NOT(A)) -> A
+	root = pruneRedundantNodes(root)
 	return root
 }
 
@@ -409,7 +494,26 @@ func applyOpFlip(rng *rand.Rand, node *RuleNode) bool {
 	return applyOpFlip(rng, node.R)
 }
 
+// Helper: check if a rule tree contains rare event leaves (Cross/Break)
+// These create "always true" when wrapped in NOT, producing 0 edges
+func containsRareEventLeaf(node *RuleNode) bool {
+	if node == nil {
+		return false
+	}
+	if node.Op == OpLeaf {
+		// Check if this is a rare event leaf
+		switch node.Leaf.Kind {
+		case LeafCrossUp, LeafCrossDown, LeafBreakUp, LeafBreakDown:
+			return true
+		}
+		return false
+	}
+	// Recursively check children
+	return containsRareEventLeaf(node.L) || containsRareEventLeaf(node.R)
+}
+
 // Helper: insert NOT at a random internal node
+// CRITICAL FIX #2: Skip NOT on rare event leaves to prevent "always true" rules
 func applyNOTInsert(rng *rand.Rand, node *RuleNode) bool {
 	if node == nil || node.Op == OpLeaf || node.Op == OpNot {
 		return false
@@ -419,13 +523,19 @@ func applyNOTInsert(rng *rand.Rand, node *RuleNode) bool {
 	if rng.Float32() < 0.3 {
 		// wrap this node's children with NOT
 		if rng.Float32() < 0.5 && node.L != nil {
-			oldL := node.L
-			node.L = &RuleNode{Op: OpNot, L: oldL, R: nil}
-			return true
+			// Skip if left child contains rare event leaves
+			if !containsRareEventLeaf(node.L) {
+				oldL := node.L
+				node.L = &RuleNode{Op: OpNot, L: oldL, R: nil}
+				return true
+			}
 		} else if node.R != nil {
-			oldR := node.R
-			node.R = &RuleNode{Op: OpNot, L: oldR, R: nil}
-			return true
+			// Skip if right child contains rare event leaves
+			if !containsRareEventLeaf(node.R) {
+				oldR := node.R
+				node.R = &RuleNode{Op: OpNot, L: oldR, R: nil}
+				return true
+			}
 		}
 	}
 
@@ -434,6 +544,47 @@ func applyNOTInsert(rng *rand.Rand, node *RuleNode) bool {
 		return true
 	}
 	return applyNOTInsert(rng, node.R)
+}
+
+// Helper: add a new constraint by AND-ing a new leaf into the tree
+func applyAddConstraint(rng *rand.Rand, node *RuleNode, newLeaf Leaf) bool {
+	if node == nil {
+		return false
+	}
+
+	// 30% chance to apply at this node
+	if rng.Float32() < 0.3 {
+		newNode := &RuleNode{Op: OpLeaf, Leaf: newLeaf}
+		if node.Op == OpLeaf {
+			// Wrap leaf with AND (old leaf AND new leaf)
+			old := cloneRule(node)
+			*node = RuleNode{Op: OpAnd, L: old, R: newNode}
+			return true
+		}
+		if node.L == nil {
+			node.L = newNode
+			return true
+		}
+		if node.R == nil {
+			node.R = newNode
+			return true
+		}
+		// AND the new leaf into a random side to add a constraint
+		if rng.Float32() < 0.5 {
+			old := cloneRule(node.L)
+			node.L = &RuleNode{Op: OpAnd, L: old, R: newNode}
+		} else {
+			old := cloneRule(node.R)
+			node.R = &RuleNode{Op: OpAnd, L: old, R: newNode}
+		}
+		return true
+	}
+
+	// try children
+	if applyAddConstraint(rng, node.L, newLeaf) {
+		return true
+	}
+	return applyAddConstraint(rng, node.R, newLeaf)
 }
 
 // Helper: remove NOT from a random location
@@ -543,8 +694,8 @@ func sanitizeCrossOperations(rng *rand.Rand, root *RuleNode, feats Features) int
 
 		if node.Op == OpLeaf {
 			leaf := &node.Leaf
-			// Check CrossUp and CrossDown leaves
-			if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown {
+			// Check CrossUp, CrossDown, BreakUp, and BreakDown leaves
+			if leaf.Kind == LeafCrossUp || leaf.Kind == LeafCrossDown || leaf.Kind == LeafBreakUp || leaf.Kind == LeafBreakDown {
 				// Validate feature indices
 				if leaf.A < 0 || leaf.A >= len(feats.Types) || leaf.B < 0 || leaf.B >= len(feats.Types) {
 					// Invalid indices - change to a safe leaf kind (Rising/Falling)
@@ -603,52 +754,83 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	child.ExitRule.Root = cloneRule(parent.ExitRule.Root)
 	child.RegimeFilter.Root = cloneRule(parent.RegimeFilter.Root)
 
-	// FIX #2: mutate 2–4 parts (was 1–3) for more diversity
+	// Balanced mutations: 2-4 parts with more useful complexity exploration
 	for i := 0; i < 2+rng.Intn(3); i++ {
-		switch rng.Intn(6) {
-		case 0:
-			child.EntryRule.Root = mutateRuleTree(rng, child.EntryRule.Root, feats, 4)
-		case 1:
-			child.ExitRule.Root = mutateRuleTree(rng, child.ExitRule.Root, feats, 3)
-		case 2:
-			child.RegimeFilter.Root = mutateRuleTree(rng, child.RegimeFilter.Root, feats, 2)
-		case 3:
-			// SL tweak - FIX #2: Larger steps for more diversity
+		// Balanced distribution:
+		// 0-19: 20% - Replace leaf/parameter (entry)
+		// 20-29: 10% - Replace leaf/parameter (exit)
+		// 30-39: 10% - Replace leaf/parameter (regime)
+		// 40-49: 10% - SL tweak
+		// 50-59: 10% - TP tweak
+		// 60-69: 10% - Replace subtree (same complexity)
+		// 70-79: 10% - Op flip (same complexity)
+		// 80-89: 10% - ADD constraint (increase complexity)
+		// 90-99: 10% - DELETE subtree (reduce complexity)
+		mutType := rng.Intn(100)
+
+		switch mutType {
+		case 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+			10, 11, 12, 13, 14, 15, 16, 17, 18, 19: // 20% - Replace leaf/parameter (entry)
+			child.EntryRule.Root = mutateRuleTree(rng, child.EntryRule.Root, feats, 4, "entry")
+		case 20, 21, 22, 23, 24, 25, 26, 27, 28, 29: // 10% - Replace leaf/parameter (exit)
+			child.ExitRule.Root = mutateRuleTree(rng, child.ExitRule.Root, feats, 3, "exit")
+		case 30, 31, 32, 33, 34, 35, 36, 37, 38, 39: // 10% - Replace leaf/parameter (regime)
+			child.RegimeFilter.Root = mutateRuleTree(rng, child.RegimeFilter.Root, feats, 2, "regime")
+		case 40, 41, 42, 43, 44, 45, 46, 47, 48, 49: // 10% - SL tweak
+			// SL tweak - Larger steps for more diversity
 			if child.StopLoss.Kind == "atr" {
-				child.StopLoss.ATRMult += float32(rng.NormFloat64() * 1.2)  // FIX #2: Increased from 0.3
+				child.StopLoss.ATRMult += float32(rng.NormFloat64() * 1.2)
 				if child.StopLoss.ATRMult < 4.0 {
-					child.StopLoss.ATRMult = 4.0  // FIX #2: Raised floor to match minimum
+					child.StopLoss.ATRMult = 4.0
 				}
-				if child.StopLoss.ATRMult > 14.0 {  // FIX #2: Raised ceiling
-					child.StopLoss.ATRMult = 14.0
+				if child.StopLoss.ATRMult > 10.0 { // CRITICAL FIX: Lowered ceiling to prevent high DD
+					child.StopLoss.ATRMult = 10.0
 				}
 			}
-		case 4:
-			// TP tweak - FIX #2: Larger steps for more diversity
+		case 50, 51, 52, 53, 54, 55, 56, 57, 58, 59: // 10% - TP tweak
+			// TP tweak - Larger steps for more diversity
 			if child.TakeProfit.Kind == "atr" {
-				child.TakeProfit.ATRMult += float32(rng.NormFloat64() * 2.0)  // FIX #2: Increased from 0.4
-				if child.TakeProfit.ATRMult < 8.0 {  // FIX #2: Raised floor
+				child.TakeProfit.ATRMult += float32(rng.NormFloat64() * 2.0)
+				if child.TakeProfit.ATRMult < 8.0 {
 					child.TakeProfit.ATRMult = 8.0
 				}
-				if child.TakeProfit.ATRMult > 30.0 {  // FIX #2: Raised ceiling
-					child.TakeProfit.ATRMult = 30.0
+				if child.TakeProfit.ATRMult > 20.0 { // CRITICAL FIX: Lowered ceiling to prevent extreme R:R
+					child.TakeProfit.ATRMult = 20.0 // FIX: Was 30.0, matches comment
 				}
 			}
-		case 5:
-			// trail toggle - ensure valid kind/params when enabling
-			child.Trail.Active = !child.Trail.Active
-			if child.Trail.Active {
-				// Ensure valid kind and params when activating trail
-				if child.Trail.Kind != "atr" && child.Trail.Kind != "swing" {
-					// Initialize with valid ATR trail if no valid kind
-					child.Trail.Kind = "atr"
-					child.Trail.ATRMult = 3.5 // Use looser default (was 2.5)
-				}
-				if child.Trail.Kind == "atr" && child.Trail.ATRMult <= 0 {
-					// Ensure valid ATR multiplier with looser default
-					child.Trail.ATRMult = 3.5 // Use looser default (was 2.5)
+		case 60, 61, 62, 63, 64, 65, 66, 67, 68, 69: // 10% - Replace subtree (same complexity)
+			// Replace random subtree with new random tree
+			// CRITICAL FIX: Use exit-specific subtree for exit rules to enforce meaningful exit signals
+			roll := rng.Float32()
+			if roll < 0.3 {
+				newSubtree := randomRuleNode(rng, feats, 0, 3)
+				child.EntryRule.Root = replaceRandomSubtree(rng, child.EntryRule.Root, newSubtree)
+			} else if roll < 0.6 {
+				newSubtree := randomExitRuleNode(rng, feats, 0, 3)
+				child.ExitRule.Root = replaceRandomSubtree(rng, child.ExitRule.Root, newSubtree)
+			} else {
+				newSubtree := randomRuleNode(rng, feats, 0, 3)
+				child.RegimeFilter.Root = replaceRandomSubtree(rng, child.RegimeFilter.Root, newSubtree)
+			}
+		case 70, 71, 72, 73, 74, 75, 76, 77, 78, 79: // 10% - Op flip (same complexity)
+			// Flip AND <-> OR at random internal node
+			if !applyOpFlip(rng, child.EntryRule.Root) {
+				if child.EntryRule.Root != nil && child.EntryRule.Root.Op == OpAnd {
+					child.EntryRule.Root.Op = OpOr
+				} else if child.EntryRule.Root != nil && child.EntryRule.Root.Op == OpOr {
+					child.EntryRule.Root.Op = OpAnd
 				}
 			}
+		case 80, 81, 82, 83, 84, 85, 86, 87, 88, 89: // 10% - ADD constraint (increase complexity)
+			newLeaf := randomEntryLeaf(rng, feats, true)
+			if child.EntryRule.Root == nil {
+				child.EntryRule.Root = &RuleNode{Op: OpLeaf, Leaf: newLeaf}
+			} else {
+				applyAddConstraint(rng, child.EntryRule.Root, newLeaf)
+			}
+		case 90, 91, 92, 93, 94, 95, 96, 97, 98, 99: // 10% - DELETE subtree (reduce complexity)
+			// Prune entry rule subtree
+			child.EntryRule.Root = pruneRandomSubtree(rng, child.EntryRule.Root)
 		}
 	}
 
@@ -670,7 +852,65 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	child.ExitCompiled = compileRuleTree(child.ExitRule.Root)
 	child.RegimeCompiled = compileRuleTree(child.RegimeFilter.Root)
 
+	// CRITICAL: Validate and repair entry rule after mutation
+	// Mutation can produce empty entry rules (e.g., prune deletes all nodes)
+	// This ensures every strategy has a valid entry rule that can open positions
+	if !validateAndRepairEntryRule(rng, &child, feats) {
+		// Repair failed - this strategy is broken, return parent instead
+		// (Don't waste population slots on dead strategies)
+		return parent
+	}
+
+	// Ensure regime filter remains non-empty and compilable
+	ensureRegimeFilterValid(rng, &child, feats)
+
 	return child
+}
+
+// pruneRandomSubtree removes a random internal node and replaces it with one of its children
+// This reduces tree complexity by removing a subtree
+func pruneRandomSubtree(rng *rand.Rand, root *RuleNode) *RuleNode {
+	if root == nil {
+		return nil
+	}
+
+	// Collect all internal nodes (non-leaf)
+	var internalNodes []*RuleNode
+	var collectInternal func(node *RuleNode)
+	collectInternal = func(node *RuleNode) {
+		if node == nil {
+			return
+		}
+		if node.Op != OpLeaf {
+			internalNodes = append(internalNodes, node)
+			collectInternal(node.L)
+			collectInternal(node.R)
+		}
+	}
+	collectInternal(root)
+
+	if len(internalNodes) == 0 {
+		// No internal nodes to prune, return as is
+		return root
+	}
+
+	// Pick random internal node to prune
+	target := internalNodes[rng.Intn(len(internalNodes))]
+
+	// Replace with one of its children (prefer left if both exist)
+	if target.L != nil && target.R == nil {
+		*target = *target.L
+	} else if target.R != nil && target.L == nil {
+		*target = *target.R
+	} else if target.L != nil && target.R != nil {
+		if rng.Float32() < 0.5 {
+			*target = *target.L
+		} else {
+			*target = *target.R
+		}
+	}
+
+	return root
 }
 
 func crossover(rng *rand.Rand, a, b Strategy, feats Features) Strategy {
@@ -722,6 +962,16 @@ func crossover(rng *rand.Rand, a, b Strategy, feats Features) Strategy {
 	child.ExitCompiled = compileRuleTree(child.ExitRule.Root)
 	child.RegimeCompiled = compileRuleTree(child.RegimeFilter.Root)
 
+	// CRITICAL: Validate and repair entry rule after crossover
+	// Crossover can produce empty entry rules if parent had nil entry
+	if !validateAndRepairEntryRule(rng, &child, feats) {
+		// Repair failed - return parent A as fallback
+		return a
+	}
+
+	// Ensure regime filter remains non-empty and compilable
+	ensureRegimeFilterValid(rng, &child, feats)
+
 	return child
 }
 
@@ -741,43 +991,45 @@ func bigMutation(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	for i := 0; i < numMutations; i++ {
 		switch rng.Intn(7) { // Added new case 6
 		case 0:
-			child.EntryRule.Root = mutateRuleTree(rng, child.EntryRule.Root, feats, 4)
+			child.EntryRule.Root = mutateRuleTree(rng, child.EntryRule.Root, feats, 4, "entry")
 		case 1:
-			child.ExitRule.Root = mutateRuleTree(rng, child.ExitRule.Root, feats, 3)
+			child.ExitRule.Root = mutateRuleTree(rng, child.ExitRule.Root, feats, 3, "exit")
 		case 2:
-			child.RegimeFilter.Root = mutateRuleTree(rng, child.RegimeFilter.Root, feats, 2)
+			child.RegimeFilter.Root = mutateRuleTree(rng, child.RegimeFilter.Root, feats, 2, "regime")
 		case 3:
 			// Big SL tweak - FIX #2: Larger jumps with proper minimums
+			// CRITICAL FIX: Capped SL ATRMult to [4.0, 10.0] to prevent 60%+ DD monsters
 			if child.StopLoss.Kind == "atr" {
-				child.StopLoss.ATRMult += float32(rng.NormFloat64() * 3.5)  // FIX #2: Increased from 2.5
-				if child.StopLoss.ATRMult < 4.0 {  // FIX #2: Raised floor to 4.0
+				child.StopLoss.ATRMult += float32(rng.NormFloat64() * 3.5) // FIX #2: Increased from 2.5
+				if child.StopLoss.ATRMult < 4.0 {                          // FIX #2: Raised floor to 4.0
 					child.StopLoss.ATRMult = 4.0
 				}
-				if child.StopLoss.ATRMult > 14.0 {  // FIX #2: Raised ceiling
-					child.StopLoss.ATRMult = 14.0
+				if child.StopLoss.ATRMult > 10.0 { // CRITICAL FIX: Lowered ceiling to prevent high DD
+					child.StopLoss.ATRMult = 10.0
 				}
 			} else if child.StopLoss.Kind == "fixed" {
-				child.StopLoss.Value += float32(rng.NormFloat64() * 4.0)  // FIX #2: Increased from 3.0
-				if child.StopLoss.Value < 4.0 {  // FIX #2: Raised floor to 4.0%
+				child.StopLoss.Value += float32(rng.NormFloat64() * 4.0) // FIX #2: Increased from 3.0
+				if child.StopLoss.Value < 4.0 {                          // FIX #2: Raised floor to 4.0%
 					child.StopLoss.Value = 4.0
 				}
-				if child.StopLoss.Value > 20.0 {
-					child.StopLoss.Value = 20.0
+				if child.StopLoss.Value > 10.0 { // CRITICAL FIX: Lowered max from 20% to 10% to reduce DD
+					child.StopLoss.Value = 10.0
 				}
 			}
 		case 4:
 			// Big TP tweak - FIX #2: Larger jumps with proper minimums
+			// CRITICAL FIX: Capped TP ATRMult to [8.0, 20.0] for better R:R ratios
 			if child.TakeProfit.Kind == "atr" {
-				child.TakeProfit.ATRMult += float32(rng.NormFloat64() * 4.0)  // FIX #2: Increased from 3.0
-				if child.TakeProfit.ATRMult < 8.0 {  // FIX #2: Raised floor to 8.0
+				child.TakeProfit.ATRMult += float32(rng.NormFloat64() * 4.0) // FIX #2: Increased from 3.0
+				if child.TakeProfit.ATRMult < 8.0 {                          // FIX #2: Raised floor to 8.0
 					child.TakeProfit.ATRMult = 8.0
 				}
-				if child.TakeProfit.ATRMult > 30.0 {  // FIX #2: Raised ceiling
-					child.TakeProfit.ATRMult = 30.0
+				if child.TakeProfit.ATRMult > 20.0 { // CRITICAL FIX: Lowered ceiling to prevent extreme R:R
+					child.TakeProfit.ATRMult = 20.0
 				}
 			} else if child.TakeProfit.Kind == "fixed" {
-				child.TakeProfit.Value += float32(rng.NormFloat64() * 8.0)  // FIX #2: Increased from 7.0
-				if child.TakeProfit.Value < 10.0 {  // FIX #2: Raised floor to 10%
+				child.TakeProfit.Value += float32(rng.NormFloat64() * 8.0) // FIX #2: Increased from 7.0
+				if child.TakeProfit.Value < 10.0 {                         // FIX #2: Raised floor to 10%
 					child.TakeProfit.Value = 10.0
 				}
 				if child.TakeProfit.Value > 50.0 {
@@ -796,11 +1048,25 @@ func bigMutation(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 					// Convert to fixed
 					child.StopLoss.Kind = "fixed"
 					child.StopLoss.Value = child.StopLoss.ATRMult * 3.0 // Rough conversion
+					// CRITICAL FIX: Clamp converted value to prevent Fixed SL > 10%
+					if child.StopLoss.Value > 10.0 {
+						child.StopLoss.Value = 10.0
+					}
+					if child.StopLoss.Value < 4.0 {
+						child.StopLoss.Value = 4.0
+					}
 					child.StopLoss.ATRMult = 0
 				} else if child.StopLoss.Kind == "fixed" {
 					// Convert to ATR
 					child.StopLoss.Kind = "atr"
 					child.StopLoss.ATRMult = child.StopLoss.Value / 3.0 // Rough conversion
+					// Clamp converted ATR to [4.0, 10.0]
+					if child.StopLoss.ATRMult > 10.0 {
+						child.StopLoss.ATRMult = 10.0
+					}
+					if child.StopLoss.ATRMult < 4.0 {
+						child.StopLoss.ATRMult = 4.0
+					}
 					child.StopLoss.Value = 0
 				}
 			} else {
@@ -830,5 +1096,76 @@ func bigMutation(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	child.ExitCompiled = compileRuleTree(child.ExitRule.Root)
 	child.RegimeCompiled = compileRuleTree(child.RegimeFilter.Root)
 
+	// CRITICAL: Validate and repair entry rule after big mutation
+	// Big mutation can drastically change rules, potentially emptying entry
+	if !validateAndRepairEntryRule(rng, &child, feats) {
+		// Repair failed - return parent as fallback
+		return parent
+	}
+
+	// Ensure regime filter remains non-empty and compilable
+	ensureRegimeFilterValid(rng, &child, feats)
+
 	return child
+}
+
+// PROBLEM A FIX: applySimplifyMutation removes constraints to increase entry rate
+// For AND(A, B), returns either A or B (removes one constraint)
+// For NOT(X), returns X (removes negation)
+func applySimplifyMutation(rng *rand.Rand, root *RuleNode) bool {
+	if root == nil {
+		return false
+	}
+
+	// Collect all AND and NOT nodes in the tree
+	type NodePath struct {
+		node   **RuleNode
+		parent **RuleNode
+		isLeft bool
+	}
+	var andNodes []NodePath
+	var notNodes []NodePath
+
+	var walk func(node **RuleNode, parent **RuleNode, isLeft bool)
+	walk = func(node **RuleNode, parent **RuleNode, isLeft bool) {
+		if *node == nil {
+			return
+		}
+		if (*node).Op == OpAnd {
+			andNodes = append(andNodes, NodePath{node: node, parent: parent, isLeft: isLeft})
+		} else if (*node).Op == OpNot {
+			notNodes = append(notNodes, NodePath{node: node, parent: parent, isLeft: isLeft})
+		}
+		walk(&(*node).L, node, true)
+		walk(&(*node).R, node, false)
+	}
+	walk(&root, nil, false)
+
+	// Prefer simplifying AND nodes (removes constraints)
+	if len(andNodes) > 0 && rng.Float32() < 0.7 {
+		// Pick a random AND node and replace with one of its children
+		target := andNodes[rng.Intn(len(andNodes))]
+		andNode := *target.node
+		if andNode.L != nil && andNode.R != nil {
+			// Keep the simpler child (fewer nodes = higher entry rate)
+			if countNodes(andNode.L) <= countNodes(andNode.R) {
+				*target.node = andNode.L
+			} else {
+				*target.node = andNode.R
+			}
+			return true
+		}
+	}
+
+	// Fallback: remove NOT negations
+	if len(notNodes) > 0 {
+		target := notNodes[rng.Intn(len(notNodes))]
+		notNode := *target.node
+		if notNode.L != nil {
+			*target.node = notNode.L
+			return true
+		}
+	}
+
+	return false
 }

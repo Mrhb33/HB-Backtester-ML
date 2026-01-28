@@ -178,10 +178,10 @@ func evaluateCompiled(code []ByteCode, features [][]float32, t int) bool {
 
 			kind := LeafKind(instr.Kind)
 
-			// For CrossUp/CrossDown, validate and fetch B
+			// For CrossUp/CrossDown/BreakUp/BreakDown, validate and fetch B
 			fa := features[instr.A]
 			var fb []float32
-			if kind == LeafCrossUp || kind == LeafCrossDown {
+			if kind == LeafCrossUp || kind == LeafCrossDown || kind == LeafBreakUp || kind == LeafBreakDown {
 				if instr.B < 0 || int(instr.B) >= len(features) {
 					// Invalid feature B index - return false
 					if sp >= len(stack) {
@@ -313,6 +313,26 @@ func evaluateCompiled(code []ByteCode, features [][]float32, t int) bool {
 						prevB := fb[t-1]
 						result = (prevA >= prevB) && (fa[t] < bVal)
 					}
+				}
+			case LeafBreakUp:
+				// BreakUp: A[t-1] <= B[t-1] && A[t] > B[t] (no movement requirement)
+				if t < 1 {
+					result = false
+				} else {
+					prevA := fa[t-1]
+					prevB := fb[t-1]
+					bVal := fb[t]
+					result = (prevA <= prevB) && (fa[t] > bVal)
+				}
+			case LeafBreakDown:
+				// BreakDown: A[t-1] >= B[t-1] && A[t] < B[t] (no movement requirement)
+				if t < 1 {
+					result = false
+				} else {
+					prevA := fa[t-1]
+					prevB := fb[t-1]
+					bVal := fb[t]
+					result = (prevA >= prevB) && (fa[t] < bVal)
 				}
 			case LeafRising:
 				lb := int(instr.Lookback)
@@ -466,13 +486,13 @@ func evaluateLeavesDebug(code []ByteCode, features [][]float32, t int) []bool {
 				continue
 			}
 			fb := features[instr.B]
-			bVal := fb[t]
-			prevA := float32(0)
-			prevB := float32(0)
-			if t >= 1 {
-				prevA = fa[t-1]
-				prevB = fb[t-1]
+			if t < 1 || t >= len(fa) || t >= len(fb) {
+				results = append(results, false)
+				continue
 			}
+			bVal := fb[t]
+			prevA := fa[t-1]
+			prevB := fb[t-1]
 			// CRITICAL FIX #1: Prevent fake CrossUp when one series is constant/zero
 			// Epsilon check: require actual movement in BOTH series (use abs!)
 			const eps = 1e-6
@@ -498,13 +518,13 @@ func evaluateLeavesDebug(code []ByteCode, features [][]float32, t int) []bool {
 				continue
 			}
 			fb := features[instr.B]
-			bVal := fb[t]
-			prevA := float32(0)
-			prevB := float32(0)
-			if t >= 1 {
-				prevA = fa[t-1]
-				prevB = fb[t-1]
+			if t < 1 || t >= len(fa) || t >= len(fb) {
+				results = append(results, false)
+				continue
 			}
+			bVal := fb[t]
+			prevA := fa[t-1]
+			prevB := fb[t-1]
 			// CRITICAL FIX #1: Prevent fake CrossDown when one series is constant/zero
 			// Epsilon check: require actual movement in BOTH series (use abs!)
 			const eps = 1e-6
@@ -524,6 +544,34 @@ func evaluateLeavesDebug(code []ByteCode, features [][]float32, t int) []bool {
 				// Require both sides straddle (real crossing)
 				result = (prevA >= prevB) && (fa[t] < bVal)
 			}
+		case LeafBreakUp:
+			if instr.B < 0 || int(instr.B) >= len(features) {
+				results = append(results, false)
+				continue
+			}
+			fb := features[instr.B]
+			if t < 1 || t >= len(fa) || t >= len(fb) {
+				results = append(results, false)
+				continue
+			}
+			prevA := fa[t-1]
+			prevB := fb[t-1]
+			bVal := fb[t]
+			result = (prevA <= prevB) && (fa[t] > bVal)
+		case LeafBreakDown:
+			if instr.B < 0 || int(instr.B) >= len(features) {
+				results = append(results, false)
+				continue
+			}
+			fb := features[instr.B]
+			if t < 1 || t >= len(fa) || t >= len(fb) {
+				results = append(results, false)
+				continue
+			}
+			prevA := fa[t-1]
+			prevB := fb[t-1]
+			bVal := fb[t]
+			result = (prevA >= prevB) && (fa[t] < bVal)
 		case LeafRising:
 			lb := int(instr.Lookback)
 			if lb > 0 && t >= lb {
@@ -547,15 +595,15 @@ func evaluateLeavesDebug(code []ByteCode, features [][]float32, t int) []bool {
 // CrossDebugInfo holds detailed information about a cross evaluation for debugging
 type CrossDebugInfo struct {
 	LeafIndex int
-	Kind      string    // "CrossUp" or "CrossDown"
-	FeatAName string    // Name of feature A
-	FeatBName string    // Name of feature B
-	PrevA     float32   // A[t-1]
-	PrevB     float32   // B[t-1]
-	CurA      float32   // A[t]
-	CurB      float32   // B[t]
-	Result    bool      // Final result
-	IsCorrect bool      // true if the cross logic is correct
+	Kind      string  // "CrossUp" or "CrossDown"
+	FeatAName string  // Name of feature A
+	FeatBName string  // Name of feature B
+	PrevA     float32 // A[t-1]
+	PrevB     float32 // B[t-1]
+	CurA      float32 // A[t]
+	CurB      float32 // B[t]
+	Result    bool    // Final result
+	IsCorrect bool    // true if the cross logic is correct
 }
 
 // evaluateCrossDebug evaluates all CrossUp/CrossDown leaves and returns detailed debug info
