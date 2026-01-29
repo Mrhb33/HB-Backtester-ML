@@ -76,14 +76,23 @@ func LogGenTypes(immigrant, heavyMut, cross, normalMut int64) {
 }
 
 // LogBatchProgress - batch completion progress
-func LogBatchProgress(batchID int64, tested uint64, trainScore, valScore float32, trainReturn, valReturn, winRate float32,
-	trades int, rate float64, elapsed time.Duration, fingerprint string) {
-	fmt.Printf("%s  %s  Batch %d: Tested %d | Train: %s | batchValScore: %s | Ret: %s | WR: %s | Trds: %d | Rate: %.0f/s | Runtime: %s | fp: %s\n",
+func LogBatchProgress(batchID int64, tested uint64, trainScore, valScore float32, trainReturn, valReturn, valGeoAvgMonthly, valMedian, winRate float32,
+	trades int, oosMonths int, rate float64, elapsed time.Duration, fingerprint string) {
+	// Format GeoAvg and Median as "n/a" when OOS wasn't computed (oosMonths == 0)
+	// This prevents confusing "0.00 because not computed" with "0.00 because performance is flat"
+	geoAvgStr := ReturnColor(valGeoAvgMonthly)
+	medianStr := MedianColor(valMedian)
+	if oosMonths == 0 {
+		geoAvgStr = C(gray, "n/a")
+		medianStr = C(gray, "n/a")
+	}
+
+	fmt.Printf("%s  %s  Batch %d: Tested %d | Train: %s | batchValScore: %s | Ret: %s | GeoAvg: %s | Median: %s | WR: %s | Trds: %d | Rate: %.0f/s | Runtime: %s | fp: %s\n",
 		C(gray, time.Now().UTC().Format("15:04:05Z")),
 		Channel("PROG"),
 		batchID, tested,
 		ScoreColor(trainScore), ScoreColor(valScore),
-		ReturnColor(valReturn), WinRateColor(winRate),
+		ReturnColor(valReturn), geoAvgStr, medianStr, WinRateColor(winRate),
 		trades, rate, formatDuration(elapsed), fingerprint,
 	)
 }
@@ -209,18 +218,18 @@ type MetricsSnapshot struct {
 	BestProfitFact float32
 
 	// Progress metrics
-	Tested       int64
-	Rate         float64
-	Elites       int
-	Generation   int64
+	Tested     int64
+	Rate       float64
+	Elites     int
+	Generation int64
 
 	// Rejection metrics (last N strategies)
-	RejSeen      float64
-	RejNovelty   float64
-	RejSur       float64
+	RejSeen    float64
+	RejNovelty float64
+	RejSur     float64
 
 	// Runtime
-	Elapsed      time.Duration
+	Elapsed time.Duration
 }
 
 // LogMetricsDashboard - comprehensive metrics summary dashboard

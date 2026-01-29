@@ -157,7 +157,7 @@ func convertSimpleToStrategy(simpleSt SimpleStrategy, f Features) Strategy {
 		Seed:        12345,
 		FeeBps:      simpleSt.FeeBps,
 		SlippageBps: simpleSt.SlippageBps,
-		RiskPct:     0.01,
+		RiskPct:     1.0,
 		Direction:   simpleSt.Direction,
 		EntryRule:   RuleTree{Root: entryNode},
 		EntryCompiled: compileRuleTree(entryNode),

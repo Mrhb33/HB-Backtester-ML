@@ -56,12 +56,12 @@ var globalTimeframeMinutes int32 = 5
 
 // Generator loop counters (atomic for thread safety)
 var (
-	genGenerated      int64 // Total strategies generated
-	genRejectedSur    int64 // Rejected by surrogate
+	genGenerated       int64 // Total strategies generated
+	genRejectedSur     int64 // Rejected by surrogate
 	genRejectedSeen    int64 // Rejected by markSeen (duplicate) - DEPRECATED, use seenHits/seenNew instead
 	genRejectedNovelty int64 // Rejected by novelty pressure (too similar to recent)
-	genRerolled       int64 // Strategies that were rerolled from seen to unseen
-	genSentToJobs     int64 // Sent to worker jobs
+	genRerolled        int64 // Strategies that were rerolled from seen to unseen
+	genSentToJobs      int64 // Sent to worker jobs
 	// EXACT counters for seen tracking - call CheckAndSet exactly once per final candidate
 	seenHits int64 // CheckAndSet returned false (already existed)
 	seenNew  int64 // CheckAndSet returned true (new insert)
@@ -141,27 +141,27 @@ type BatchMsg struct {
 }
 
 type EliteLog struct {
-	Seed         int64   `json:"seed"`
-	FeeBps       float32 `json:"fee_bps"`
-	SlippageBps  float32 `json:"slippage_bps"`
-	Direction    int     `json:"direction"`
-	StopLoss     string  `json:"stop_loss"`
-	TakeProfit   string  `json:"take_profit"`
-	Trail        string  `json:"trail"`
-	EntryRule    string  `json:"entry_rule"`
-	ExitRule     string  `json:"exit_rule"`
-	RegimeFilter string  `json:"regime_filter"`
-	FeatureMapHash string `json:"feature_map_hash,omitempty"` // Feature ordering fingerprint
-	TrainScore   float32 `json:"train_score"`
-	TrainReturn  float32 `json:"train_return"`
-	TrainMaxDD   float32 `json:"train_max_dd"`
-	TrainWinRate float32 `json:"train_win_rate"`
-	TrainTrades  int     `json:"train_trades"`
-	ValScore     float32 `json:"val_score"`
-	ValReturn    float32 `json:"val_return"`
-	ValMaxDD     float32 `json:"val_max_dd"`
-	ValWinRate   float32 `json:"val_win_rate"`
-	ValTrades    int     `json:"val_trades"`
+	Seed           int64   `json:"seed"`
+	FeeBps         float32 `json:"fee_bps"`
+	SlippageBps    float32 `json:"slippage_bps"`
+	Direction      int     `json:"direction"`
+	StopLoss       string  `json:"stop_loss"`
+	TakeProfit     string  `json:"take_profit"`
+	Trail          string  `json:"trail"`
+	EntryRule      string  `json:"entry_rule"`
+	ExitRule       string  `json:"exit_rule"`
+	RegimeFilter   string  `json:"regime_filter"`
+	FeatureMapHash string  `json:"feature_map_hash,omitempty"` // Feature ordering fingerprint
+	TrainScore     float32 `json:"train_score"`
+	TrainReturn    float32 `json:"train_return"`
+	TrainMaxDD     float32 `json:"train_max_dd"`
+	TrainWinRate   float32 `json:"train_win_rate"`
+	TrainTrades    int     `json:"train_trades"`
+	ValScore       float32 `json:"val_score"`
+	ValReturn      float32 `json:"val_return"`
+	ValMaxDD       float32 `json:"val_max_dd"`
+	ValWinRate     float32 `json:"val_win_rate"`
+	ValTrades      int     `json:"val_trades"`
 }
 
 type ReportLine struct {
@@ -300,6 +300,8 @@ func main() {
 	wfTestDays := flag.Int("wf_test_days", 90, "walk-forward test window size in days")
 	wfStepDays := flag.Int("wf_step_days", 60, "walk-forward step size in days")
 	wfMinTradesOOS := flag.Int("wf_min_trades_oos", 30, "minimum total trades in OOS period")
+	// QuickTest validation flags
+	qtMinTrades := flag.Int("qt_min_trades", 5, "QuickTest minimum trades threshold")
 	wfMaxDD := flag.Float64("wf_max_dd", 0.70, "maximum drawdown allowed (0-1)")
 	wfMaxSparseMonthsRatio := flag.Float64("wf_max_sparse_months_ratio", 0.80, "maximum ratio of sparse months to total months")
 	wfMinActiveMonthsRatio := flag.Float64("wf_min_active_months_ratio", 0.25, "minimum ratio of active months to total months")
@@ -307,11 +309,21 @@ func main() {
 	wfMinMonth := flag.Float64("wf_min_month", -0.35, "minimum monthly return threshold")
 	wfMinMedianMonthly := flag.Float64("wf_min_median_monthly", 0.003, "minimum median monthly return")
 	wfMinGeoMonthly := flag.Float64("wf_min_geo_monthly", 0.005, "minimum geometric average monthly return")
-	wfMinEdgesPerYear := flag.Float64("wf_min_edges_per_year", 0.03, "minimum edges per year threshold")
-	wfFoldMinEdgesPerYear := flag.Float64("wf_fold_min_edges_per_year", 0, "minimum edges per year per-fold threshold")
+	// FIX PROBLEM B: Increased from 0.03 to 30.0 to prevent zero-trade OOS rejections
+	// 0.03 was way too low and allowed "dead" strategies through that never trade in OOS
+	// 30 edges/year = ~2.5 trades/month minimum for statistical significance
+	wfMinEdgesPerYear := flag.Float64("wf_min_edges_per_year", 30.0, "minimum edges per year threshold (FIX: increased from 0.03 to reduce zero-trade OOS)")
+	// FIX PROBLEM B: Enable per-fold edge gate with meaningful threshold
+	// Was 0 (disabled), now set to 15.0 to ensure each fold has minimum trading activity
+	// This prevents strategies that only trade in 1-2 folds from passing
+	wfFoldMinEdgesPerYear := flag.Float64("wf_fold_min_edges_per_year", 15.0, "minimum edges per year per-fold threshold (FIX: increased from 0 to reduce sparse fold rejections)")
 	wfDDLambda := flag.Float64("wf_dd_lambda", 0.008, "drawdown penalty lambda")
 	wfVolLambda := flag.Float64("wf_vol_lambda", 0.004, "volatility penalty lambda")
 	_ = flag.Float64("target_geo_monthly", 0.12, "target geometric monthly return for scoring (reserved for future use)")
+	minValReturnFlag := flag.Float64("min_val_return", 0.01, "minimum validation return threshold")
+	minValPFFlag := flag.Float64("min_val_pf", 1.01, "minimum validation portfolio factor")
+	maxValDDFlag := flag.Float64("max_val_dd", 0.45, "maximum validation drawdown")
+	autoAdjust := flag.Bool("auto_adjust", false, "Enable automatic tightening of validation gates during search")
 	flag.Parse()
 
 	// Parse timeframe (e.g., "5m", "15m", "60m" OR "1h", "4h")
@@ -329,12 +341,12 @@ func main() {
 
 	// Set walk-forward configuration from flags
 	wfConfig = WFConfig{
-		Enable:           *wfEnable,
-		TrainDays:        *wfTrainDays,
-		TestDays:         *wfTestDays,
-		StepDays:         *wfStepDays,
-		MinFolds:         3,
-		MinTradesPerFold: 10,
+		Enable:                   *wfEnable,
+		TrainDays:                *wfTrainDays,
+		TestDays:                 *wfTestDays,
+		StepDays:                 *wfStepDays,
+		MinFolds:                 3,
+		MinTradesPerFold:         10,
 		MinMonths:                3,
 		MinTotalTradesOOS:        *wfMinTradesOOS,
 		MinTradesPerMonth:        2,
@@ -376,12 +388,12 @@ func main() {
 
 	// Auto-reduce friction in recovery mode ONLY if not explicitly set
 	if RecoveryMode.Load() {
-		if !feeBpsWasSet && *feeBpsFlag == 30 {  // Default value
+		if !feeBpsWasSet && *feeBpsFlag == 30 { // Default value
 			feeBps = float32(5)
 			fmt.Println("[RECOVERY] Fee auto-reduced to 5 bps (was 30)")
 			fmt.Println("[RECOVERY] Override with explicit -fee_bps flag")
 		}
-		if !slipBpsWasSet && *slipBpsFlag == 8 {  // Default value
+		if !slipBpsWasSet && *slipBpsFlag == 8 { // Default value
 			slipBps = float32(5)
 			fmt.Println("[RECOVERY] Slippage auto-reduced to 5 bps (was 8)")
 			fmt.Println("[RECOVERY] Override with explicit -slip_bps flag")
@@ -409,19 +421,19 @@ func main() {
 	var minValTrades int
 	if *scoringMode == "aggressive" {
 		// Aggressive mode: stricter profit gates, looser DD to encourage exploration
-		maxValDD = 0.60       // Allow higher drawdown
-		minValReturn = 0.0    // TEMP warm-start: allow any return
-		minValPF = 1.0        // TEMP warm-start: relaxed profit factor
-		minValExpect = 0.0    // TEMP warm-start: allow any expectancy
-		minValTrades = 20     // TEMP warm-start: 20 trades until elites exist, then 30
+		maxValDD = float32(*maxValDDFlag)
+		minValReturn = float32(*minValReturnFlag)
+		minValPF = float32(*minValPFFlag)
+		minValExpect = 0.0 // TEMP warm-start: allow any expectancy
+		minValTrades = 20  // TEMP warm-start: 20 trades until elites exist, then 30
 		fmt.Printf("Scoring mode: AGGRESSIVE (DD<%.2f, ret>%.1f%%, pf>%.2f, exp>%.4f) [WARM-START]\n", maxValDD, minValReturn*100, minValPF, minValExpect)
 	} else {
 		// Balanced mode (default): balanced gates for stability and exploration
-		maxValDD = 0.45        // Tighter drawdown limit
-		minValReturn = 0.0     // TEMP warm-start: allow any return
-		minValPF = 1.0         // TEMP warm-start: relaxed profit factor
-		minValExpect = 0.0     // TEMP warm-start: allow any expectancy
-		minValTrades = 20      // TEMP warm-start: 20 trades until elites exist, then 30
+		maxValDD = float32(*maxValDDFlag)
+		minValReturn = float32(*minValReturnFlag)
+		minValPF = float32(*minValPFFlag)
+		minValExpect = 0.0 // TEMP warm-start: allow any expectancy
+		minValTrades = 20  // TEMP warm-start: 20 trades until elites exist, then 30
 		fmt.Printf("Scoring mode: BALANCED (DD<%.2f, ret>%.1f%%, pf>%.2f, exp>%.4f) [WARM-START]\n", maxValDD, minValReturn*100, minValPF, minValExpect)
 	}
 
@@ -609,13 +621,13 @@ func main() {
 
 	// Track passed validations for adaptive criteria
 	var passedCount int64
-	var validatedLabels int64    // Track number of validation labels for surrogate training
+	var validatedLabels int64       // Track number of validation labels for surrogate training
 	var bestValSeen float32 = -1e30 // Track best validation score seen (init to very low for bootstrap)
-	var bestValSeenMu sync.Mutex // Protect bestValSeen for thread-safe access
+	var bestValSeenMu sync.Mutex    // Protect bestValSeen for thread-safe access
 
 	// Anti-stagnation tracking (thread-safe)
-	var radicalP float32 = 0.10    // base radical mutation probability
-	var surExploreP float32 = 0.10 // base surrogate exploration
+	var radicalP float32 = 0.10     // base radical mutation probability
+	var surExploreP float32 = 0.10  // base surrogate exploration
 	var surThreshold float64 = -0.5 // surrogate filtering threshold - start more aggressive to filter junk early
 	var lastBestValScore float32 = -1e30
 	var batchesSinceLastImprovement int
@@ -749,7 +761,7 @@ func main() {
 			for _, se := range cp.ArchiveElites {
 				e, err := slimToElite(se, rng, &feats)
 				if err != nil {
-					continue  // Skip invalid elites
+					continue // Skip invalid elites
 				}
 				archive.Add(e.Val, e)
 				archiveLoaded++
@@ -918,16 +930,15 @@ func main() {
 		archive.mu.RUnlock()
 
 		cp := Checkpoint{
-			Seed:             seed,
-			PassedCount:      atomic.LoadInt64(&passedCount),
-			ValidatedLabels:  atomic.LoadInt64(&validatedLabels),
-			BestValSeen:      func() float32 { bestValSeenMu.Lock(); defer bestValSeenMu.Unlock(); return bestValSeen }(),
-			HOFElites:        snapshotHOFSlim(hof),
-			ArchiveElites:    archiveSlim,
-			SeenFingerprints: seenList,
-			FeatureMapHash:   ComputeFeatureMapHash(feats),
+			Seed:              seed,
+			PassedCount:       atomic.LoadInt64(&passedCount),
+			ValidatedLabels:   atomic.LoadInt64(&validatedLabels),
+			BestValSeen:       func() float32 { bestValSeenMu.Lock(); defer bestValSeenMu.Unlock(); return bestValSeen }(),
+			HOFElites:         snapshotHOFSlim(hof),
+			ArchiveElites:     archiveSlim,
+			SeenFingerprints:  seenList,
+			FeatureMapHash:    ComputeFeatureMapHash(feats),
 			FeatureMapVersion: GetFeatureMapVersion(feats),
-
 		}
 		// Print rejection stats before checkpointing
 		printRejectionStats()
@@ -1026,7 +1037,7 @@ func main() {
 					Seed:        rng.Int63(),
 					FeeBps:      log.FeeBps,
 					SlippageBps: log.SlippageBps,
-					RiskPct:     0.01,
+					RiskPct:     1.0,
 					Direction:   log.Direction, // Preserve original direction for consistency
 					EntryRule: RuleTree{
 						Root: parseRuleTree(log.EntryRule),
@@ -1037,9 +1048,9 @@ func main() {
 					RegimeFilter: RuleTree{
 						Root: parseRuleTree(log.RegimeFilter),
 					},
-					StopLoss:        parseStopModel(log.StopLoss),
-					TakeProfit:      parseTPModel(log.TakeProfit),
-					Trail:           parseTrailModel(log.Trail),
+					StopLoss:         parseStopModel(log.StopLoss),
+					TakeProfit:       parseTPModel(log.TakeProfit),
+					Trail:            parseTrailModel(log.Trail),
 					VolatilityFilter: VolFilterModel{Enabled: false}, // Default disabled for old strategies
 				}
 
@@ -1111,8 +1122,8 @@ func main() {
 
 	// Track recent fingerprints for novelty pressure (penalize too-similar children)
 	// This reduces the duplicate storm by rejecting strategies too similar to recent ones
-	const recentFingerprintsWindow = 5000 // Track last 5000 generated fingerprints
-	var recentFingerprints = make(map[string]int)   // fingerprint -> count
+	const recentFingerprintsWindow = 5000         // Track last 5000 generated fingerprints
+	var recentFingerprints = make(map[string]int) // fingerprint -> count
 	var recentFingerprintsMu sync.RWMutex
 	var totalRecentFingerprints int64 = 0
 
@@ -1198,7 +1209,7 @@ func main() {
 				}
 
 				// tighten gently if pass rate is too high (means your gate is too easy)
-				if passRate > 0.03 { // 3% passing is "too easy" in big search
+				if *autoAdjust && passRate > 0.03 { // 3% passing is "too easy" in big search
 					oldReturn := minValReturn
 					oldPF := minValPF
 					oldDD := maxValDD
@@ -1227,8 +1238,8 @@ func main() {
 				stagnationMu.Unlock()
 				logx.LogMetaStagnate(batchesNoImprove, oldRadical, radicalP, oldSurExplore, surExploreP, passRate)
 
-				// If pass rate is basically zero, gate is too strict -> loosen a bit
-				if passRate < 0.002 { // <0.2%
+				// If pass rate is basically zero, gate is too strict -> loosen a bit (disable with -auto_adjust=false)
+				if *autoAdjust && passRate < 0.002 { // <0.2%
 					oldReturn := minValReturn
 					oldPF := minValPF
 					oldDD := maxValDD
@@ -1441,6 +1452,7 @@ func main() {
 					var bestTrainResult Result
 					var bestPassesValidation bool
 					var bestQuickTestR Result // Track best quick test result for reporting
+					bestQuickTestR.Score = -1e30
 
 					// Diversity selection: top 10 by score + 10 diverse fingerprints
 					// This reduces overfitting to one "family" of strategies
@@ -1661,12 +1673,12 @@ func main() {
 						} else if elitesCount < recoveryThreshold {
 							// RECOVERY MODE (10-19 elites): Accept based on train, bypass VAL profit gates
 							// Check: VAL DD + VAL trades, train score + train return
-							recoveryValOK := valR.MaxDD < 0.65 && valR.Trades >= 15  // Basic VAL sanity
-							recoveryTrainOK := candidate.Score > -20.0 || candidate.Return > -0.10  // Train not terrible
+							recoveryValOK := valR.MaxDD < 0.65 && valR.Trades >= 15                // Basic VAL sanity
+							recoveryTrainOK := candidate.Score > -20.0 || candidate.Return > -0.10 // Train not terrible
 
 							if recoveryValOK && recoveryTrainOK {
-								passesValidation = false  // Don't use normal validation path
-								isPreElite = true  // Mark for special handling below
+								passesValidation = false // Don't use normal validation path
+								isPreElite = true        // Mark for special handling below
 								skipCPCV = true
 								fmt.Printf("[PRE-ELITE] train_score=%.2f train_ret=%.2f%% val_trades=%d val_dd=%.2f%%\n",
 									candidate.Score, candidate.Return*100, valR.Trades, valR.MaxDD*100)
@@ -1802,53 +1814,58 @@ func main() {
 								}
 							}
 
-							// CRITICAL FIX: Disable QuickTest entirely until elites > 0
-							// QuickTest with Trds=0 is common early and shouldn't veto candidates
-							quickTestProfitOK := true // Assume passes during bootstrap
+							// CRITICAL FIX: Always compute QuickTest for reporting, but only enforce gates after elites exist
+							// This avoids "REJECTED / 0 trades" display when QuickTest is intentionally skipped.
+							quickTestProfitOK := true // Default: don't veto during bootstrap
+
+							// Use first 25% of test window as "quick test" to filter out obvious failures
+							quickTestEnd := testW.Start + (testW.End-testW.Start)/4
+							if quickTestEnd > testW.End {
+								quickTestEnd = testW.End
+							}
+							quickTestW := Window{
+								Start:  testW.Start,
+								End:    quickTestEnd,
+								Warmup: testW.Warmup,
+							}
+
+							// DEBUG: Print window info before evaluation
+							windowCandles := quickTestEnd - testW.Start
+							firstCandleTime := int64(0)
+							if testW.Start < len(series.OpenTimeMs) {
+								firstCandleTime = series.OpenTimeMs[testW.Start]
+							}
+							fmt.Printf("[QuickTest-DEBUG] window=[%d:%d] candles=%d first_candle_ts=%d\n",
+								testW.Start, quickTestEnd, windowCandles, firstCandleTime)
+
+							quickTestR := evaluateStrategyWindow(series, feats, candidate.Strategy, quickTestW)
+
+							// DEBUG: Print result after evaluation
+							fmt.Printf("[QuickTest-DEBUG] result: trades=%d return=%.4f pf=%.2f score=%.4f\n",
+								quickTestR.Trades, quickTestR.Return, quickTestR.ProfitFactor, quickTestR.Score)
+
+							// Track best quick test result for reporting (best score among all candidates)
+							if quickTestR.Score > bestQuickTestR.Score {
+								bestQuickTestR = quickTestR
+							}
+
+							// Only ENFORCE QuickTest gates after elites exist
 							if elitesCount > 0 {
-								// Only run QuickTest after we have at least one elite
-								// Use first 25% of test window as "quick test" to filter out obvious failures
-								quickTestEnd := testW.Start + (testW.End-testW.Start)/4
-								if quickTestEnd > testW.End {
-									quickTestEnd = testW.End
-								}
-								quickTestW := Window{
-									Start:  testW.Start,
-									End:    quickTestEnd,
-									Warmup: testW.Warmup,
-								}
-
-								// DEBUG: Print window info before evaluation
-								windowCandles := quickTestEnd - testW.Start
-								firstCandleTime := int64(0)
-								if testW.Start < len(series.OpenTimeMs) {
-									firstCandleTime = series.OpenTimeMs[testW.Start]
-								}
-								fmt.Printf("[QuickTest-DEBUG] window=[%d:%d] candles=%d first_candle_ts=%d\n",
-									testW.Start, quickTestEnd, windowCandles, firstCandleTime)
-
-								quickTestR := evaluateStrategyWindow(series, feats, candidate.Strategy, quickTestW)
-
-								// DEBUG: Print result after evaluation
-								fmt.Printf("[QuickTest-DEBUG] result: trades=%d return=%.4f pf=%.2f score=%.4f\n",
-									quickTestR.Trades, quickTestR.Return, quickTestR.ProfitFactor, quickTestR.Score)
-
-								// Track best quick test result for reporting (best score among all candidates)
-								if quickTestR.Score > bestQuickTestR.Score {
-									bestQuickTestR = quickTestR
-								}
-
+								// If -qt_min_trades=0, treat QuickTest as informational only (never reject)
+								if *qtMinTrades == 0 {
+									// quickTestProfitOK stays true (default), skip all gate enforcement
+								} else {
 								// BOOTSTRAP LADDER: Relax QuickTest during bootstrap (elites < 10)
 								// When elite pool is small, allow candidates with weaker QuickTest results
 								var minQuickTestTrades int
 								var minQuickTestReturn float32
 								if elitesCount < 10 {
 									// Relaxed QuickTest gates during bootstrap
-									minQuickTestTrades = 5  // Lower trade threshold for small test window
+									minQuickTestTrades = *qtMinTrades
 									minQuickTestReturn = -0.05 // Allow small loss during bootstrap
 								} else {
 									// Standard QuickTest gates once we have enough elites
-									minQuickTestTrades = 15
+									minQuickTestTrades = *qtMinTrades
 									minQuickTestReturn = 0.0
 								}
 
@@ -1857,8 +1874,25 @@ func main() {
 								if quickTestR.Trades > 0 {
 									// CRITICAL FIX: Require positive edge explicitly, not relative to minValReturn
 									// After elites exist, minValReturn could be 0.0, which doesn't protect against losing strategies
+
+									// FIX PROBLEM A: Reject "no-loss / one-trade" PF inflation
+									// PF=999 with 1 trade is NOT a robust strategy - it's statistical noise
+									// Require meaningful PF by checking both wins AND losses exist
+									minWinsLossesForPF := 3 // Need at least 3 wins AND 3 losses for meaningful PF
+									hasMeaningfulPF := true
+									if quickTestR.ProfitFactor >= 999.0 {
+										// Infinite PF cap hit - check if this is due to too few trades
+										// Compute approximate wins/losses from winrate
+										estimatedWins := int(float64(quickTestR.Trades) * float64(quickTestR.WinRate))
+										estimatedLosses := quickTestR.Trades - estimatedWins
+										if estimatedWins < minWinsLossesForPF || estimatedLosses < minWinsLossesForPF {
+											hasMeaningfulPF = false // Reject: not enough data for meaningful PF
+										}
+									}
+
 									quickTestProfitOK = quickTestR.Return >= minQuickTestReturn && // Use bootstrap-adjusted threshold
 										quickTestR.ProfitFactor >= 1.0 && // Must be profitable after costs
+										hasMeaningfulPF && // FIX A: Reject PF=999 with insufficient trades
 										quickTestR.Trades >= minQuickTestTrades && // Use bootstrap-adjusted threshold
 										quickTestR.MaxDD < maxValDD // Drawdown check
 								}
@@ -1873,6 +1907,14 @@ func main() {
 									if quickTestR.ProfitFactor < 1.0 {
 										reasons = append(reasons, fmt.Sprintf("QT_pf<%.2f", quickTestR.ProfitFactor))
 									}
+									// FIX PROBLEM A: Add logging for PF inflation rejection
+									if quickTestR.ProfitFactor >= 999.0 {
+										estimatedWins := int(float64(quickTestR.Trades) * float64(quickTestR.WinRate))
+										estimatedLosses := quickTestR.Trades - estimatedWins
+										if estimatedWins < 3 || estimatedLosses < 3 {
+											reasons = append(reasons, fmt.Sprintf("QT_pf_inflated_wins=%d_losses=%d", estimatedWins, estimatedLosses))
+										}
+									}
 									if quickTestR.Trades < minQuickTestTrades {
 										reasons = append(reasons, fmt.Sprintf("QT_trds<%d", minQuickTestTrades))
 									}
@@ -1883,6 +1925,7 @@ func main() {
 									fmt.Printf("[NEAR-MISS-QT] val_score=%.4f val_ret=%.2f%% QT_ret=%.2f%% QT_pf=%.2f QT_trds=%d QT_dd=%.3f reasons=%s\n",
 										valR.Score, valR.Return*100, quickTestR.Return*100, quickTestR.ProfitFactor, quickTestR.Trades, quickTestR.MaxDD, reasonStr)
 								}
+								} // end of else block (QuickTest gate enforcement)
 							}
 
 							if !quickTestProfitOK {
@@ -1920,11 +1963,11 @@ func main() {
 							batchAccepted = append(batchAccepted, candidate)
 
 							elite := Elite{
-								Strat:     candidate.Strategy,
-								Train:     candidate,
-								Val:       valR, // Use current candidate's validation result
-								ValScore:  valR.Score,
-								IsPreElite: isPreElite,  // Mark recovery mode elites
+								Strat:      candidate.Strategy,
+								Train:      candidate,
+								Val:        valR, // Use current candidate's validation result
+								ValScore:   valR.Score,
+								IsPreElite: isPreElite, // Mark recovery mode elites
 							}
 							hof.Add(elite)
 							archive.Add(valR, elite) // Use current candidate's validation result
@@ -1945,27 +1988,27 @@ func main() {
 
 							// Also log to persistent file
 							log := EliteLog{
-								Seed:         candidate.Strategy.Seed,
-								FeeBps:       candidate.Strategy.FeeBps,
-								SlippageBps:  candidate.Strategy.SlippageBps,
-								Direction:    candidate.Strategy.Direction,
-								StopLoss:     stopModelToString(candidate.Strategy.StopLoss),
-								TakeProfit:   tpModelToString(candidate.Strategy.TakeProfit),
-								Trail:        trailModelToString(candidate.Strategy.Trail),
-								EntryRule:    ruleTreeToString(candidate.Strategy.EntryRule.Root),
-								ExitRule:     ruleTreeToString(candidate.Strategy.ExitRule.Root),
-								RegimeFilter: ruleTreeToString(candidate.Strategy.RegimeFilter.Root),
+								Seed:           candidate.Strategy.Seed,
+								FeeBps:         candidate.Strategy.FeeBps,
+								SlippageBps:    candidate.Strategy.SlippageBps,
+								Direction:      candidate.Strategy.Direction,
+								StopLoss:       stopModelToString(candidate.Strategy.StopLoss),
+								TakeProfit:     tpModelToString(candidate.Strategy.TakeProfit),
+								Trail:          trailModelToString(candidate.Strategy.Trail),
+								EntryRule:      ruleTreeToString(candidate.Strategy.EntryRule.Root),
+								ExitRule:       ruleTreeToString(candidate.Strategy.ExitRule.Root),
+								RegimeFilter:   ruleTreeToString(candidate.Strategy.RegimeFilter.Root),
 								FeatureMapHash: featureHash,
-								TrainScore:   candidate.Score,
-								TrainReturn:  candidate.Return,
-								TrainMaxDD:   candidate.MaxDD,
-								TrainWinRate: candidate.WinRate,
-								TrainTrades:  candidate.Trades,
-								ValScore:     valR.Score,
-								ValReturn:    valR.Return,
-								ValMaxDD:     valR.MaxDD,
-								ValWinRate:   valR.WinRate,
-								ValTrades:    valR.Trades,
+								TrainScore:     candidate.Score,
+								TrainReturn:    candidate.Return,
+								TrainMaxDD:     candidate.MaxDD,
+								TrainWinRate:   candidate.WinRate,
+								TrainTrades:    candidate.Trades,
+								ValScore:       valR.Score,
+								ValReturn:      valR.Return,
+								ValMaxDD:       valR.MaxDD,
+								ValWinRate:     valR.WinRate,
+								ValTrades:      valR.Trades,
 							}
 							select {
 							case winnerLog <- log:
@@ -2199,7 +2242,20 @@ func main() {
 						runtimeElapsed := now.Sub(searchStartTime)
 						searchStartTimeMu.Unlock()
 						logx.LogBatchProgress(batchID, atomic.LoadUint64(&tested), bestTrainResult.Score, bestValR.Score,
-							bestTrainResult.Return, bestValR.Return, bestValR.WinRate, bestValR.Trades, rate, runtimeElapsed, fingerprint+" "+checkmark)
+							bestTrainResult.Return, bestValR.Return, float32(bestValR.OOSGeoAvgMonthly), float32(bestValR.OOSMedianMonthly), bestValR.WinRate, bestValR.Trades, bestValR.OOSTotalMonths, rate, runtimeElapsed, fingerprint+" "+checkmark)
+
+						// Always show real WF OOS stats when WF is enabled
+						if wfConfig.Enable {
+							fmt.Printf("  %s GeoAvg=%+.2f%%  Median=%+.2f%%  MinMo=%+.2f%%  Months=%d  Trades=%d  OOS_DD=%.2f%%\n",
+								logx.Info("[OOS]"),
+								bestValR.OOSGeoAvgMonthly*100,
+								bestValR.OOSMedianMonthly*100,
+								bestValR.OOSMinMonth*100,
+								bestValR.OOSTotalMonths,
+								bestValR.OOSTotalTrades,
+								bestValR.OOSMaxDD*100,
+							)
+						}
 
 						// Print criteria summary
 						print("  %s\n",
@@ -2261,38 +2317,38 @@ func main() {
 					elitesCount := len(hof.Elites)
 					const minElitesForProfitGates = 10 // Wait for at least 10 elites before enforcing strict gates
 					if elitesCount > 0 {
-						// Raise minValTrades from 20 to 30 once we have elites
-						// CRITICAL FIX: Also update the local variable used in validation gates
-						if meta.MinValTrades < 30 {
+						// Keep MinValTrades at 20 (do NOT auto-raise to 30)
+						if meta.MinValTrades > 20 {
 							meta.mu.Lock()
-							meta.MinValTrades = 30
-							newMinTrades := meta.MinValTrades
+							meta.MinValTrades = 20
 							meta.mu.Unlock()
-							logx.LogAutoAdjustInt("MinValTrades", 20, newMinTrades)
-							minValTrades = newMinTrades // FIX: Update local variable too!
 						}
+						minValTrades = 20
 
-						// CRITICAL FIX: Only enforce profit gates AFTER we have enough elites
-						// This allows evolution to climb out of the valley before strict gates kick in
-						if elitesCount >= minElitesForProfitGates && minValReturn < 0.02 {
-							oldReturn := minValReturn
-							minValReturn = 0.02
-							logx.LogAutoAdjust("Enforcing profit gates, minValReturn", oldReturn, minValReturn)
-						}
-						if elitesCount >= minElitesForProfitGates && minValPF < 1.05 {
-							oldPF := minValPF
-							minValPF = 1.05
-							logx.LogAutoAdjust("Enforcing profit gates, minValPF", oldPF, minValPF)
-						}
-						if elitesCount >= minElitesForProfitGates && maxValDD > 0.35 {
-							oldDD := maxValDD
-							maxValDD = 0.35
-							logx.LogAutoAdjust("Enforcing profit gates, maxValDD", oldDD, maxValDD)
-						}
-						if elitesCount >= minElitesForProfitGates && minValExpect < 0.0001 {
-							oldExp := minValExpect
-							minValExpect = 0.0001
-							logx.LogAutoAdjust("Enforcing profit gates, minValExpect", oldExp, minValExpect)
+						// Auto-adjust profit gates (disable with -auto_adjust=false for tuning)
+						if *autoAdjust {
+							// CRITICAL FIX: Only enforce profit gates AFTER we have enough elites
+							// This allows evolution to climb out of the valley before strict gates kick in
+							if elitesCount >= minElitesForProfitGates && minValReturn < 0.02 {
+								oldReturn := minValReturn
+								minValReturn = 0.02
+								logx.LogAutoAdjust("Enforcing profit gates, minValReturn", oldReturn, minValReturn)
+							}
+							if elitesCount >= minElitesForProfitGates && minValPF < 1.05 {
+								oldPF := minValPF
+								minValPF = 1.05
+								logx.LogAutoAdjust("Enforcing profit gates, minValPF", oldPF, minValPF)
+							}
+							if elitesCount >= minElitesForProfitGates && maxValDD > 0.35 {
+								oldDD := maxValDD
+								maxValDD = 0.35
+								logx.LogAutoAdjust("Enforcing profit gates, maxValDD", oldDD, maxValDD)
+							}
+							if elitesCount >= minElitesForProfitGates && minValExpect < 0.0001 {
+								oldExp := minValExpect
+								minValExpect = 0.0001
+								logx.LogAutoAdjust("Enforcing profit gates, minValExpect", oldExp, minValExpect)
+							}
 						}
 					}
 
@@ -2333,7 +2389,9 @@ func main() {
 								continue // no trades
 							}
 							// Store train result with val metrics embedded
-							trainR.ValResult = &valR
+							// IMPORTANT: allocate a distinct copy to avoid pointer aliasing across iterations
+							trainR.ValResult = new(Result)
+							*trainR.ValResult = valR
 							localResults = append(localResults, trainR)
 						}
 						// Sort by score and send top 20
@@ -2375,7 +2433,9 @@ func main() {
 							}
 							// Store train result with val metrics embedded
 							// We'll use the train result for ranking, but validation will use valR
-							trainR.ValResult = &valR // Store val result reference
+							// IMPORTANT: allocate a distinct copy to avoid pointer aliasing across iterations
+							trainR.ValResult = new(Result)
+							*trainR.ValResult = valR
 							localResults = append(localResults, trainR)
 						}
 						// Sort by score and send top 20
@@ -3278,11 +3338,11 @@ func runTestMode(dataFile string, feeBps, slipBps float32, fromIdx, toIdx int, f
 	// Rebuild and test each strategy
 	type TestResult struct {
 		EliteLog
-		TestScore    float32         `json:"test_score"`
-		TestReturn   float32         `json:"test_return"`
-		TestMaxDD    float32         `json:"test_max_dd"`
-		TestWinRate  float32         `json:"test_win_rate"`
-		TestTrades   int             `json:"test_trades"`
+		TestScore       float32        `json:"test_score"`
+		TestReturn      float32        `json:"test_return"`
+		TestMaxDD       float32        `json:"test_max_dd"`
+		TestWinRate     float32        `json:"test_win_rate"`
+		TestTrades      int            `json:"test_trades"`
 		TestExitReasons map[string]int `json:"test_exit_reasons"`
 	}
 
@@ -3355,7 +3415,7 @@ func runTestMode(dataFile string, feeBps, slipBps float32, fromIdx, toIdx int, f
 				Seed:        log.Seed,
 				FeeBps:      feeBps,  // OVERRIDE: Use specified production fee for testing
 				SlippageBps: slipBps, // OVERRIDE: Use specified production slippage for testing
-				RiskPct:     0.01,
+				RiskPct:     1.0,
 				Direction:   log.Direction,
 				EntryRule: RuleTree{
 					Root: parseRuleTree(log.EntryRule),
@@ -3366,9 +3426,9 @@ func runTestMode(dataFile string, feeBps, slipBps float32, fromIdx, toIdx int, f
 				RegimeFilter: RuleTree{
 					Root: parseRuleTree(log.RegimeFilter),
 				},
-				StopLoss:        parseStopModel(log.StopLoss),
-				TakeProfit:      parseTPModel(log.TakeProfit),
-				Trail:           parseTrailModel(log.Trail),
+				StopLoss:         parseStopModel(log.StopLoss),
+				TakeProfit:       parseTPModel(log.TakeProfit),
+				Trail:            parseTrailModel(log.Trail),
 				VolatilityFilter: VolFilterModel{Enabled: false}, // Default disabled for old strategies
 			}
 		}()
@@ -3412,12 +3472,12 @@ func runTestMode(dataFile string, feeBps, slipBps float32, fromIdx, toIdx int, f
 
 		// Create test result
 		result := TestResult{
-			EliteLog:       log,
-			TestScore:      testR.Score,
-			TestReturn:     testR.Return,
-			TestMaxDD:      testR.MaxDD,
-			TestWinRate:    testR.WinRate,
-			TestTrades:     testR.Trades,
+			EliteLog:        log,
+			TestScore:       testR.Score,
+			TestReturn:      testR.Return,
+			TestMaxDD:       testR.MaxDD,
+			TestWinRate:     testR.WinRate,
+			TestTrades:      testR.Trades,
 			TestExitReasons: testR.ExitReasons,
 		}
 
@@ -4164,20 +4224,20 @@ func parseTrailModel(s string) TrailModel {
 
 // WinnerRow represents a single winner from winners.jsonl or winners_tested.jsonl
 type WinnerRow struct {
-	Seed         int64   `json:"seed"`
-	FeeBps       float32 `json:"fee_bps"`
-	SlippageBps  float32 `json:"slippage_bps"`
-	Direction    int     `json:"direction"`
-	StopLoss     string  `json:"stop_loss"`
-	TakeProfit   string  `json:"take_profit"`
-	Trail        string  `json:"trail"`
-	EntryRule    string  `json:"entry_rule"`
-	ExitRule     string  `json:"exit_rule"`
-	RegimeFilter string  `json:"regime_filter"`
-	FeatureMapHash string `json:"feature_map_hash,omitempty"` // Feature ordering fingerprint
-	TrainScore   float32 `json:"train_score,omitempty"`
-	ValScore     float32 `json:"val_score,omitempty"`
-	TestScore    float32 `json:"test_score,omitempty"`
+	Seed           int64   `json:"seed"`
+	FeeBps         float32 `json:"fee_bps"`
+	SlippageBps    float32 `json:"slippage_bps"`
+	Direction      int     `json:"direction"`
+	StopLoss       string  `json:"stop_loss"`
+	TakeProfit     string  `json:"take_profit"`
+	Trail          string  `json:"trail"`
+	EntryRule      string  `json:"entry_rule"`
+	ExitRule       string  `json:"exit_rule"`
+	RegimeFilter   string  `json:"regime_filter"`
+	FeatureMapHash string  `json:"feature_map_hash,omitempty"` // Feature ordering fingerprint
+	TrainScore     float32 `json:"train_score,omitempty"`
+	ValScore       float32 `json:"val_score,omitempty"`
+	TestScore      float32 `json:"test_score,omitempty"`
 }
 
 // loadWinnerBySeed loads a specific winner by seed from winners_tested.jsonl or winners.jsonl
@@ -4288,7 +4348,7 @@ func runGoldenMode(dataFile string, seed int64, printTrades int, feeBps, slipBps
 		Seed:        w.Seed,
 		FeeBps:      float32(feeBps),
 		SlippageBps: float32(slipBps),
-		RiskPct:     0.01,
+		RiskPct:     1.0,
 		Direction:   w.Direction,
 		EntryRule: RuleTree{
 			Root: parseRuleTree(w.EntryRule),
@@ -4299,9 +4359,9 @@ func runGoldenMode(dataFile string, seed int64, printTrades int, feeBps, slipBps
 		RegimeFilter: RuleTree{
 			Root: parseRuleTree(w.RegimeFilter),
 		},
-		StopLoss:        parseStopModel(w.StopLoss),
-		TakeProfit:      parseTPModel(w.TakeProfit),
-		Trail:           parseTrailModel(w.Trail),
+		StopLoss:         parseStopModel(w.StopLoss),
+		TakeProfit:       parseTPModel(w.TakeProfit),
+		Trail:            parseTrailModel(w.Trail),
 		VolatilityFilter: VolFilterModel{Enabled: false}, // Default disabled for old strategies
 	}
 
@@ -4547,12 +4607,12 @@ func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st 
 
 	// Map to store exit details by bar index (in full series)
 	type exitDetails struct {
-		reason      string
-		pnl         float32
-		entryPrice  float32
-		exitPrice   float32
-		stopPrice   float32
-		tpPrice     float32
+		reason     string
+		pnl        float32
+		entryPrice float32
+		exitPrice  float32
+		stopPrice  float32
+		tpPrice    float32
 	}
 	exitDetailsMap := make(map[int]exitDetails)
 
@@ -4560,12 +4620,12 @@ func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st 
 	type signalBooleans struct {
 		regimeNotRisingVolPerTrade string
 		regimeImbalanceGT          string
-		regimeSwingHighGT           string
-		entryRisingVolSMA20         string
-		entryFallingMinusDI         string
-		entryFallingEMA50           string
-		entryCrossUpMACD            string
-		entryCrossUpEMASwing        string
+		regimeSwingHighGT          string
+		entryRisingVolSMA20        string
+		entryFallingMinusDI        string
+		entryFallingEMA50          string
+		entryCrossUpMACD           string
+		entryCrossUpEMASwing       string
 		entrySlopeLTEMA200         string
 	}
 	signalBoolsMap := make(map[int]signalBooleans)
@@ -4609,16 +4669,16 @@ func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st 
 	}
 
 	// Get feature indices for this specific strategy
-	volPerTradeIdx := feats.Index["VolPerTrade"]    // F[35]
-	imbalanceIdx := feats.Index["Imbalance"]          // F[34]
-	swingHighIdx := feats.Index["SwingHigh"]          // F[8] and F[40]
-	volSMA20Idx := feats.Index["VolSMA20"]            // F[27]
-	minusDIIdx := feats.Index["MinusDI"]              // F[23]
-	ema50Idx := feats.Index["EMA50"]                  // F[2]
-	ema20Idx := feats.Index["EMA20"]                  // F[1]
-	bbWidth50Idx := feats.Index["BB_Width50"]         // F[13]
-	macdIdx := feats.Index["MACD"]                    // F[14]
-	ema200Idx := feats.Index["EMA200"]                // F[4]
+	volPerTradeIdx := feats.Index["VolPerTrade"] // F[35]
+	imbalanceIdx := feats.Index["Imbalance"]     // F[34]
+	swingHighIdx := feats.Index["SwingHigh"]     // F[8] and F[40]
+	volSMA20Idx := feats.Index["VolSMA20"]       // F[27]
+	minusDIIdx := feats.Index["MinusDI"]         // F[23]
+	ema50Idx := feats.Index["EMA50"]             // F[2]
+	ema20Idx := feats.Index["EMA20"]             // F[1]
+	bbWidth50Idx := feats.Index["BB_Width50"]    // F[13]
+	macdIdx := feats.Index["MACD"]               // F[14]
+	ema200Idx := feats.Index["EMA200"]           // F[4]
 
 	// Mark ENTRY EXEC, HOLDING and exits
 	for _, tr := range trades {
@@ -4724,12 +4784,12 @@ func writeTraceCSV(s Series, trades []Trade, outPath string, feats Features, st 
 				signalBoolsMap[sigIdx] = signalBooleans{
 					regimeNotRisingVolPerTrade: regimeNotRisingVolPerTrade,
 					regimeImbalanceGT:          regimeImbalanceGT,
-					regimeSwingHighGT:           regimeSwingHighGT,
-					entryRisingVolSMA20:         entryRisingVolSMA20,
-					entryFallingMinusDI:         entryFallingMinusDI,
-					entryFallingEMA50:           entryFallingEMA50,
-					entryCrossUpMACD:            entryCrossUpMACD,
-					entryCrossUpEMASwing:        entryCrossUpEMASwing,
+					regimeSwingHighGT:          regimeSwingHighGT,
+					entryRisingVolSMA20:        entryRisingVolSMA20,
+					entryFallingMinusDI:        entryFallingMinusDI,
+					entryFallingEMA50:          entryFallingEMA50,
+					entryCrossUpMACD:           entryCrossUpMACD,
+					entryCrossUpEMASwing:       entryCrossUpEMASwing,
 					entrySlopeLTEMA200:         entrySlopeLTEMA200,
 				}
 
@@ -4884,7 +4944,7 @@ func buildManualEMA20x50(feats Features, feeBps, slipBps float32) Strategy {
 		Seed:             0, // Deterministic seed for manual strategy
 		FeeBps:           feeBps,
 		SlippageBps:      slipBps,
-		RiskPct:          0.01,
+		RiskPct:          1.0,
 		Direction:        1, // Long only
 		EntryRule:        RuleTree{Root: entryRoot},
 		ExitRule:         RuleTree{Root: exitRoot},
@@ -4931,7 +4991,7 @@ func buildManualVolSMAEMAStrategy(feats Features, feeBps, slipBps float32) Strat
 	ema50Idx := getIdx("EMA50")
 	bbWidth50Idx := getIdx("BB_Width50")
 	macdIdx := getIdx("MACD")
-	ema20Idx := getIdx("EMA20")  // F[1] = EMA20 (both originally and now)
+	ema20Idx := getIdx("EMA20") // F[1] = EMA20 (both originally and now)
 	swingHighIdx := getIdx("SwingHigh")
 	ema200Idx := getIdx("EMA200")
 
@@ -5083,7 +5143,7 @@ func buildManualVolSMAEMAStrategy(feats Features, feeBps, slipBps float32) Strat
 		Seed:             6302889439695856639, // Original seed for reference
 		FeeBps:           feeBps,
 		SlippageBps:      slipBps,
-		RiskPct:          0.01,
+		RiskPct:          1.0,
 		Direction:        1, // Long only
 		EntryRule:        RuleTree{Root: entryRoot},
 		ExitRule:         RuleTree{Root: exitRoot},
@@ -5221,7 +5281,7 @@ func runTraceMode(dataFile string, seed int64, csvPath, manual string, openCSV b
 			Seed:        winnerRow.Seed,
 			FeeBps:      float32(feeBps),
 			SlippageBps: float32(slipBps),
-			RiskPct:     0.01,
+			RiskPct:     1.0,
 			Direction:   winnerRow.Direction,
 			EntryRule: RuleTree{
 				Root: parseRuleTree(winnerRow.EntryRule),
@@ -5232,9 +5292,9 @@ func runTraceMode(dataFile string, seed int64, csvPath, manual string, openCSV b
 			RegimeFilter: RuleTree{
 				Root: parseRuleTree(winnerRow.RegimeFilter),
 			},
-			StopLoss:        parseStopModel(winnerRow.StopLoss),
-			TakeProfit:      parseTPModel(winnerRow.TakeProfit),
-			Trail:           parseTrailModel(winnerRow.Trail),
+			StopLoss:         parseStopModel(winnerRow.StopLoss),
+			TakeProfit:       parseTPModel(winnerRow.TakeProfit),
+			Trail:            parseTrailModel(winnerRow.Trail),
 			VolatilityFilter: VolFilterModel{Enabled: false}, // Default disabled for old strategies
 		}
 

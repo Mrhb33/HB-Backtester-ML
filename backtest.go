@@ -148,9 +148,10 @@ type Result struct {
 	ExitReasons  map[string]int // Count of trades by exit reason
 
 	// OOS Stats (Walk-Forward Validation)
-	OOSGeoAvgMonthly float64  `json:"oos_geo_avg_monthly,omitempty"` // Geometric average monthly return
-	OOSMedianMonthly float64  `json:"oos_median_monthly,omitempty"`  // Median monthly return
-	OOSMinMonth      float64  `json:"oos_min_month,omitempty"`       // Worst single month return
+	OOSGeoAvgMonthly       float64  `json:"oos_geo_avg_monthly,omitempty"`       // Geometric average monthly return (all months)
+	OOSActiveGeoAvgMonthly float64  `json:"oos_active_geo_avg_monthly,omitempty"` // Geometric average (active months only - diagnostic)
+	OOSMedianMonthly       float64  `json:"oos_median_monthly,omitempty"`         // Median monthly return
+	OOSMinMonth            float64  `json:"oos_min_month,omitempty"`              // Worst single month return
 	OOSStdMonth      float64  `json:"oos_std_month,omitempty"`       // Std dev of monthly returns
 	OOSMaxDD         float64  `json:"oos_max_dd,omitempty"`          // Max drawdown across all OOS
 	OOSTotalMonths   int     `json:"oos_total_months,omitempty"`    // Total OOS months
@@ -323,8 +324,8 @@ func computeScore(ret, dd, expectancy float32, trades int, testedCount int64) fl
 
 	// Penalty system instead of hard rejection
 	tradePenalty := float32(0)
-	if trades < 30 {
-		tradePenalty = -2.0 // align with validation crit trds>=30
+	if trades < 20 {
+		tradePenalty = -2.0 // align with validation crit trds>=20
 	}
 
 	retPenalty := float32(0)

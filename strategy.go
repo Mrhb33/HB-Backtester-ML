@@ -1408,18 +1408,15 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 	ensureSetupLeaf(entryRoot, rng, feats)
 
 	// Fix C: Timeframe-aware risk sizing to reduce DD
-	// 1H: 5% risk, 5min/15min: 10% risk
+	// 100% risk for all timeframes (full account position sizing)
 	tfMinutes = atomic.LoadInt32(&globalTimeframeMinutes) // Reuse variable from line 781
-	riskPct := float32(0.10)                              // Default: 10% for 5min/15min
-	if tfMinutes >= 60 {
-		riskPct = 1.00 // 100% risk for 1H (user override - WARNING: very aggressive!)
-	}
+	riskPct := float32(1.0) // 100% risk for all timeframes
 
 	s := Strategy{
 		Seed:             rng.Int63(),
 		FeeBps:           feeBps,  // Use specified production costs
 		SlippageBps:      slipBps, // Use specified production costs
-		RiskPct:          riskPct, // Fix C: Timeframe-aware risk (5% for 1H, 10% for 5min/15min)
+		RiskPct:          riskPct, // Fix C: Timeframe-aware risk (1% for 1H, 10% for 5min/15min)
 		Direction:        direction,
 		EntryRule:        RuleTree{Root: entryRoot},
 		EntryCompiled:    compileRuleTree(entryRoot),
@@ -2648,20 +2645,20 @@ func randomExitLeaf(rng *rand.Rand, feats Features) Leaf {
 	// Exit leaf types - organized by category
 	// Momentum fade: exit when momentum drops (Falling ROC, RSI drops, MACD cross down)
 	momentumFadeKinds := []LeafKind{
-		LeafFalling,    // Trend reverses (e.g., Falling ROC10)
-		LeafCrossDown,  // Cross below threshold (e.g., RSI crosses below 70)
-		LeafLT,         // Below threshold (e.g., MACD_Hist < 0)
+		LeafFalling,   // Trend reverses (e.g., Falling ROC10)
+		LeafCrossDown, // Cross below threshold (e.g., RSI crosses below 70)
+		LeafLT,        // Below threshold (e.g., MACD_Hist < 0)
 	}
 	// Volatility contraction: exit when vol drops or trend breaks
 	volContractionKinds := []LeafKind{
-		LeafCrossDown,  // ATR drops below threshold
-		LeafLT,         // BB Width below threshold (squeeze)
-		LeafFalling,    // ATR falling
+		LeafCrossDown, // ATR drops below threshold
+		LeafLT,        // BB Width below threshold (squeeze)
+		LeafFalling,   // ATR falling
 	}
 	// Trend break: exit when price cross below MA
 	trendBreakKinds := []LeafKind{
-		LeafCrossDown,  // Price crosses below EMA
-		LeafLT,         // Price below EMA
+		LeafCrossDown, // Price crosses below EMA
+		LeafLT,        // Price below EMA
 	}
 
 	var kind LeafKind

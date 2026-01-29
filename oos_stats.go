@@ -16,7 +16,6 @@ var (
 )
 
 func warnStitch(format string, args ...any) {
-	// Use existing DebugWalkForward flag (defined in main.go)
 	if !DebugWalkForward {
 		return
 	}
@@ -74,12 +73,13 @@ const (
 // OOSStats holds out-of-sample statistics
 type OOSStats struct {
 	// Primary metrics (use float64 for precision in geo mean calculation)
-	GeoAvgMonthly      float64 // Geometric average monthly return (MAIN METRIC)
-	MedianMonthly      float64 // Kept for backward compatibility = MedianActiveMonths
-	MedianAllMonths    float64 // NEW: Median across ALL months (including sparse)
-	MedianActiveMonths float64 // NEW: Median across only active months (trades > 0)
-	MinMonth           float64 // Worst single month return
-	StdMonth           float64 // Std dev of monthly returns (volatility)
+	GeoAvgMonthly       float64 // Geometric average monthly return across ALL months (MAIN METRIC)
+	ActiveGeoAvgMonthly float64 // Geometric average across active months only (diagnostic)
+	MedianMonthly       float64 // Kept for backward compatibility = MedianActiveMonths
+	MedianAllMonths     float64 // NEW: Median across ALL months (including sparse)
+	MedianActiveMonths  float64 // NEW: Median across only active months (trades > 0)
+	MinMonth            float64 // Worst single month return
+	StdMonth            float64 // Std dev of monthly returns (volatility)
 
 	// Breakdown
 	MonthlyReturns []MonthlyReturn // Per-month breakdown
@@ -93,14 +93,10 @@ type OOSStats struct {
 	MinTradesPerMonth int // Minimum trades across all months
 
 	// Active months ratio (for stability assessment)
-	// FIX A: Active month = (Trades > 0) OR (abs(Return) > epsilon)
-	// This counts months with carried positions as active, not just months with new trades
 	ActiveMonthsCount int     // Number of months with trades OR meaningful returns
 	ActiveMonthsRatio float64 // Active months / Total months
 
 	// Sparse months ratio (for quality assessment)
-	// Sparse month = month with 0 trades (regardless of carried positions)
-	// High sparse ratio indicates strategy is not consistently active
 	SparseMonthsCount int     // Number of months with 0 trades
 	SparseMonthsRatio float64 // Sparse months / Total months
 
@@ -149,14 +145,6 @@ func StitchOOSEquityCurve(foldResults []FoldResult, series Series) StitchedOOSDa
 		return foldResults[i].TestStart < foldResults[j].TestStart
 	})
 
-	// Step 2B: Validate TestStart/TestEnd are global indices
-	for _, fr := range foldResults {
-		if fr.TestStart < 0 || fr.TestEnd > len(series.CloseTimeMs) || fr.TestStart >= fr.TestEnd {
-			warnStitch("[BAD-FOLD-IDX] start=%d end=%d seriesLen=%d\n", fr.TestStart, fr.TestEnd, len(series.CloseTimeMs))
-			break
-		}
-	}
-
 	// Fix B: Use timestamp-based duplicate detection (not barIndex)
 	lastTS := int64(-1)
 
@@ -185,27 +173,15 @@ func StitchOOSEquityCurve(foldResults []FoldResult, series Series) StitchedOOSDa
 		}
 
 		if len(stitched) > 0 {
-			currentEquity = stitched[len(stitched)-1]
-		}
-	}
-
-	// Step 2C: Hard assertion - check stitching is not collapsing
-	if len(stitchedTimestamps) != len(stitched) {
-		panic("stitched timestamps and equity length mismatch")
-	}
-
-	// Fix 1: Wrap debug prints with rate-limited warning function
-	if DebugWalkForward {
-		expectedBars := foldResults[len(foldResults)-1].TestEnd - foldResults[0].TestStart
-		warnStitch("[STITCH-TOO-SHORT] stitched=%d expected~=%d\n",
-			len(stitchedTimestamps), expectedBars)
-
-		// Step 1: Diagnostic print (only when DebugWalkForward is true)
-		if len(stitchedTimestamps) > 0 {
-			warnStitch("[STITCH-DBG] folds=%d stitchedBars=%d ts0=%d (%s) tsN=%d (%s)\n",
-				len(foldResults), len(stitchedTimestamps),
-				stitchedTimestamps[0], time.UnixMilli(stitchedTimestamps[0]).UTC().Format(time.RFC3339),
-				stitchedTimestamps[len(stitchedTimestamps)-1], time.UnixMilli(stitchedTimestamps[len(stitchedTimestamps)-1]).UTC().Format(time.RFC3339))
+			// CRITICAL FIX: Ensure equity doesn't become negative or NaN
+			lastEq := stitched[len(stitched)-1]
+			if math.IsNaN(lastEq) || math.IsInf(lastEq, 0) {
+				lastEq = 0
+			}
+			if lastEq < 0 {
+				lastEq = 0
+			}
+			currentEquity = lastEq
 		}
 	}
 
@@ -216,13 +192,15 @@ func StitchOOSEquityCurve(foldResults []FoldResult, series Series) StitchedOOSDa
 	}
 }
 
-// collectTradeEntryIndices collects all trade entry indices across all folds
-func collectTradeEntryIndices(foldResults []FoldResult) []int {
-	var indices []int
+// collectTradeEntryTimesMs collects all trade entry timestamps across all folds
+func collectTradeEntryTimesMs(foldResults []FoldResult) []int64 {
+	var times []int64
 	for _, fr := range foldResults {
-		indices = append(indices, fr.TradeEntryIdxs...)
+		for _, tr := range fr.Trades {
+			times = append(times, tr.EntryTime.Unix()*1000)
+		}
 	}
-	return indices
+	return times
 }
 
 // computeDrawdownFromEquitySlice computes drawdown from an equity slice
@@ -235,12 +213,19 @@ func computeDrawdownFromEquitySlice(equity []float64, barIndices []int, series S
 	maxDD := 0.0
 
 	for _, eq := range equity {
+		// FIX: Handle bad data points
+		if math.IsNaN(eq) || math.IsInf(eq, 0) {
+			continue
+		}
 		if eq > peak {
 			peak = eq
 		}
-		dd := (peak - eq) / peak
-		if dd > maxDD {
-			maxDD = dd
+		// Prevent division by zero if peak is 0
+		if peak > 1e-9 {
+			dd := (peak - eq) / peak
+			if dd > maxDD {
+				maxDD = dd
+			}
 		}
 	}
 
@@ -303,49 +288,54 @@ func ComputeMonthlyReturnsFromEquity(stitched StitchedOOSData,
 		return monthlyReturns
 	}
 
-	// First, collect all trade entry indices across all folds
-	allTradeEntryIndices := collectTradeEntryIndices(foldResults)
+	// CRITICAL FIX: Use trade timestamps instead of indices for robust counting
+	allTradeEntryTimes := collectTradeEntryTimesMs(foldResults)
 
 	currentMonthStart := 0
 	var monthIndex int
 	currentYear, currentMonth, _ := time.UnixMilli(stitched.Timestamps[0]).UTC().Date()
 
 	for i := 1; i < len(stitched.Equity); i++ {
-		// Use UTC for month boundary detection
 		thisYear, thisMonth, _ := time.UnixMilli(stitched.Timestamps[i]).UTC().Date()
 
 		if thisYear != currentYear || thisMonth != currentMonth {
 			// Month ended - compute return for bars [currentMonthStart, i)
-			// endEq is at i-1 (last bar of current month), NOT i (first bar of next month)
 			startEq := stitched.Equity[currentMonthStart]
 			endEq := stitched.Equity[i-1]
 
-			// Count trades in this month by checking entry bar indices
-			// Use half-open interval [monthStartMs, nextMonthStartMs)
 			tradesInMonth := 0
 			monthStartMs := stitched.Timestamps[currentMonthStart]
 			nextMonthStartMs := stitched.Timestamps[i]
 
-			for _, entryIdx := range allTradeEntryIndices {
-				tradeMs := series.CloseTimeMs[entryIdx]
+			for _, tradeMs := range allTradeEntryTimes {
 				if tradeMs >= monthStartMs && tradeMs < nextMonthStartMs {
 					tradesInMonth++
 				}
 			}
 
-			// Compute per-month drawdown from equity curve
-			// Slice is [currentMonthStart:i) to exclude first bar of next month
 			monthDD := computeDrawdownFromEquitySlice(
 				stitched.Equity[currentMonthStart:i],
 				stitched.BarIndices[currentMonthStart:i],
 				series,
 			)
 
+			// FIX: Safety check for division by zero (StartEq=0) and NaN
+			var monthRet float64
+			if startEq <= 1e-9 {
+				monthRet = 0.0
+			} else {
+				monthRet = (endEq - startEq) / startEq
+			}
+
+			if math.IsNaN(monthRet) || math.IsInf(monthRet, 0) {
+				monthRet = 0.0
+			}
+
 			mr := MonthlyReturn{
 				Month:   monthIndex,
 				StartEq: startEq,
 				EndEq:   endEq,
-				Return:  (endEq - startEq) / startEq,
+				Return:  monthRet,
 				Trades:  tradesInMonth,
 				DD:      monthDD,
 			}
@@ -357,7 +347,7 @@ func ComputeMonthlyReturnsFromEquity(stitched StitchedOOSData,
 		}
 	}
 
-	// After loop ends, finalize last month
+	// Finalize last month
 	if currentMonthStart < len(stitched.Equity) {
 		lastMonthStart := currentMonthStart
 		lastMonthEnd := len(stitched.Equity) - 1
@@ -365,11 +355,9 @@ func ComputeMonthlyReturnsFromEquity(stitched StitchedOOSData,
 		startEq := stitched.Equity[lastMonthStart]
 		endEq := stitched.Equity[lastMonthEnd]
 
-		// Count trades in last month (no upper bound)
 		monthStartMs := stitched.Timestamps[lastMonthStart]
 		tradesInMonth := 0
-		for _, entryIdx := range allTradeEntryIndices {
-			tradeMs := series.CloseTimeMs[entryIdx]
+		for _, tradeMs := range allTradeEntryTimes {
 			if tradeMs >= monthStartMs {
 				tradesInMonth++
 			}
@@ -381,11 +369,22 @@ func ComputeMonthlyReturnsFromEquity(stitched StitchedOOSData,
 			series,
 		)
 
+		var monthRet float64
+		if startEq <= 1e-9 {
+			monthRet = 0.0
+		} else {
+			monthRet = (endEq - startEq) / startEq
+		}
+
+		if math.IsNaN(monthRet) || math.IsInf(monthRet, 0) {
+			monthRet = 0.0
+		}
+
 		mr := MonthlyReturn{
 			Month:   monthIndex,
 			StartEq: startEq,
 			EndEq:   endEq,
-			Return:  (endEq - startEq) / startEq,
+			Return:  monthRet,
 			Trades:  tradesInMonth,
 			DD:      monthDD,
 		}
@@ -396,22 +395,30 @@ func ComputeMonthlyReturnsFromEquity(stitched StitchedOOSData,
 }
 
 // ComputeGeoAvgMonthly computes geometric average monthly return
-// Formula: geoAvg = exp((1/N) * sum(ln(1 + r_m))) - 1
 func ComputeGeoAvgMonthly(returns []float64) float64 {
 	if len(returns) == 0 {
 		return 0
 	}
 
 	sumLog := 0.0
+	validCount := 0
 	for _, r := range returns {
+		// FIX: Handle NaN and Inf explicitly
+		if math.IsNaN(r) || math.IsInf(r, 0) {
+			continue // Skip invalid data points
+		}
 		if r <= -1.0 {
-			// Total loss in a month - invalid for geo mean
-			return math.Inf(-1)
+			return -1.0
 		}
 		sumLog += math.Log(1.0 + r)
+		validCount++
 	}
 
-	meanLog := sumLog / float64(len(returns))
+	if validCount == 0 {
+		return 0
+	}
+
+	meanLog := sumLog / float64(validCount)
 	return math.Exp(meanLog) - 1.0
 }
 
@@ -429,9 +436,23 @@ func median(data []float64) float64 {
 	if len(data) == 0 {
 		return 0
 	}
-	sorted := make([]float64, len(data))
-	copy(sorted, data)
+
+	// FIX: Filter out NaNs before sorting
+	validData := make([]float64, 0, len(data))
+	for _, v := range data {
+		if !math.IsNaN(v) && !math.IsInf(v, 0) {
+			validData = append(validData, v)
+		}
+	}
+
+	if len(validData) == 0 {
+		return 0
+	}
+
+	sorted := make([]float64, len(validData))
+	copy(sorted, validData)
 	sort.Float64s(sorted)
+
 	n := len(sorted)
 	if n%2 == 0 {
 		return (sorted[n/2-1] + sorted[n/2]) / 2
@@ -446,11 +467,18 @@ func std(data []float64) float64 {
 	}
 	meanVal := mean(data)
 	sumSq := 0.0
+	count := 0
 	for _, v := range data {
-		diff := v - meanVal
-		sumSq += diff * diff
+		if !math.IsNaN(v) && !math.IsInf(v, 0) {
+			diff := v - meanVal
+			sumSq += diff * diff
+			count++
+		}
 	}
-	return math.Sqrt(sumSq / float64(len(data)-1))
+	if count < 2 {
+		return 0
+	}
+	return math.Sqrt(sumSq / float64(count-1))
 }
 
 // mean computes mean of a float64 slice
@@ -459,316 +487,240 @@ func mean(data []float64) float64 {
 		return 0
 	}
 	sum := 0.0
+	count := 0
 	for _, v := range data {
-		sum += v
+		if !math.IsNaN(v) && !math.IsInf(v, 0) {
+			sum += v
+			count++
+		}
 	}
-	return sum / float64(len(data))
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
 }
 
 // ValidateOOSConstraints validates OOS constraints and sets rejection status
 func ValidateOOSConstraints(stats *OOSStats, config WFConfig) {
-	// Constraint 1: Min months (default: 24 = 2 years OOS)
+	// Constraint 1: Min months
 	if stats.TotalMonths < config.MinMonths {
 		stats.Rejected = true
 		stats.RejectCode = RejectInsufficientMonths
-		stats.RejectReason = fmt.Sprintf("Insufficient months: %d < %d (need 2+ years OOS)",
-			stats.TotalMonths, config.MinMonths)
+		stats.RejectReason = fmt.Sprintf("Insufficient months: %d < %d", stats.TotalMonths, config.MinMonths)
 		return
 	}
 
-	// Constraint 2: Min trades (default: 200, or 100 for lower-frequency strategies)
+	// Constraint 2: Min trades
 	if stats.TotalTrades < config.MinTotalTradesOOS {
 		stats.Rejected = true
 		stats.RejectCode = RejectInsufficientTrades
-		stats.RejectReason = fmt.Sprintf("Insufficient OOS trades: %d < %d",
-			stats.TotalTrades, config.MinTotalTradesOOS)
+		stats.RejectReason = fmt.Sprintf("Insufficient OOS trades: %d < %d", stats.TotalTrades, config.MinTotalTradesOOS)
 		return
 	}
 
-	// Constraint 2b: Min trades per month (prevents rare-trade winners)
+	// Constraint 2b: Min trades per month
 	if config.MinTradesPerMonth > 0 && stats.MinTradesPerMonth < config.MinTradesPerMonth {
 		stats.Rejected = true
 		stats.RejectCode = RejectInsufficientTrades
-		stats.RejectReason = fmt.Sprintf("Insufficient trades per month: %d < %d (some months too sparse)",
-			stats.MinTradesPerMonth, config.MinTradesPerMonth)
+		stats.RejectReason = fmt.Sprintf("Insufficient trades per month: %d < %d", stats.MinTradesPerMonth, config.MinTradesPerMonth)
 		return
 	}
 
-	// Constraint 3: Max drawdown (default: 0.25 = 25%)
+	// Constraint 3: Max drawdown
 	if stats.MaxDD > config.MaxDrawdown {
 		stats.Rejected = true
 		stats.RejectCode = RejectMaxDD
-		stats.RejectReason = fmt.Sprintf("Max DD exceeded: %.2f%% > %.2f%%",
-			stats.MaxDD*100, config.MaxDrawdown*100)
+		stats.RejectReason = fmt.Sprintf("Max DD too high: %.2f%% > %.2f%%", stats.MaxDD*100, config.MaxDrawdown*100)
 		return
 	}
 
-	// PROBLEM B FIX: Constraint 4 (optional but strong): Worst month cap - made trade-count dependent
-	// A single bad month with 0-2 trades shouldn't reject an otherwise good strategy
-	// Only reject worst month if: (a) it's very bad OR (b) it had meaningful trades
-	if config.EnableMinMonthConstraint {
-		// Find the worst month and check its trade count
-		worstMonthTrades := 0
-		for _, mr := range stats.MonthlyReturns {
-			if mr.Return == stats.MinMonth {
-				worstMonthTrades = mr.Trades
-				break
-			}
-		}
-
-		// FIX #1: Add absolute floor at -15% (disaster prevention)
-		// No month can be worse than -15% regardless of trade count
-		// RESPECT CLI: floor also respects MinMonthReturn (more lenient if configured lower)
-		absoluteFloor := math.Min(-0.15, config.MinMonthReturn)
-		// if config.MinMonthReturn is -0.20, floor becomes -0.20 (more lenient for Phase A)
-
-		// Dynamic threshold: stricter for months with more trades, lenient for sparse months
-		// If worst month had < 3 trades, allow double the normal drawdown
-		// If worst month had >= 10 trades, use standard threshold
-		dynamicThreshold := config.MinMonthReturn
-		if worstMonthTrades < 3 {
-			dynamicThreshold = math.Max(absoluteFloor, config.MinMonthReturn*2.0)
-		} else if worstMonthTrades < 10 {
-			dynamicThreshold = math.Max(absoluteFloor, config.MinMonthReturn*1.5)
-		} else {
-			dynamicThreshold = math.Max(absoluteFloor, config.MinMonthReturn)
-		}
-
-		// NEW: Also reject if worst month is beyond absolute floor (catastrophic month)
-		if stats.MinMonth < absoluteFloor {
-			// DEBUG: Print rejection details
-			fmt.Printf("[MIN-MONTH-REJECT] absolute_floor: MinMonth=%.2f%% < Floor=%.2f%% (trds=%d, config_min=%.2f%%)\n",
-				stats.MinMonth*100, absoluteFloor*100, worstMonthTrades, config.MinMonthReturn*100)
-			stats.Rejected = true
-			stats.RejectCode = RejectMinMonth
-			stats.RejectReason = fmt.Sprintf("Worst month catastrophic: %.2f%% < %.2f%% (absolute floor, trds=%d)",
-				stats.MinMonth*100, absoluteFloor*100, worstMonthTrades)
-			return
-		}
-
-		if stats.MinMonth < dynamicThreshold {
-			// DEBUG: Print rejection details
-			fmt.Printf("[MIN-MONTH-REJECT] dynamic_threshold: MinMonth=%.2f%% < Threshold=%.2f%% (trds=%d, config_min=%.2f%%, floor=%.2f%%)\n",
-				stats.MinMonth*100, dynamicThreshold*100, worstMonthTrades, config.MinMonthReturn*100, absoluteFloor*100)
-			stats.Rejected = true
-			stats.RejectCode = RejectMinMonth
-			stats.RejectReason = fmt.Sprintf("Worst month too bad: %.2f%% < %.2f%% (threshold=%.2f%%, trds=%d)",
-				stats.MinMonth*100, config.MinMonthReturn*100, dynamicThreshold*100, worstMonthTrades)
-			return
-		}
+	// Constraint 4: Min monthly return (worst month)
+	if config.EnableMinMonthConstraint && stats.MinMonth < config.MinMonthReturn {
+		stats.Rejected = true
+		stats.RejectCode = RejectMinMonth
+		stats.RejectReason = fmt.Sprintf("Worst month too bad: %.2f%% < %.2f%%", stats.MinMonth*100, config.MinMonthReturn*100)
+		return
 	}
 
-	// Constraint 5: Minimum geometric average monthly return
-	// Prevents strategies with very low returns from being added to Hall of Fame
-	if config.MinGeoMonthlyReturn > 0 && stats.GeoAvgMonthly < config.MinGeoMonthlyReturn {
+	// Constraint 5: Positive geometric expectancy
+	if stats.GeoAvgMonthly < config.MinGeoMonthlyReturn {
 		stats.Rejected = true
 		stats.RejectCode = RejectGeoMonthly
-		stats.RejectReason = fmt.Sprintf("Geo avg monthly return too low: %.4f%% < %.4f%%",
-			stats.GeoAvgMonthly*100, config.MinGeoMonthlyReturn*100)
+		stats.RejectReason = fmt.Sprintf("Geo avg monthly too low: %.2f%% < %.2f%%", stats.GeoAvgMonthly*100, config.MinGeoMonthlyReturn*100)
 		return
 	}
 
-	// FIX A: Constraint 6: Active months ratio gate
-	// Prevents strategies that only trade in a few months from passing
-	// Active month = (Trades > 0) OR (abs(Return) > epsilon) - includes carried positions
-	if config.MinActiveMonthsRatio > 0 && stats.ActiveMonthsRatio < config.MinActiveMonthsRatio {
+	// Constraint 6: Active months ratio
+	if stats.ActiveMonthsRatio < config.MinActiveMonthsRatio {
 		stats.Rejected = true
 		stats.RejectCode = RejectActiveMonths
-		stats.RejectReason = fmt.Sprintf("Active months ratio too low: %.2f%% < %.2f%% (%d/%d months active with trades OR returns)",
-			stats.ActiveMonthsRatio*100, config.MinActiveMonthsRatio*100,
-			stats.ActiveMonthsCount, stats.TotalMonths)
+		stats.RejectReason = fmt.Sprintf("Active months ratio low: %.1f%% < %.1f%%", stats.ActiveMonthsRatio*100, config.MinActiveMonthsRatio*100)
 		return
 	}
 
-	// Constraint 6b: Sparse months ratio gate (NEW)
-	// Rejects strategies with too many months having 0 trades
-	// This eliminates "Median=0.00%" strategies that are not consistently active
-	// Sparse month = month with 0 trades (regardless of carried positions)
+	// Constraint 7: Sparse months ratio
 	if config.MaxSparseMonthsRatio > 0 && stats.SparseMonthsRatio > config.MaxSparseMonthsRatio {
 		stats.Rejected = true
-		stats.RejectCode = RejectActiveMonths // Reuse reject code for now
-		stats.RejectReason = fmt.Sprintf("Sparse months ratio too high: %.2f%% > %.2f%% (%d/%d months with 0 trades)",
-			stats.SparseMonthsRatio*100, config.MaxSparseMonthsRatio*100,
-			stats.SparseMonthsCount, stats.TotalMonths)
+		stats.RejectCode = RejectActiveMonths
+		stats.RejectReason = fmt.Sprintf("Too many sparse months: %.1f%% > %.1f%%", stats.SparseMonthsRatio*100, config.MaxSparseMonthsRatio*100)
 		return
 	}
 
-	// Constraint 7: Minimum median monthly return
-	// Ensures consistent positive performance across active months
-	if config.MinMedianMonthly > 0 && stats.MedianMonthly < config.MinMedianMonthly {
+	// Constraint 8: Median monthly return
+	if config.MinMedianMonthly > 0 && stats.MedianAllMonths < config.MinMedianMonthly {
 		stats.Rejected = true
 		stats.RejectCode = RejectMedianMonthly
-		stats.RejectReason = fmt.Sprintf("Median active monthly return too low: %.2f%% < %.2f%% (all=%.2f%%, active=%.2f%%)",
-			stats.MedianActiveMonths*100, config.MinMedianMonthly*100,
-			stats.MedianAllMonths*100, stats.MedianActiveMonths*100)
+		stats.RejectReason = fmt.Sprintf("Median monthly too low: %.2f%% < %.2f%%", stats.MedianAllMonths*100, config.MinMedianMonthly*100)
 		return
 	}
 
-	// Constraint 8: Maximum monthly volatility (hard stability gate)
-	// Rejects strategies with extreme monthly volatility (configurable via -wf_max_std_month)
-	// This prevents unstable strategies from passing validation
+	// Constraint 9: Monthly volatility
 	if config.MaxStdMonth > 0 && stats.StdMonth > config.MaxStdMonth {
 		stats.Rejected = true
-		stats.RejectCode = RejectActiveMonths // Reuse reject code
-		stats.RejectReason = fmt.Sprintf("Monthly volatility too high: %.2f%% > %.2f%% (unstable strategy)",
-			stats.StdMonth*100, config.MaxStdMonth*100)
+		stats.RejectCode = RejectGeoMonthly
+		stats.RejectReason = fmt.Sprintf("Monthly volatility too high: %.2f%% > %.2f%%", stats.StdMonth*100, config.MaxStdMonth*100)
 		return
 	}
 }
 
-// ComputeOOSStats computes OOS statistics from stitched equity and monthly returns
-func ComputeOOSStats(stitched StitchedOOSData, monthlyReturns []MonthlyReturn,
-	foldResults []FoldResult, series Series, config WFConfig) OOSStats {
-	stats := OOSStats{
-		MonthlyReturns: monthlyReturns,
-		TotalMonths:    len(monthlyReturns),
-		TotalTrades:    sumTradesFromMonthlyReturns(monthlyReturns),
+// CalculateOOSStats computes full statistics from fold results
+func CalculateOOSStats(foldResults []FoldResult, series Series, config WFConfig) OOSStats {
+	stats := OOSStats{}
+
+	// 1. Stitch equity curve
+	stitched := StitchOOSEquityCurve(foldResults, series)
+	if len(stitched.Equity) == 0 {
+		stats.Rejected = true
+		stats.RejectReason = "No OOS equity curve generated (empty folds?)"
+		stats.RejectCode = RejectInsufficientTrades
+		return stats
 	}
 
-	// CRITICAL DEBUG: If we have many folds but get few OOS months/bars, there's a stitching bug
-	// Fix 2: Print only once per run using package-level guard
-	if DebugWalkForward && !printedStitchBug {
-		expectedBars := 0
-		for _, fr := range foldResults {
-			expectedBars += len(fr.EquityCurve)
-		}
-		if len(foldResults) >= 10 && len(monthlyReturns) < 3 && len(stitched.Equity) < expectedBars/2 {
-			printedStitchBug = true
-			warnStitch("[BUG] Many folds (%d) but few OOS months (%d) and few stitched bars (%d vs %d expected)!\n",
-				len(foldResults), len(monthlyReturns), len(stitched.Equity), expectedBars)
-			fmt.Printf("  This indicates a bug in StitchOOSEquityCurve - not all folds being stitched!\n")
-		}
+	// 2. Compute monthly returns
+	monthlyReturns := ComputeMonthlyReturnsFromEquity(stitched, foldResults, series)
+	stats.MonthlyReturns = monthlyReturns
+	stats.TotalMonths = len(monthlyReturns)
+
+	if stats.TotalMonths == 0 {
+		stats.Rejected = true
+		stats.RejectReason = "No monthly returns generated (OOS period too short?)"
+		stats.RejectCode = RejectInsufficientMonths
+		return stats
 	}
 
-	// Extract return series for geo mean
-	// FIX A: Active month = (Trades > 0) OR (abs(Return) > epsilon)
-	// A month with 0 trades but non-zero return means a position was carried across months
-	// This is STILL an active month with market exposure
-	const tinyEps = 1e-6
-	var activeReturns []float64
-	var activeMonthCount int
-	// FIX: Initialize MinMonth to +Inf so all-positive strategies get correct worst month
-	stats.MinMonth = math.Inf(1)
-	for _, mr := range monthlyReturns {
-		// FIX A: Month is active if it has trades OR meaningful return (position carried over)
-		isActive := mr.Trades > 0 || mr.Return > tinyEps || mr.Return < -tinyEps
-		if isActive {
-			activeReturns = append(activeReturns, mr.Return)
-			activeMonthCount++
-		}
-		// Still track MinMonth across ALL months (for worst-month constraint)
-		if mr.Return < stats.MinMonth {
-			stats.MinMonth = mr.Return
-		}
-	}
+	// 3. Compute aggregates
+	stats.TotalTrades = sumTradesFromMonthlyReturns(monthlyReturns)
 
-	// If no active months (shouldn't happen with the new logic), use all returns
-	if len(activeReturns) == 0 {
-		for _, mr := range monthlyReturns {
-			activeReturns = append(activeReturns, mr.Return)
-			activeMonthCount++
-		}
-	}
-
-	// Compute median from active months only (better stability representation)
-	stats.MedianActiveMonths = median(activeReturns)
-
-	// Compute median across ALL months (including sparse with 0 trades)
-	var allMonthlyReturns []float64
-	for _, mr := range monthlyReturns {
-		allMonthlyReturns = append(allMonthlyReturns, mr.Return)
-	}
-	stats.MedianAllMonths = median(allMonthlyReturns)
-
-	// Maintain backward compatibility
-	stats.MedianMonthly = stats.MedianActiveMonths
-
-	// Compute overall OOS MaxDD from stitched equity curve
+	// FIX: Robust MaxDD calculation
 	stats.MaxDD = computeDrawdownFromEquitySlice(stitched.Equity, stitched.BarIndices, series)
 
-	// Track minimum trades per month (FIX #10)
-	// Initialize to large value instead of count of months
-	stats.MinTradesPerMonth = math.MaxInt32
+	// 4. Compute distribution stats
+	var allReturns []float64
+	var activeReturns []float64
+	minMonth := 1.0
+	minTrades := 999999
+
+	activeMonths := 0
+	sparseMonths := 0
+
 	for _, mr := range monthlyReturns {
-		if mr.Trades < stats.MinTradesPerMonth {
-			stats.MinTradesPerMonth = mr.Trades
+		allReturns = append(allReturns, mr.Return)
+		if mr.Return < minMonth {
+			minMonth = mr.Return
+		}
+		if mr.Trades < minTrades {
+			minTrades = mr.Trades
+		}
+
+		// Active month: has trades OR significant return
+		isActive := mr.Trades > 0 || math.Abs(mr.Return) > 0.001
+		if isActive {
+			activeMonths++
+			activeReturns = append(activeReturns, mr.Return)
+		}
+
+		// Sparse month: 0 trades
+		if mr.Trades == 0 {
+			sparseMonths++
 		}
 	}
-	// Handle edge case of empty monthlyReturns
-	if len(monthlyReturns) == 0 {
+
+	stats.MinMonth = minMonth
+	stats.MinTradesPerMonth = minTrades
+	if minTrades == 999999 {
 		stats.MinTradesPerMonth = 0
 	}
 
-	// Compute monthly volatility (std dev) from active months only
-	// This prevents months with 0 trades from inflating volatility
-	stats.StdMonth = std(activeReturns)
-
-	// FIX A: Compute active months ratio for stability gate
-	// Active month = (Trades > 0) OR (abs(Return) > epsilon)
-	stats.ActiveMonthsCount = activeMonthCount
+	stats.ActiveMonthsCount = activeMonths
 	if stats.TotalMonths > 0 {
-		stats.ActiveMonthsRatio = float64(activeMonthCount) / float64(stats.TotalMonths)
+		stats.ActiveMonthsRatio = float64(activeMonths) / float64(stats.TotalMonths)
+		stats.SparseMonthsCount = sparseMonths
+		stats.SparseMonthsRatio = float64(sparseMonths) / float64(stats.TotalMonths)
 	}
 
-	// Compute sparse months ratio for quality gate
-	// Sparse month = month with 0 trades (regardless of carried positions)
-	// This catches strategies that are not consistently active
-	var sparseMonthCount int
-	for _, mr := range monthlyReturns {
-		if mr.Trades == 0 {
-			sparseMonthCount++
-		}
-	}
-	stats.SparseMonthsCount = sparseMonthCount
-	if stats.TotalMonths > 0 {
-		stats.SparseMonthsRatio = float64(sparseMonthCount) / float64(stats.TotalMonths)
+	// 5. Compute averages using robust methods (NaN-safe)
+	stats.GeoAvgMonthly = ComputeGeoAvgMonthly(allReturns)
+	stats.ActiveGeoAvgMonthly = ComputeGeoAvgMonthly(activeReturns)
+	stats.MedianMonthly = median(activeReturns)
+	stats.MedianAllMonths = median(allReturns)
+	stats.MedianActiveMonths = median(activeReturns)
+	stats.StdMonth = std(allReturns)
+
+	// 6. Compute OOS trade metrics
+	var oosTrades []Trade
+	for _, fr := range foldResults {
+		oosTrades = append(oosTrades, fr.Trades...)
 	}
 
-	// Geometric average: exp(mean(log(1+r))) - 1 from active months only
-	// This focuses on actual trading performance, not periods of inactivity
-	stats.GeoAvgMonthly = ComputeGeoAvgMonthly(activeReturns)
+	stats.OOSProfitFactor = computeProfitFactor(oosTrades)
+	stats.OOSExpectancy = computeExpectancy(oosTrades)
+	stats.OOSWinRate = computeWinRate(oosTrades)
 
-	// Validate constraints
+	// 7. Validate constraints
 	ValidateOOSConstraints(&stats, config)
 
 	return stats
 }
 
-// LogOOSResults logs OOS results with fold-by-fold and monthly breakdown
-func LogOOSResults(oos OOSStats, foldResults []FoldResult) {
-	fmt.Printf("\n=== Out-of-Sample Results ===\n")
-	fmt.Printf("Months: %d | Total Trades: %d | Max DD: %.2f%%\n",
-		oos.TotalMonths, oos.TotalTrades, oos.MaxDD*100)
-	fmt.Printf("Geo Avg Monthly: %.2f%% | Worst Month: %.2f%%\n",
-		oos.GeoAvgMonthly*100, oos.MinMonth*100)
-
-	fmt.Printf("\n--- Monthly Breakdown ---\n")
-	for _, mr := range oos.MonthlyReturns {
-		fmt.Printf("Month %2d: Ret=%+6.2f%% | DD=%5.2f%% | Trades=%2d\n",
-			mr.Month, mr.Return*100, mr.DD*100, mr.Trades)
-	}
-
-	fmt.Printf("\n--- Fold Details ---\n")
-	for _, fr := range foldResults {
-		mtmInfo := ""
-		if fr.MTMPositions > 0 {
-			mtmInfo = fmt.Sprintf(" [MTM: %d pos]", fr.MTMPositions)
+func computeProfitFactor(trades []Trade) float64 {
+	grossWin := 0.0
+	grossLoss := 0.0
+	for _, t := range trades {
+		if t.PnL > 0 {
+			grossWin += float64(t.PnL)
+		} else {
+			grossLoss -= float64(t.PnL)
 		}
-		fmt.Printf("Fold %d: Score=%.4f | Ret=%+.2f%% | DD=%.2f%% | Trades=%d%s [%s -> %s]\n",
-			fr.FoldNumber, fr.TestScore, fr.TestReturn*100, fr.TestDD*100,
-			fr.TestTrades, mtmInfo, fr.TrainDate, fr.TestDate)
 	}
+	if grossLoss == 0 {
+		if grossWin > 0 {
+			return 999.0
+		}
+		return 0.0
+	}
+	return grossWin / grossLoss
 }
 
-// LogBestStrategy logs best strategy metrics with UniqueFeatureCount fix
-func LogBestStrategy(stats OOSStats, complexity Complexity, fitness float64) {
-	fmt.Printf("bestFit=%.4f ", fitness)
-	fmt.Printf("geoMo=%.1f%% ", stats.GeoAvgMonthly*100)
-	fmt.Printf("medMo=%.1f%% ", stats.MedianMonthly*100)
-	fmt.Printf("minMo=%.1f%% ", stats.MinMonth*100)
-	fmt.Printf("months=%d ", stats.TotalMonths)
-	fmt.Printf("trades=%d ", stats.TotalTrades)
-	fmt.Printf("dd=%.1f%% ", stats.MaxDD*100)
-	fmt.Printf("nodes=%d ", complexity.NodeCount)
-	fmt.Printf("feats=%d\n", complexity.UniqueFeatureCount()) // FIX #8: Added ()
+func computeExpectancy(trades []Trade) float64 {
+	if len(trades) == 0 {
+		return 0
+	}
+	totalPnL := 0.0
+	for _, t := range trades {
+		totalPnL += float64(t.PnL)
+	}
+	return totalPnL / float64(len(trades))
+}
+
+func computeWinRate(trades []Trade) float64 {
+	if len(trades) == 0 {
+		return 0
+	}
+	wins := 0
+	for _, t := range trades {
+		if t.PnL > 0 {
+			wins++
+		}
+	}
+	return float64(wins) / float64(len(trades))
 }

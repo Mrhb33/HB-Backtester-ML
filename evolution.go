@@ -33,10 +33,16 @@ func NewHallOfFame(k int) *HallOfFame {
 	return &HallOfFame{K: k}
 }
 
+// Add adds an elite to the Hall of Fame with proper locking.
 func (h *HallOfFame) Add(e Elite) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.addLocked(e)
+}
 
+// addLocked adds an elite assuming the lock is already held.
+// This is an internal helper for Add() and SeedFromCandidates().
+func (h *HallOfFame) addLocked(e Elite) {
 	// CRITICAL FIX: Reject elites with invalid scores (sentinel corruption)
 	// Sentinel -1e30 means uninitialized/overflow score - these should not be in HallOfFame
 	if e.ValScore < -1e20 || math.IsNaN(float64(e.ValScore)) || math.IsInf(float64(e.ValScore), 0) {
@@ -46,21 +52,23 @@ func (h *HallOfFame) Add(e Elite) {
 		return
 	}
 
-	// CRITICAL FIX: Reject negative scores when pool is full
-	// Once elite pool is full, only admit strategies with positive scores
-	// This prevents the elite set from becoming noisy with junk strategies
+	// CRITICAL FIX: Reject candidates that don't improve the pool when full
+	// Once elite pool is full, only admit strategies better than the worst elite
+	// This prevents rejecting improving candidates with negative scores
 	poolFull := len(h.Elites) >= h.K
-	if poolFull && e.ValScore <= 0 {
-		// Find worst score for logging
+	if poolFull {
 		worstOverallScore := float32(0.0)
 		if len(h.Elites) > 0 {
 			worstOverallScore = h.Elites[len(h.Elites)-1].ValScore
 		}
-		if Verbose {
-			fmt.Printf("[HOF-REJECT] Pool full (%d/%d), newScore=%.4f <= 0, worstScore=%.4f\n",
-				len(h.Elites), h.K, e.ValScore, worstOverallScore)
+		// Only reject if not better than worst (not if <= 0)
+		if e.ValScore <= worstOverallScore {
+			if Verbose {
+				fmt.Printf("[HOF-REJECT] Pool full (%d/%d), newScore=%.4f <= worstScore=%.4f\n",
+					len(h.Elites), h.K, e.ValScore, worstOverallScore)
+			}
+			return
 		}
-		return
 	}
 
 	// Use CoarseFingerprint for diversity tracking (threshold buckets)
@@ -200,6 +208,8 @@ func minInt(a, b int) int {
 // SeedFromCandidates adds the best N candidates as elites when HOF is empty
 // This is an emergency recovery mechanism when population collapses
 // CHANGES SEARCH DYNAMICS: Results won't be comparable to runs without seeding
+// CRITICAL FIX: Hold lock throughout and use addLocked() to prevent deadlock
+// The outer lock protects all h.Elites access and prevents race conditions
 func (h *HallOfFame) SeedFromCandidates(candidates []Elite, maxSeeds int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -213,23 +223,18 @@ func (h *HallOfFame) SeedFromCandidates(candidates []Elite, maxSeeds int) {
 		return candidates[i].ValScore > candidates[j].ValScore
 	})
 
-	// CRITICAL FIX: Use h.Add() instead of direct append to respect fingerprint diversity caps
-	// This prevents seeding 5 identical fingerprints which would block progress
+	// CRITICAL FIX: Use h.addLocked() instead of h.Add() to avoid deadlock
+	// addLocked() assumes lock is already held, avoiding nested lock acquisition
 	seedCount := minInt(maxSeeds, len(candidates))
 	seeded := 0
 	for i := 0; i < seedCount; i++ {
-		// Try to add via normal Add() path which enforces fingerprint diversity
+		// Try to add via addLocked() path which enforces fingerprint diversity
 		beforeLen := len(h.Elites)
-		h.Add(candidates[i])
+		h.addLocked(candidates[i])
 		if len(h.Elites) > beforeLen {
 			seeded++
 		}
 	}
-
-	// Update atomic snapshot
-	snapshot := make([]Elite, len(h.Elites))
-	copy(snapshot, h.Elites)
-	h.snapshot.Store(snapshot)
 
 	fmt.Printf("[EMERGENCY-SEED] Seeded %d/%d elites from candidates (HOF was empty)\n", seeded, seedCount)
 }

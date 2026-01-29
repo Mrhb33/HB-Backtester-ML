@@ -65,14 +65,15 @@ var globalQuiet int32 = 0
 // Global edge minimum multiplier (default 2, can be lowered to 1 during recovery)
 var globalEdgeMinMult int32 = 2
 
-// PROBLEM A FIX: Relaxed entry rate threshold for discovery phase (was 120)
+// PROBLEM A & B FIX: Updated entry rate thresholds
 // During discovery: use 30-60 edges/year to avoid killing promising edges early
 // Can be raised back to 120+ after finding good candidates
-var globalMinEdgesPerYear int32 = 40      // Default: 40 edges/year (relaxed for discovery)
-var wfDiscoveryEdgesPerYear float64 = 0.5 // EMERGENCY: Allow 6 edges/year at 1H (0.5 × 12)
+var globalMinEdgesPerYear int32 = 40 // Default: 40 edges/year (relaxed for discovery)
+var wfDiscoveryEdgesPerYear float64 = 30.0 // FIX B: Increased from 0.5 to 30.0 to prevent zero-trade OOS
 
 // DEBUG: Disable entry rate gate entirely for diagnosis (set to true to allow all strategies through)
-var debugDisableEntryRateGate bool = true
+// FIX B: Set to false so entry rate gate is enabled by default
+var debugDisableEntryRateGate bool = false
 
 // setDebugDisableEntryRateGate sets the debug flag for disabling entry rate gate
 func setDebugDisableEntryRateGate(disable bool) {
@@ -1260,15 +1261,27 @@ func evaluateWithWalkForward(full Series, fullF Features, st Strategy, screenW, 
 		ProfitFactor: float32(oosStats.OOSProfitFactor), // Real PF from OOS trades
 
 		// OOS Stats for EliteLog output - these contain the real OOS metrics
-		OOSGeoAvgMonthly:  oosStats.GeoAvgMonthly,
-		OOSMedianMonthly:  oosStats.MedianMonthly,
-		OOSMinMonth:       oosStats.MinMonth,
-		OOSStdMonth:       oosStats.StdMonth,
-		OOSMaxDD:          oosStats.MaxDD,
-		OOSTotalMonths:    oosStats.TotalMonths,
-		OOSTotalTrades:    oosStats.TotalTrades,
-		OOSMonthlyReturns: convertMonthlyReturnsToJSON(oosStats.MonthlyReturns),
+		OOSGeoAvgMonthly:       oosStats.GeoAvgMonthly,
+		OOSActiveGeoAvgMonthly: oosStats.ActiveGeoAvgMonthly, // Diagnostic: active-only geo
+		OOSMedianMonthly:       oosStats.MedianMonthly,
+		OOSMinMonth:            oosStats.MinMonth,
+		OOSStdMonth:            oosStats.StdMonth,
+		OOSMaxDD:               oosStats.MaxDD,
+		OOSTotalMonths:         oosStats.TotalMonths,
+		OOSTotalTrades:         oosStats.TotalTrades,
+		OOSMonthlyReturns:      convertMonthlyReturnsToJSON(oosStats.MonthlyReturns),
 	}
+
+	// Also copy OOS stats to trainR for consistency in batch progress reporting
+	trainR.OOSGeoAvgMonthly = valR.OOSGeoAvgMonthly
+	trainR.OOSActiveGeoAvgMonthly = valR.OOSActiveGeoAvgMonthly
+	trainR.OOSMedianMonthly = valR.OOSMedianMonthly
+	trainR.OOSMinMonth = valR.OOSMinMonth
+	trainR.OOSStdMonth = valR.OOSStdMonth
+	trainR.OOSMaxDD = valR.OOSMaxDD
+	trainR.OOSTotalMonths = valR.OOSTotalMonths
+	trainR.OOSTotalTrades = valR.OOSTotalTrades
+	trainR.OOSMonthlyReturns = valR.OOSMonthlyReturns
 
 	// NOTE: LogOOSResults disabled for walk-forward to reduce terminal spam.
 	// Monthly returns are already displayed in the terminal for accepted elites.

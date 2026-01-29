@@ -163,6 +163,15 @@ func ReturnColor(ret float32) string {
 	return Error(fmt.Sprintf("%.2f%%", ret*100))
 }
 
+// MedianColor returns color-coded median with 4 decimal precision
+// Positive returns are green, negative are red
+func MedianColor(med float32) string {
+	if med > 0 {
+		return Success(fmt.Sprintf("%.4f%%", med*100))
+	}
+	return Error(fmt.Sprintf("%.4f%%", med*100))
+}
+
 // DDColor returns color-coded drawdown based on severity
 // Low DD (<0.10) is green, medium (<0.20) is yellow, high is red
 func DDColor(dd float32) string {

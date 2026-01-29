@@ -4,8 +4,12 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync/atomic"
 	"time"
 )
+
+// Rate-limit fold debug logging across strategies
+var wfFoldLogCounter atomic.Int64
 
 // WFConfig holds walk-forward validation configuration
 type WFConfig struct {
@@ -440,16 +444,19 @@ func ExtractTestPeriodMetrics(fullBacktest coreBacktestResult, testStart, testEn
 }
 
 // extractMTMEquityForTestPeriod extracts test-period MTM equity with compatibility handling
-// Handles both old (test-window-only) and new (full-range) recording formats
+// Uses RAW MTM equity (RiskPct=1.0) for consistency with scoring/returns.
+// Handles both old (test-window-only) and new (full-range) recording formats.
 func extractMTMEquityForTestPeriod(full coreBacktestResult, testStartLocal, testEndLocal int) []float64 {
 	want := testEndLocal - testStartLocal
 	if want <= 0 {
 		return []float64{1.0}
 	}
 
-	src := full.MTMEquity
+	// Prefer RAW MTM equity (RiskPct=1.0) so OOS stats align with trade PnL/score units.
+	// Fall back to risk-adjusted MTM if raw is unavailable.
+	src := full.RawMTMEquity
 	if len(src) == 0 {
-		src = full.RawMTMEquity
+		src = full.MTMEquity
 	}
 	if len(src) == 0 {
 		// No MTM data - return flat curve
@@ -465,16 +472,49 @@ func extractMTMEquityForTestPeriod(full coreBacktestResult, testStartLocal, test
 	// Handle different recording scenarios
 	if len(src) == testEndLocal || len(src) == testEndLocal-1 {
 		// Recorded for entire local range - slice test window
-		// Check for both endLocal and endLocal-1 to handle loop starting at t=1
-		start := testStartLocal
-		end := testEndLocal
-		if end > len(src) {
-			end = len(src)
+		// src[0] corresponds to bar 1 (because loop starts t=1)
+		// Map barIdx -> srcIdx = barIdx - 1
+		startIdx := testStartLocal - 1
+		endIdx := testEndLocal - 1 // exclusive
+
+		// Handle edge case: if test starts at bar 0, prepend initial equity
+		prependBar0 := false
+		if startIdx < 0 {
+			startIdx = 0
+			prependBar0 = true // testStartLocal == 0, missing bar0 in src
 		}
-		if start >= end || start >= len(src) {
-			return []float64{1.0}
+
+		// Boundary checks
+		if endIdx < 0 {
+			endIdx = 0
 		}
-		raw = src[start:end]
+		if endIdx > len(src) {
+			endIdx = len(src)
+		}
+		if startIdx > endIdx {
+			startIdx = endIdx
+		}
+
+		// Extract slice
+		raw = append([]float64{}, src[startIdx:endIdx]...)
+
+		// If test started at bar 0, inject bar0 equity = 1.0 so normalization is sane
+		if prependBar0 {
+			raw = append([]float64{1.0}, raw...)
+		}
+
+		// Force exact length = want (testEndLocal - testStartLocal)
+		if len(raw) > want {
+			raw = raw[:want]
+		} else if len(raw) < want {
+			last := 1.0
+			if len(raw) > 0 {
+				last = raw[len(raw)-1]
+			}
+			for len(raw) < want {
+				raw = append(raw, last)
+			}
+		}
 	} else if len(src) >= want {
 		// Recorded only for test window - use as-is
 		raw = src
@@ -617,25 +657,18 @@ func computeDDFromTrades(trades []Trade) float64 {
 	return maxDD
 }
 
-// computeWinRate computes win rate from trades
-func computeWinRate(trades []Trade) float64 {
-	if len(trades) == 0 {
-		return 0
-	}
-
-	wins := 0
-	for _, t := range trades {
-		if t.PnL > 0 {
-			wins++
-		}
-	}
-
-	return float64(wins) / float64(len(trades))
-}
-
 // EvaluateWalkForward evaluates a strategy across all walk-forward folds
 func EvaluateWalkForward(series Series, features Features, strategy Strategy, folds []Fold, config WFConfig) (OOSStats, StitchedOOSData, []FoldResult) {
 	var foldResults []FoldResult
+
+	// Debug fold logging is extremely noisy; rate-limit across strategies.
+	logFolds := false
+	if DebugWalkForward {
+		n := wfFoldLogCounter.Add(1)
+		if n == 1 || n%500 == 0 {
+			logFolds = true
+		}
+	}
 
 	for i, fold := range folds {
 		// Compute warmup for this strategy
@@ -676,74 +709,25 @@ func EvaluateWalkForward(series Series, features Features, strategy Strategy, fo
 			fr.TestDate = time.UnixMilli(series.CloseTimeMs[fold.TestStart]).UTC().Format("2006-01")
 		}
 
-		// DEBUG: Print fold execution path diagnostics (after dates are set, only if debug_wf enabled)
+		// DEBUG: Print fold execution path diagnostics (rate-limited to avoid spam)
 		// If signals>0 but trades=0, your execution path is broken
-		if DebugWalkForward {
-			fmt.Printf("[FOLD %d] bars=%d signals=%d entries=%d exits=%d test_trades=%d %s\n",
-				i, testEndLocal-testStartLocal, core.signalCount, core.entryCount, core.exitCount, fr.TestTrades,
-				fr.TrainDate+" -> "+fr.TestDate)
+		if logFolds {
+			// Log only first 3 folds and the last fold to keep output readable
+			if i < 3 || i == len(folds)-1 {
+				fmt.Printf("[FOLD %d] bars=%d signals=%d entries=%d exits=%d test_trades=%d %s\n",
+					i, testEndLocal-testStartLocal, core.signalCount, core.entryCount, core.exitCount, fr.TestTrades,
+					fr.TrainDate+" -> "+fr.TestDate)
+			}
 		}
 
 		foldResults = append(foldResults, fr)
 	}
 
-	// Stitch OOS equity curve
+	// Compute OOS stats (includes stitching and monthly returns internally)
+	oosStats := CalculateOOSStats(foldResults, series, config)
+
+	// Stitch OOS equity curve for return value
 	stitched := StitchOOSEquityCurve(foldResults, series)
-
-	// Compute monthly returns
-	monthlyReturns := ComputeMonthlyReturnsFromEquity(stitched, foldResults, series)
-
-	// Compute OOS stats
-	oosStats := ComputeOOSStats(stitched, monthlyReturns, foldResults, series, config)
-
-	// Compute OOS ProfitFactor and Expectancy from all fold trades
-	// Aggregate all trades from all folds
-	var allOOSTrades []Trade
-	for _, fr := range foldResults {
-		allOOSTrades = append(allOOSTrades, fr.Trades...)
-	}
-
-	// Compute OOS PF/Expectancy using correct formulas
-	var grossWin, grossLoss, sumPnL float64
-	var wins, losses int
-	for _, t := range allOOSTrades {
-		sumPnL += float64(t.PnL) // PnL already includes fees+slippage
-		if t.PnL > 0 {
-			wins++
-			grossWin += float64(t.PnL)
-		} else {
-			losses++
-			grossLoss += -float64(t.PnL)
-		}
-	}
-
-	// Profit Factor with edge cases
-	var pf float64
-	if grossLoss > 0 && grossWin > 0 {
-		pf = grossWin / grossLoss
-	} else if grossLoss == 0 && grossWin > 0 {
-		pf = InfiniteProfitFactor // +Inf capped (all wins)
-	} else if grossWin == 0 && grossLoss > 0 {
-		pf = 0.0 // All losses
-	} else {
-		pf = 0.0 // No trades or flat
-	}
-
-	// Expectancy: average net PnL per trade (standard formula)
-	var exp float64
-	if len(allOOSTrades) > 0 {
-		exp = sumPnL / float64(len(allOOSTrades))
-	}
-
-	// Win Rate: wins / total trades (standard formula)
-	var wr float64
-	if len(allOOSTrades) > 0 {
-		wr = float64(wins) / float64(len(allOOSTrades))
-	}
-
-	oosStats.OOSProfitFactor = pf
-	oosStats.OOSExpectancy = exp
-	oosStats.OOSWinRate = wr
 
 	return oosStats, stitched, foldResults
 }
