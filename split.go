@@ -57,6 +57,7 @@ func SliceSeries(s Series, i0, i1 int) Series {
 }
 
 // SliceFeatures creates a new Features slice from i0 (inclusive) to i1 (exclusive)
+// OPTIMIZATION: Reuses Index map and Stats since feature order doesn't change (only bar range changes)
 func SliceFeatures(f Features, i0, i1 int) Features {
 	if i0 < 0 {
 		i0 = 0
@@ -71,22 +72,16 @@ func SliceFeatures(f Features, i0, i1 int) Features {
 	out := Features{
 		F:     make([][]float32, len(f.F)),
 		Names: f.Names,
+		// OPTIMIZATION: Reuse Index map - slicing bars doesn't change feature indices
+		// Index maps feature names to feature slot indices, which remain the same
+		Index: f.Index,
+		// OPTIMIZATION: Reuse Types and Stats - they're per-feature metadata, not per-bar
+		Types: f.Types,
+		Stats: f.Stats,
 	}
 	for k := range f.F {
 		out.F[k] = f.F[k][i0:i1]
 	}
-
-	// FIX: Rebuild index map for sliced data - indices are sequential 0..len(Names)-1
-	// DO NOT copy the old Index map as it points to wrong positions in sliced arrays
-	out.Index = make(map[string]int, len(f.Names))
-	for i := 0; i < len(out.Names); i++ {
-		out.Index[out.Names[i]] = i
-	}
-
-	// Copy Types and Stats arrays (they're already per-feature, not per-bar)
-	out.Types = f.Types
-	out.Stats = make([]FeatureStats, len(f.Stats))
-	copy(out.Stats, f.Stats)
 
 	return out
 }

@@ -2,6 +2,7 @@ package logx
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -143,8 +144,17 @@ func Checkmark(passed bool) string {
 
 // ScoreColor returns color-coded score based on value
 // Positive scores are green, negative are red
-// Sentinel values (-1e30) are displayed as "REJECTED"
+// Sentinel/NaN/Inf values are displayed as "REJECTED"
 func ScoreColor(score float32) string {
+	// Check NaN first (NaN != NaN is true)
+	if score != score {
+		return Error("REJECTED(NaN)")
+	}
+	// Check Inf
+	if math.IsInf(float64(score), 0) {
+		return Error("REJECTED(Inf)")
+	}
+	// Sentinel check
 	if score < -1e20 {
 		return Error("REJECTED")
 	}

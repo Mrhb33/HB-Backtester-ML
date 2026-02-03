@@ -33,6 +33,7 @@ type WFConfig struct {
 	MaxSparseMonthsRatio     float64 // FIX: Maximum ratio of sparse months (0 trades) to total months (reject if > 0.35)
 	MinMedianMonthly         float64 // NEW: Minimum median monthly return
 	MaxStdMonth              float64 // Maximum monthly volatility (std dev) - rejects unstable strategies
+	MaxZeroTradeFoldRatio    float64 // PROBLEM B FIX: Maximum ratio of zero-trade folds to total folds (reject if > 0.20)
 
 	// Penalty weights
 	MonthlyVolLambda float64

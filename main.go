@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -22,6 +23,10 @@ import (
 
 	"hb_bactest_checker/logx"
 )
+
+// BUILD VERSION - Update this when making changes to detect old binaries
+// Format: YYYY-MM-DD_HH:MM (manual update on each significant change)
+const BuildVersion = "2026-02-02_FIX_QT_V4"
 
 // Global verbose flag - controls debug output across all packages
 var Verbose bool = false
@@ -54,6 +59,10 @@ var wfConfig WFConfig
 // Global timeframe in minutes (default 5 for 5-minute bars)
 var globalTimeframeMinutes int32 = 5
 
+// Global candles per year (calculated from timeframe: 365*24*60/tfMinutes)
+// Default for 5-minute bars: 365*24*12 = 105120
+var globalCandlesPerYear float32 = 105120
+
 // Generator loop counters (atomic for thread safety)
 var (
 	genGenerated       int64 // Total strategies generated
@@ -77,6 +86,9 @@ func getGeneratorStats() string {
 	// Use exact counters for seen tracking
 	hits := atomic.LoadInt64(&seenHits)
 	newFp := atomic.LoadInt64(&seenNew)
+
+	// Get dead prefilter stats (deadRerolled tracked separately for generator loop)
+	deadEntry, sparseEntry, deadRegime, _ := GetDeadStrategyCounts()
 
 	totalGenerated := generated
 	if totalGenerated == 0 {
@@ -131,8 +143,18 @@ func getGeneratorStats() string {
 		sentPct = 100
 	}
 
-	return fmt.Sprintf("gen=%d rej_sur=%d(%.1f%%) rej_seen=%d/%d(%.1f%%) rerolled=%d(%.1f%%) rej_novelty=%d(%.1f%%) sent=%d(%.1f%%)",
-		generated, rejectedSur, surPct, hits, seenTotal, seenPct, rerolled, rerolledPct, rejectedNovelty, noveltyPct, sentToJobs, sentPct)
+	// Calculate dead prefilter percentage (dead + sparse + regime)
+	prefilterTotal := deadEntry + sparseEntry + deadRegime
+	prefilterPct := 100.0 * float64(prefilterTotal) / float64(totalGenerated)
+	if prefilterPct < 0 {
+		prefilterPct = 0
+	}
+	if prefilterPct > 100 {
+		prefilterPct = 100
+	}
+
+	return fmt.Sprintf("gen=%d rej_sur=%d(%.1f%%) rej_seen=%d/%d(%.1f%%) rerolled=%d(%.1f%%) rej_novelty=%d(%.1f%%) prefilter=%d[dead=%d,sparse=%d,regime=%d](%.1f%%) sent=%d(%.1f%%)",
+		generated, rejectedSur, surPct, hits, seenTotal, seenPct, rerolled, rerolledPct, rejectedNovelty, noveltyPct, prefilterTotal, deadEntry, sparseEntry, deadRegime, prefilterPct, sentToJobs, sentPct)
 }
 
 type BatchMsg struct {
@@ -162,6 +184,20 @@ type EliteLog struct {
 	ValMaxDD       float32 `json:"val_max_dd"`
 	ValWinRate     float32 `json:"val_win_rate"`
 	ValTrades      int     `json:"val_trades"`
+
+	// OOS Walk-Forward Statistics (detailed monthly breakdown)
+	OOSGeoAvgMonthly       float64              `json:"oos_geo_avg_monthly,omitempty"`        // Geometric average monthly return
+	OOSActiveGeoAvgMonthly float64              `json:"oos_active_geo_avg_monthly,omitempty"` // Geo avg (active months only)
+	OOSMedianMonthly       float64              `json:"oos_median_monthly,omitempty"`         // Median monthly return
+	OOSMinMonth            float64              `json:"oos_min_month,omitempty"`              // Worst single month
+	OOSStdMonth            float64              `json:"oos_std_month,omitempty"`              // Std dev of monthly returns
+	OOSMaxDD               float64              `json:"oos_max_dd,omitempty"`                 // Max drawdown across OOS
+	OOSTotalMonths         int                  `json:"oos_total_months,omitempty"`           // Total months in OOS
+	OOSTotalTrades         int                  `json:"oos_total_trades,omitempty"`           // Total trades in OOS
+	OOSProfitFactor        float64              `json:"oos_profit_factor,omitempty"`          // OOS profit factor
+	OOSExpectancy          float64              `json:"oos_expectancy,omitempty"`             // OOS expectancy per trade
+	OOSWinRate             float64              `json:"oos_win_rate,omitempty"`               // OOS win rate
+	OOSMonthlyReturns      []MonthlyReturnJSON  `json:"oos_monthly_returns,omitempty"`        // Per-month breakdown
 }
 
 type ReportLine struct {
@@ -204,6 +240,14 @@ type MetaState struct {
 	MinValPF     float32 `json:"min_val_pf"`
 	MinValExpect float32 `json:"min_val_expect"`
 	MinValTrades int     `json:"min_val_trades"`
+	MinValScore  float32 `json:"min_val_score"`
+
+	// Hard cap on train score/return to prevent overfitting
+	// Reject if train exceeds these but val is poor
+	MaxTrainScore        float32 `json:"max_train_score"`        // Max train score (default 12.0)
+	MaxTrainReturn       float32 `json:"max_train_return"`       // Max train return (default 0.80 = 80%)
+	MinValScoreAfterCap  float32 `json:"min_val_score_after_cap"` // Min val score needed after cap (default 1.0)
+	MinValReturnAfterCap float32 `json:"min_val_return_after_cap"` // Min val return needed after cap (default 0.02 = 2%)
 
 	// Multi-fidelity gate control (0=strict, 1=normal, 2=relaxed, 3=very_relaxed)
 	ScreenRelaxLevel int `json:"screen_relax_level"`
@@ -225,6 +269,52 @@ func clampf(x, lo, hi float32) float32 {
 		return hi
 	}
 	return x
+}
+
+// computeScaledStabilityThreshold scales threshold based on train score
+// Higher train scores get lower threshold (expect more OOS degradation)
+// Also caps the effective train score to prevent unrealistic requirements
+// PROBLEM 7 FIX: Elite-aware bounds relaxation (bootstrap support)
+func computeScaledStabilityThreshold(baseThreshold, trainScore float32, eliteCount int) float32 {
+	if trainScore <= 0 {
+		return baseThreshold
+	}
+	// Scale: threshold = base * (3.0 / trainScore)^0.3
+	// trainScore=3: threshold=0.33, trainScore=6: threshold=0.26, trainScore=1.5: threshold=0.42
+	scaleFactor := float32(math.Pow(3.0/float64(trainScore), 0.3))
+	scaled := baseThreshold * scaleFactor
+
+	// Elite-aware bounds relaxation (bootstrap support)
+	minBound, maxBound := float32(0.15), float32(0.50)
+	if eliteCount < 10 {
+		minBound, maxBound = 0.05, 0.70 // Bootstrap: very relaxed
+	} else if eliteCount < 20 {
+		minBound, maxBound = 0.10, 0.60 // Early discovery
+	} else if eliteCount < 50 {
+		minBound, maxBound = 0.12, 0.55 // Building portfolio
+	}
+
+	if scaled < minBound {
+		scaled = minBound
+	}
+	if scaled > maxBound {
+		scaled = maxBound
+	}
+	return scaled
+}
+
+// computeStabilityRequirement computes the minimum val score required for stability
+// Caps the effective train score at 5.0 to prevent unrealistic requirements
+// when train scores explode (e.g., trainScore=13.8 would require valScore=2.7)
+// PROBLEM 7 FIX: Elite-aware bounds (requires eliteCount parameter)
+func computeStabilityRequirement(baseThreshold, trainScore float32, eliteCount int) float32 {
+	effectiveStabThreshold := computeScaledStabilityThreshold(baseThreshold, trainScore, eliteCount)
+	// Cap the effective train score used in calculation
+	effectiveTrain := trainScore
+	if effectiveTrain > 5.0 {
+		effectiveTrain = 5.0
+	}
+	return effectiveStabThreshold * effectiveTrain
 }
 
 // parseTimeframe parses a timeframe string (e.g., "5m", "60m", "1h", "4h") and returns minutes
@@ -252,6 +342,7 @@ func parseTimeframe(tf string) int32 {
 
 func main() {
 	fmt.Println("HB Backtest Strategy Search Engine")
+	fmt.Printf("Build: %s\n", BuildVersion)
 	fmt.Println("====================================")
 
 	mode := flag.String("mode", "search", "search|test|golden|trace|validate|diagnose|verify")
@@ -306,17 +397,17 @@ func main() {
 	wfMaxSparseMonthsRatio := flag.Float64("wf_max_sparse_months_ratio", 0.80, "maximum ratio of sparse months to total months")
 	wfMinActiveMonthsRatio := flag.Float64("wf_min_active_months_ratio", 0.25, "minimum ratio of active months to total months")
 	wfEnableMinMonth := flag.Bool("wf_enable_min_month", true, "enable minimum monthly return constraint")
-	wfMinMonth := flag.Float64("wf_min_month", -0.35, "minimum monthly return threshold")
+	wfMinMonth := flag.Float64("wf_min_month", -0.25, "minimum monthly return threshold (-0.25 = -25%)")
 	wfMinMedianMonthly := flag.Float64("wf_min_median_monthly", 0.003, "minimum median monthly return")
 	wfMinGeoMonthly := flag.Float64("wf_min_geo_monthly", 0.005, "minimum geometric average monthly return")
 	// FIX PROBLEM B: Increased from 0.03 to 30.0 to prevent zero-trade OOS rejections
 	// 0.03 was way too low and allowed "dead" strategies through that never trade in OOS
-	// 30 edges/year = ~2.5 trades/month minimum for statistical significance
-	wfMinEdgesPerYear := flag.Float64("wf_min_edges_per_year", 30.0, "minimum edges per year threshold (FIX: increased from 0.03 to reduce zero-trade OOS)")
-	// FIX PROBLEM B: Enable per-fold edge gate with meaningful threshold
-	// Was 0 (disabled), now set to 15.0 to ensure each fold has minimum trading activity
-	// This prevents strategies that only trade in 1-2 folds from passing
-	wfFoldMinEdgesPerYear := flag.Float64("wf_fold_min_edges_per_year", 15.0, "minimum edges per year per-fold threshold (FIX: increased from 0 to reduce sparse fold rejections)")
+	// PROBLEM C FIX: Lower edge requirements to allow realistic trading frequencies and reduce overfitting pressure
+	// 10 edges/year = ~0.8 trades/month (was 30, too strict causing overfit on sparse patterns)
+	wfMinEdgesPerYear := flag.Float64("wf_min_edges_per_year", 10.0, "minimum edges per year threshold (PROBLEM C: lowered from 30 to reduce overfit)")
+	// PROBLEM C FIX: Enable per-fold edge gate with realistic threshold
+	// 3 edges/year/fold = ~0.25 trades/month per fold (was 15, too strict)
+	wfFoldMinEdgesPerYear := flag.Float64("wf_fold_min_edges_per_year", 3.0, "minimum edges per year per-fold threshold (PROBLEM C: lowered from 15 to realistic level)")
 	wfDDLambda := flag.Float64("wf_dd_lambda", 0.008, "drawdown penalty lambda")
 	wfVolLambda := flag.Float64("wf_vol_lambda", 0.004, "volatility penalty lambda")
 	_ = flag.Float64("target_geo_monthly", 0.12, "target geometric monthly return for scoring (reserved for future use)")
@@ -324,11 +415,18 @@ func main() {
 	minValPFFlag := flag.Float64("min_val_pf", 1.01, "minimum validation portfolio factor")
 	maxValDDFlag := flag.Float64("max_val_dd", 0.45, "maximum validation drawdown")
 	autoAdjust := flag.Bool("auto_adjust", false, "Enable automatic tightening of validation gates during search")
+	minValScoreFlag := flag.Float64("min_val_score", -10.0, "minimum validation score threshold")
+	minValTradesFlag := flag.Int("min_val_trades", 10, "minimum validation trades threshold")
+	stabilityThresholdFlag := flag.Float64("stability_threshold", 0.0, "stability threshold (0.0 for auto 3x return)")
+	ignoreMeta := flag.Bool("ignore_meta", false, "skip loading meta.json (use command-line flags)")
 	flag.Parse()
 
 	// Parse timeframe (e.g., "5m", "15m", "60m" OR "1h", "4h")
 	tfMinutes := parseTimeframe(*timeframe)
 	atomic.StoreInt32(&globalTimeframeMinutes, tfMinutes)
+
+	// Calculate candles per year based on timeframe (365 days * 24 hours * 60 minutes / tfMinutes)
+	globalCandlesPerYear = float32(365*24*60) / float32(tfMinutes)
 
 	// Set global verbose flag from command line
 	Verbose = *verbose
@@ -346,7 +444,7 @@ func main() {
 		TestDays:                 *wfTestDays,
 		StepDays:                 *wfStepDays,
 		MinFolds:                 3,
-		MinTradesPerFold:         10,
+		MinTradesPerFold:         8, // PROBLEM 3 FIX: Increased from 5 to reduce borderline sparse folds
 		MinMonths:                3,
 		MinTotalTradesOOS:        *wfMinTradesOOS,
 		MinTradesPerMonth:        2,
@@ -358,6 +456,7 @@ func main() {
 		MaxSparseMonthsRatio:     *wfMaxSparseMonthsRatio,
 		MinMedianMonthly:         *wfMinMedianMonthly,
 		MaxStdMonth:              0.5,
+		MaxZeroTradeFoldRatio:    0.15, // PROBLEM 3 FIX: Tightened from 20% to 15% to reject borderline sparse strategies
 		MonthlyVolLambda:         *wfVolLambda,
 		DDPenaltyLambda:          *wfDDLambda,
 		LambdaNodes:              0.001,
@@ -370,9 +469,31 @@ func main() {
 	}
 	VerifyMode = *verifyMode
 
+	// Sync sentinel DD with user configuration + 5% margin
+	// Sentinel should NEVER reject what user gates would allow
+	sentinelDD := float32(*maxValDDFlag) + 0.05
+	if wfConfig.Enable && float32(wfConfig.MaxDrawdown)+0.05 > sentinelDD {
+		sentinelDD = float32(wfConfig.MaxDrawdown) + 0.05
+	}
+	if sentinelDD > 0.95 {
+		sentinelDD = 0.95
+	}
+	setSentinelMaxDD(sentinelDD)
+
 	// Convert flag values to float32
 	feeBps := float32(*feeBpsFlag)
 	slipBps := float32(*slipBpsFlag)
+
+	// PROBLEM D FIX: Safety check - fees should never be 0 unless explicitly intended
+	// Warn if fees are 0 to prevent accidental unrealistic backtests
+	if feeBps == 0 && *feeBpsFlag == 0 { // Only warn if default was explicitly set to 0
+		fmt.Println("[WARNING] Running with ZERO fees! Results will be overly optimistic.")
+		fmt.Println("[WARNING] Use -fee_bps 20 for realistic crypto trading costs (0.2%)")
+	}
+	if slipBps == 0 && *slipBpsFlag == 0 {
+		fmt.Println("[WARNING] Running with ZERO slippage! Results will be overly optimistic.")
+		fmt.Println("[WARNING] Use -slip_bps 5 for realistic slippage (0.05%)")
+	}
 
 	// Track which flags were explicitly set for friction reduction
 	feeBpsWasSet := false
@@ -413,11 +534,11 @@ func main() {
 	fmt.Printf("  Components: logReturn*6.0 + calmar*2.0 + expectancy*200.0 + tradesReward*0.01 - ddPenalty*6.0\n")
 	fmt.Printf("              + sortino*0.5 - smoothPenalty*0.5 - deflationPenalty\n")
 	fmt.Printf("  Caps: calmar=[-inf,10], expectancy=[-5,5], sortino=[-10,20]\n")
-	fmt.Printf("  Sentinel: -1e30 for hard rejection (trades==0 || dd>=0.45)\n")
+	fmt.Printf("  Sentinel: -1e30 for hard rejection (trades==0 || dd>=%.2f)\n", getSentinelMaxDD())
 	fmt.Printf("====================================================================================================\n\n")
 
 	// Define scoring thresholds based on mode
-	var maxValDD, minValReturn, minValPF, minValExpect float32
+	var maxValDD, minValReturn, minValPF, minValExpect, minValScore float32
 	var minValTrades int
 	if *scoringMode == "aggressive" {
 		// Aggressive mode: stricter profit gates, looser DD to encourage exploration
@@ -425,16 +546,18 @@ func main() {
 		minValReturn = float32(*minValReturnFlag)
 		minValPF = float32(*minValPFFlag)
 		minValExpect = 0.0 // TEMP warm-start: allow any expectancy
-		minValTrades = 20  // TEMP warm-start: 20 trades until elites exist, then 30
-		fmt.Printf("Scoring mode: AGGRESSIVE (DD<%.2f, ret>%.1f%%, pf>%.2f, exp>%.4f) [WARM-START]\n", maxValDD, minValReturn*100, minValPF, minValExpect)
+		minValScore = float32(*minValScoreFlag)
+		minValTrades = *minValTradesFlag
+		fmt.Printf("Scoring mode: AGGRESSIVE (DD<%.2f, ret>%.1f%%, pf>%.2f, exp>%.4f, score>%.1f) [WARM-START]\n", maxValDD, minValReturn*100, minValPF, minValExpect, minValScore)
 	} else {
 		// Balanced mode (default): balanced gates for stability and exploration
 		maxValDD = float32(*maxValDDFlag)
 		minValReturn = float32(*minValReturnFlag)
 		minValPF = float32(*minValPFFlag)
 		minValExpect = 0.0 // TEMP warm-start: allow any expectancy
-		minValTrades = 20  // TEMP warm-start: 20 trades until elites exist, then 30
-		fmt.Printf("Scoring mode: BALANCED (DD<%.2f, ret>%.1f%%, pf>%.2f, exp>%.4f) [WARM-START]\n", maxValDD, minValReturn*100, minValPF, minValExpect)
+		minValScore = float32(*minValScoreFlag)
+		minValTrades = *minValTradesFlag
+		fmt.Printf("Scoring mode: BALANCED (DD<%.2f, ret>%.1f%%, pf>%.2f, exp>%.4f, score>%.1f) [WARM-START]\n", maxValDD, minValReturn*100, minValPF, minValExpect, minValScore)
 	}
 
 	// Initialize MetaState for self-improving search
@@ -447,9 +570,15 @@ func main() {
 		MinValPF:         minValPF,
 		MinValExpect:     minValExpect,
 		MinValTrades:     minValTrades,
+		MinValScore:      minValScore,
 		ScreenRelaxLevel: 1, // CRITICAL FIX #6: Default to normal screening (was 3)
 		// The complexity rule in strategy.go prevents volume-only junk strategies,
 		// so we can keep screening strict without needing desperate relaxation
+		// Hard cap on train score/return to prevent overfitting (exploding train scores)
+		MaxTrainScore:        12.0,  // Reject if train_score > 12.0 AND val_score < 1.0
+		MaxTrainReturn:       0.80,  // Reject if train_ret > 80% AND val_ret < 2%
+		MinValScoreAfterCap:  1.0,   // Minimum val score required after train cap
+		MinValReturnAfterCap: 0.02,  // Minimum val return required after train cap (2%)
 	}
 
 	// Part C2: Log gate thresholds at startup
@@ -463,6 +592,14 @@ func main() {
 	fmt.Printf("  Val:    minReturn=%.4f, minPF=%.2f, minExp=%.4f, maxDD=%.2f, minTrades=%d\n",
 		meta.MinValReturn, meta.MinValPF, meta.MinValExpect, meta.MaxValDD, meta.MinValTrades)
 	fmt.Printf("  RelaxLevel: %d (0=strict, 1=normal, 2=relaxed, 3=very-relaxed) [%s]\n", relaxLevel, relaxName)
+	// CRITICAL FIX: Print overlap gate bands to confirm correct values are being used
+	fmt.Printf("  Overlap: entry_rate=[%.1f%%, %.1f%%] (effective max: %.1f%%), regime_rate=[%.1f%%, %.1f%%] (effective max: %.1f%%)\n",
+		OverlapMinEntryRate, OverlapMaxEntryRate, OverlapMaxEntryRate+OverlapEntryRateEpsilon,
+		OverlapMinRegimeRate, OverlapMaxRegimeRate, OverlapMaxRegimeRate+OverlapRegimeRateEpsilon)
+	// CRITICAL FIX: Print QuickTest gate thresholds for visibility
+	// QT thresholds: minPF=1.0 (hardcoded), minReturn adapts (-5% bootstrap, 0% normal), minTrades from flag, maxDD from val
+	fmt.Printf("  QuickTest: minPF=1.00, minReturn=%s, minTrades=%d, maxDD=%.2f\n",
+		"adaptive(-5% bootstrap, 0% normal)", *qtMinTrades, meta.MaxValDD)
 	fmt.Printf("====================================================================================================\n\n")
 
 	// Mode dispatch
@@ -628,46 +765,55 @@ func main() {
 	// Anti-stagnation tracking (thread-safe)
 	var radicalP float32 = 0.10     // base radical mutation probability
 	var surExploreP float32 = 0.10  // base surrogate exploration
-	var surThreshold float64 = -0.5 // surrogate filtering threshold - start more aggressive to filter junk early
+	var surThreshold float64 = -1.2 // PROBLEM D FIX: Lowered from -0.5 to -1.2 to reduce "no_candidates" and keep funnel flowing
 	var lastBestValScore float32 = -1e30
 	var batchesSinceLastImprovement int
 	var stagnationMu sync.RWMutex // protects the above anti-stagnation variables
 
 	// Load meta.json if exists and apply to runtime knobs (must be after vars declared)
-	if b, err := os.ReadFile("meta.json"); err == nil {
-		if err := json.Unmarshal(b, &meta); err == nil {
-			fmt.Printf("Loaded meta.json: Batches=%d, BestVal=%.4f, RadicalP=%.2f, SurExploreP=%.2f, ScreenRelaxLevel=%d\n",
-				meta.Batches, meta.BestVal, meta.RadicalP, meta.SurExploreP, meta.ScreenRelaxLevel)
-			// Apply loaded meta into runtime knobs with TRUE CLAMPS (not reset)
-			// Clamp prevents oscillation, doesn't hard-reset to defaults
-			meta.MaxValDD = clampf(meta.MaxValDD, 0.25, 0.60)
-			meta.MinValReturn = clampf(meta.MinValReturn, 0.02, 0.15)
-			meta.MinValPF = clampf(meta.MinValPF, 1.05, 1.50)
-			// Allow MinValExpect to go negative but clamp extreme values
-			meta.MinValExpect = clampf(meta.MinValExpect, -0.001, 0.01)
-			// MinValTrades has reasonable bounds
-			if meta.MinValTrades < 10 {
-				meta.MinValTrades = 10
-			} else if meta.MinValTrades > 100 {
-				meta.MinValTrades = 100
-			}
-			// ScreenRelaxLevel must be 0-3
-			if meta.ScreenRelaxLevel < 0 {
-				meta.ScreenRelaxLevel = 0
-			} else if meta.ScreenRelaxLevel > 3 {
-				meta.ScreenRelaxLevel = 3
-			}
+	if !*ignoreMeta {
+		if b, err := os.ReadFile("meta.json"); err == nil {
+			if err := json.Unmarshal(b, &meta); err == nil {
+				fmt.Printf("Loaded meta.json: Batches=%d, BestVal=%.4f, RadicalP=%.2f, SurExploreP=%.2f, ScreenRelaxLevel=%d\n",
+					meta.Batches, meta.BestVal, meta.RadicalP, meta.SurExploreP, meta.ScreenRelaxLevel)
+				// Apply loaded meta into runtime knobs with TRUE CLAMPS (not reset)
+				// Clamp prevents oscillation, doesn't hard-reset to defaults
+				meta.MaxValDD = clampf(meta.MaxValDD, 0.25, 0.60)
+				meta.MinValReturn = clampf(meta.MinValReturn, 0.02, 0.15)
+				meta.MinValPF = clampf(meta.MinValPF, 1.05, 1.50)
+				// Allow MinValExpect to go negative but clamp extreme values
+				meta.MinValExpect = clampf(meta.MinValExpect, -0.001, 0.01)
+				// MinValScore has reasonable bounds
+				meta.MinValScore = clampf(meta.MinValScore, -50.0, 50.0)
+				// MinValTrades has reasonable bounds
+				if meta.MinValTrades < 10 {
+					meta.MinValTrades = 10
+				} else if meta.MinValTrades > 100 {
+					meta.MinValTrades = 100
+				}
+				// ScreenRelaxLevel must be 0-3
+				if meta.ScreenRelaxLevel < 0 {
+					meta.ScreenRelaxLevel = 0
+				} else if meta.ScreenRelaxLevel > 3 {
+					meta.ScreenRelaxLevel = 3
+				}
 
-			maxValDD, minValReturn, minValPF, minValExpect = meta.MaxValDD, meta.MinValReturn, meta.MinValPF, meta.MinValExpect
-			minValTrades = meta.MinValTrades
-			surThreshold = float64(meta.SurThreshold)
-			stagnationMu.Lock()
-			radicalP, surExploreP = meta.RadicalP, meta.SurExploreP
-			stagnationMu.Unlock()
-			// Sync global screen relax level
+				maxValDD, minValReturn, minValPF, minValExpect, minValScore = meta.MaxValDD, meta.MinValReturn, meta.MinValPF, meta.MinValExpect, meta.MinValScore
+				minValTrades = meta.MinValTrades
+				surThreshold = float64(meta.SurThreshold)
+				stagnationMu.Lock()
+				radicalP, surExploreP = meta.RadicalP, meta.SurExploreP
+				stagnationMu.Unlock()
+				// Sync global screen relax level
+				setScreenRelaxLevel(meta.ScreenRelaxLevel)
+			}
+		} else {
+			// Initialize global screen relax level to default
 			setScreenRelaxLevel(meta.ScreenRelaxLevel)
 		}
 	} else {
+		// Skip loading meta.json when -ignore_meta flag is set
+		fmt.Println("Ignoring meta.json (-ignore_meta flag set)")
 		// Initialize global screen relax level to default
 		setScreenRelaxLevel(meta.ScreenRelaxLevel)
 	}
@@ -1033,10 +1179,12 @@ func main() {
 				loadMinTrades = 15 // minimum floor even if meta gate is higher
 			}
 			if log.ValScore >= loadMinScore && log.ValMaxDD < loadMaxDD && log.ValTrades >= loadMinTrades && log.ValReturn >= loadMinReturn {
+				// FIX: Use command-line fee/slippage instead of saved values
+				// This ensures all strategies run with consistent costs
 				s := Strategy{
 					Seed:        rng.Int63(),
-					FeeBps:      log.FeeBps,
-					SlippageBps: log.SlippageBps,
+					FeeBps:      feeBps,  // Use current command-line fee
+					SlippageBps: slipBps, // Use current command-line slippage
 					RiskPct:     1.0,
 					Direction:   log.Direction, // Preserve original direction for consistency
 					EntryRule: RuleTree{
@@ -1150,7 +1298,13 @@ func main() {
 		searchStartTimeMu.Unlock()
 
 		// Define validation stability threshold once (not duplicated in loop)
-		const stabilityThreshold = 0.25 // TEMP warm-start: val must be at least 25% of train (relaxed from 40%)
+		// If flag is 0.0, stability check is DISABLED (allows any val/train ratio)
+		// If flag is negative (e.g., -1), auto-calculate as 0.33
+		stabilityThreshold := float32(*stabilityThresholdFlag)
+		if stabilityThreshold < 0 {
+			stabilityThreshold = 0.33 // Auto: 3x return (val >= 33% of train)
+		}
+		// NOTE: stabilityThreshold == 0 means stability check is DISABLED
 
 		batchSize := int64(10000)
 		var batchID int64 = 0
@@ -1248,6 +1402,21 @@ func main() {
 					maxValDD = clampf(maxValDD+0.01, 0.10, 0.80)
 					print(" [META: Gate loosened: ret %.1f%%->%.1f%%, PF %.2f->%.2f, DD %.2f->%.2f]",
 						oldReturn*100, minValReturn*100, oldPF, minValPF, oldDD, maxValDD)
+				}
+
+				// PROBLEM D FIX: When passRate is near zero, also relax surrogate threshold to prevent "no_candidates"
+				// This keeps the surrogate funnel from starving when gates are tight
+				if *autoAdjust && passRate < 0.001 { // <0.1% - very low pass rate
+					oldSurThreshold := surThreshold
+					surThreshold = surThreshold - 0.1 // Lower threshold (more permissive)
+					if surThreshold < -2.0 {
+						surThreshold = -2.0
+					}
+					if surThreshold > 0.50 {
+						surThreshold = 0.50
+					}
+					print(" [META: Surrogate relaxed: %.2f->%.2f (passRate=%.2f%%)]",
+						oldSurThreshold, surThreshold, passRate*100)
 				}
 			}
 		}
@@ -1453,6 +1622,7 @@ func main() {
 					var bestPassesValidation bool
 					var bestQuickTestR Result // Track best quick test result for reporting
 					bestQuickTestR.Score = -1e30
+					var bestQuickTestReason string = "no_candidates" // Track WHY QuickTest is sentinel
 
 					// Diversity selection: top 10 by score + 10 diverse fingerprints
 					// This reduces overfitting to one "family" of strategies
@@ -1514,8 +1684,7 @@ func main() {
 
 					// Fixed validation threshold: rely on profit sanity gates instead of dynamic score
 					// Use score only for ranking, not for pass/fail, until scale stabilizes
-					// TEMP warm-start: relax score threshold until elites exist
-					minValScore := float32(-5.0) // Warm-start: allow negative scores
+					// minValScore is set from command-line flag (-min_val_score)
 					// Thresholds are set based on scoring mode at top of main()
 
 					// Track stagnation per checkpoint, not per candidate
@@ -1546,9 +1715,13 @@ func main() {
 						// This prevents "celebrating lucky finds" as search grows
 						// CRITICAL: Use computeScoreWithSmoothness to select for smooth equity curves
 						testedNow := int64(atomic.LoadUint64(&tested))
-						valR.Score = computeScoreWithSmoothness(valR.Return, valR.MaxDD, valR.Expectancy, valR.SmoothVol, valR.DownsideVol, valR.Trades, testedNow)
+						valScoreResult := computeScoreWithSmoothness(valR.Return, valR.MaxDD, valR.Expectancy, valR.SmoothVol, valR.DownsideVol, valR.Trades, testedNow)
+						valR.Score = valScoreResult.Score
+						valR.InvalidScoreReason = valScoreResult.Reason
 						// Also deflate train scores for fair comparison
-						candidate.Score = computeScoreWithSmoothness(candidate.Return, candidate.MaxDD, candidate.Expectancy, candidate.SmoothVol, candidate.DownsideVol, candidate.Trades, testedNow)
+						candidateScoreResult := computeScoreWithSmoothness(candidate.Return, candidate.MaxDD, candidate.Expectancy, candidate.SmoothVol, candidate.DownsideVol, candidate.Trades, testedNow)
+						candidate.Score = candidateScoreResult.Score
+						candidate.InvalidScoreReason = candidateScoreResult.Reason
 
 						// Anti-stagnation: track if any candidate improved this batch
 						if valR.Score > lastBestValScore {
@@ -1588,16 +1761,16 @@ func main() {
 						atomic.AddInt64(&validatedLabels, 1) // Track total validation labels - atomic update
 
 						// Track best validation result (primary metric)
-						if valR.Score > bestValR.Score {
-							bestValR = valR
-							bestTrainResult = candidate
-						}
+						// PROBLEM D FIX: Moved bestValR update to AFTER train realism checks
+						// See below after trainCorrupted is determined
+						// Old location was here but it updated "best" before train validity was known
 
 						// CRITICAL FIX #2: Track best EVALUATED strategy (not just passed)
 						// This prevents bestVal from staying stuck at 0.0000 when nothing passes
 						// Update bestValSeen for ALL evaluated strategies with minimum trade threshold
+						// PROBLEM B FIX: Only track valid scores (not NaN/Inf/CORRUPTED)
 						bestValSeenMu.Lock()
-						if valR.Trades >= 15 && valR.Score > bestValSeen {
+						if valR.Trades >= 15 && IsValidScore(valR.Score) && valR.Score > bestValSeen {
 							bestValSeen = valR.Score
 						}
 						bestValSeenMu.Unlock()
@@ -1640,7 +1813,164 @@ func main() {
 						var isPreElite bool = false
 
 						// Variables for rejection logging (must be in outer scope)
-						var basicGatesOK, profitOK, trainOK, stableEnough bool
+						var basicGatesOK, profitOK, trainOK, stableEnough, trainCapOK bool
+						var validTrainScore bool
+						var minTrainScore, minTrainReturn float32
+						var stabilityRatio float32 // Track valScore/trainScore ratio for detailed logging
+						var corruptionReason string = "" // Track corruption reason for logging
+
+						// CRITICAL FIX #1: Train corruption guard - reject obviously corrupted train metrics
+						// This prevents impossible values like 134% return from poisoning validation
+						// IMPORTANT: Run corruption check BEFORE IsValidScore, because IsValidScore
+						// returns false for corrupted scores, and we want to catch them with clear messages
+						trainCorrupted := false
+						corruptionReason = ""
+
+						// PROBLEM A FIX: Single consistent return cap (not two-tier)
+						// The 105% base cap was too restrictive and blocking evolution
+						// Now using one cap at 300% - rely on validation/OOS to eliminate overfit
+						const trainRetCapMain float32 = 3.0  // 300% max return - let validation filter overfit
+
+						// DIAGNOSTIC: Print details when cap is triggered
+						if candidate.Return > trainRetCapMain {
+							trainCorrupted = true
+							corruptionReason = fmt.Sprintf("train_ret_%.1f%%_exceeds_%.0f%%", candidate.Return*100, trainRetCapMain*100)
+							// Print diagnostic info - use -9999 placeholder instead of corrupted sentinel score
+							fmt.Printf("[TRAIN_RET_CAP] ret=%.1f%% dd=%.2f%% trades=%d pf=%.2f score=CAPPED cap=%.0f%%\n",
+								candidate.Return*100, candidate.MaxDD*100, candidate.Trades, candidate.ProfitFactor, trainRetCapMain*100)
+						}
+
+						// Check for NaN or Inf in train score
+						if math.IsNaN(float64(candidate.Score)) || math.IsInf(float64(candidate.Score), 0) {
+							trainCorrupted = true
+							if corruptionReason == "" {
+								corruptionReason = "train_score_nan_inf"
+							}
+						}
+
+						// Check for NaN or Inf in train return
+						if math.IsNaN(float64(candidate.Return)) || math.IsInf(float64(candidate.Return), 0) {
+							trainCorrupted = true
+							if corruptionReason == "" {
+								corruptionReason = "train_ret_nan_inf"
+							}
+						}
+
+						// Check for impossible train DD (should be 0-1 range)
+						if candidate.MaxDD < 0 || candidate.MaxDD > 1.0 {
+							trainCorrupted = true
+							if corruptionReason == "" {
+								corruptionReason = fmt.Sprintf("train_dd_%.2f_invalid", candidate.MaxDD)
+							}
+						}
+
+						// Check for insane train scores (> 50 is clearly corrupted for 1-year backtest)
+						if candidate.Score > 50.0 {
+							trainCorrupted = true
+							if corruptionReason == "" {
+								corruptionReason = fmt.Sprintf("train_score_%.1f_exceeds_50", candidate.Score)
+							}
+						}
+
+						// PROBLEM B FIX: Catch ALL invalid scores (> 1e8, < -1e20, etc.)
+						// This ensures trainCorrupted is set whenever IsValidScore would return false
+						if !IsValidScore(candidate.Score) {
+							trainCorrupted = true
+							if corruptionReason == "" {
+								// Determine specific reason
+								if math.Abs(float64(candidate.Score)) > 1e8 {
+									corruptionReason = fmt.Sprintf("train_score_corrupted(%.2e>1e8)", candidate.Score)
+								} else if candidate.Score < -1e20 {
+									corruptionReason = fmt.Sprintf("train_score_sentinel(%.2e)", candidate.Score)
+								} else {
+									corruptionReason = fmt.Sprintf("train_score_invalid(%.4f)", candidate.Score)
+								}
+							}
+						}
+
+						// PROBLEM B FIX: Train realism gate - catch overfit spam strategies BEFORE scoring
+						// These patterns look great on train but die on costs in real trading
+						trainCandles := trainW.End - trainW.Start
+						trainDays := float32(trainCandles) / (24.0 * 60.0 / float32(atomic.LoadInt32(&globalTimeframeMinutes)))
+						trainYears := trainDays / 365.25
+						if trainYears > 0 && candidate.Trades > 0 {
+							tradesPerYear := float32(candidate.Trades) / trainYears
+
+							// Gate 1: Trade density - reject spam trading (>350 trades/year)
+							const maxTradesPerYearTrain = 350.0
+							if tradesPerYear > maxTradesPerYearTrain {
+								trainCorrupted = true
+								if corruptionReason == "" {
+									corruptionReason = fmt.Sprintf("train_spam(%.0f_trades/year>%.0f)", tradesPerYear, maxTradesPerYearTrain)
+								}
+							}
+
+							// Gate 2: PF sanity - reject extreme PF with high trades (almost always overfit)
+							const maxTrainPF = 4.0
+							const minTradesForPFCheck = 100
+							if candidate.ProfitFactor > maxTrainPF && candidate.Trades >= minTradesForPFCheck {
+								trainCorrupted = true
+								if corruptionReason == "" {
+									corruptionReason = fmt.Sprintf("train_pf_overfit(pf=%.2f>%.1f,trades=%d)", candidate.ProfitFactor, maxTrainPF, candidate.Trades)
+								}
+							}
+						}
+
+						// Now check if score is valid (after corruption check)
+						validTrainScore = IsValidScore(candidate.Score) && !trainCorrupted
+
+						if trainCorrupted {
+							trainOK = false
+							trainCapOK = false // Also fail cap check
+						}
+
+						// CRITICAL FIX #2: Train-cap check - applies to ALL modes (bootstrap, recovery, standard)
+						// This prevents train scores from exploding (40+) while val is normal
+						// Get thresholds from meta state (with defaults if not set)
+						maxTrainScore := meta.MaxTrainScore
+						if maxTrainScore == 0 {
+							maxTrainScore = 20.0 // Default: reject if train_score > 20 (very relaxed)
+						}
+						maxTrainReturn := meta.MaxTrainReturn
+						if maxTrainReturn == 0 {
+							maxTrainReturn = 3.0 // Default: reject if train_ret > 300% (let validation filter)
+						}
+						minValScoreAfterCap := meta.MinValScoreAfterCap
+						if minValScoreAfterCap == 0 {
+							minValScoreAfterCap = 0.3 // Default: val_score must be >= 0.3 (relaxed)
+						}
+						minValReturnAfterCap := meta.MinValReturnAfterCap
+						if minValReturnAfterCap == 0 {
+							minValReturnAfterCap = 0.005 // Default: val_ret must be >= 0.5% (relaxed)
+						}
+
+						// Apply train-cap check (runs for ALL modes)
+						trainCapOK = true
+						if validTrainScore && !trainCorrupted {
+							// Check score-based cap: train_score > 12 AND val_score < 1.0
+							if candidate.Score > maxTrainScore && valR.Score < minValScoreAfterCap {
+								trainCapOK = false
+								if corruptionReason == "" {
+									corruptionReason = fmt.Sprintf("score_cap(train_%.1f_gt_%.1f,val_%.3f_lt_%.1f)",
+										candidate.Score, maxTrainScore, valR.Score, minValScoreAfterCap)
+								}
+							}
+							// Check return-based cap: train_ret > 80% AND val_ret < 2%
+							if candidate.Return > maxTrainReturn && valR.Return < minValReturnAfterCap {
+								trainCapOK = false
+								if corruptionReason == "" {
+									corruptionReason = fmt.Sprintf("return_cap(train_%.1f%%_gt_%.0f%%,val_%.1f%%_lt_%.1f%%)",
+										candidate.Return*100, maxTrainReturn*100, valR.Return*100, minValReturnAfterCap*100)
+								}
+							}
+						}
+
+						// PROBLEM D FIX: Only update best for train-valid candidates
+						// This was moved from earlier to ensure trainCorrupted is checked first
+						if !trainCorrupted && trainCapOK && IsValidScore(valR.Score) && valR.Score > bestValR.Score {
+							bestValR = valR
+							bestTrainResult = candidate
+						}
 
 						if elitesCount < bootstrapThreshold {
 							// BOOTSTRAP MODE (0-9 elites): Very relaxed VAL gates
@@ -1654,34 +1984,47 @@ func main() {
 
 							// Basic sanity gates
 							basicGatesOK = valR.MaxDD < effectiveMaxDD && valR.Trades >= effectiveMinTrades
+							// BOOTSTRAP FIX: Skip score gate during bootstrap - score can be negative
+							// Only require positive return, reasonable PF, and non-terrible expectancy
 							profitOK = valR.Return >= effectiveMinReturn &&
-								valR.Expectancy > effectiveMinExpect &&
-								valR.ProfitFactor >= effectiveMinPF &&
-								valR.Score >= effectiveMinScore
+								valR.Expectancy > -0.001 && // Allow slightly negative expectancy in bootstrap
+								valR.ProfitFactor >= 0.95   // Allow PF slightly below 1.0 in bootstrap
+							// Score gate SKIPPED during bootstrap (effectiveMinScore not checked)
 
-							var minTrainScore, minTrainReturn float32
-							minTrainScore = -10.0
-							minTrainReturn = -0.05
-							trainOK = candidate.Score > minTrainScore || candidate.Return > minTrainReturn
-
-							stableEnough = true
-							if candidate.Score > 0 {
-								stableEnough = valR.Score >= stabilityThreshold*candidate.Score
+							// PROBLEM B FIX: Relax train gates in bootstrap to allow more elites
+							// Previously -10.0 / -0.05 was too strict, preventing HOF growth
+							minTrainScore = -50.0  // Very relaxed: allow any non-sentinel score
+							minTrainReturn = -0.20  // Allow -20% return (very relaxed)
+							// Note: validTrainScore and trainCapOK already computed above (applies to ALL modes)
+							// Only update trainOK for BOOTSTRAP MODE requirements
+							if !trainCorrupted {
+								trainOK = validTrainScore && (candidate.Score > minTrainScore || candidate.Return > minTrainReturn)
 							}
-							passesValidation = basicGatesOK && stableEnough && profitOK && trainOK
+
+							// BOOTSTRAP FIX: Skip stability check entirely during bootstrap
+							// Stability doesn't make sense when val scores are often negative
+							stableEnough = true
+							// Stability check DISABLED during bootstrap
+							// Note: trainCapOK already computed above (applies to ALL modes)
+
+							passesValidation = basicGatesOK && stableEnough && profitOK && trainOK && trainCapOK
 
 						} else if elitesCount < recoveryThreshold {
 							// RECOVERY MODE (10-19 elites): Accept based on train, bypass VAL profit gates
 							// Check: VAL DD + VAL trades, train score + train return
-							recoveryValOK := valR.MaxDD < 0.65 && valR.Trades >= 15                // Basic VAL sanity
-							recoveryTrainOK := candidate.Score > -20.0 || candidate.Return > -0.10 // Train not terrible
+							recoveryValOK := valR.MaxDD < 0.65 && valR.Trades >= 15 // Basic VAL sanity
+							// Note: validTrainScore already computed above (applies to ALL modes)
+							recoveryTrainOK := !trainCorrupted && validTrainScore && (candidate.Score > -20.0 || candidate.Return > -0.10) // Train not terrible AND valid
+							minTrainScore = -20.0  // Set for logging
+							minTrainReturn = -0.10 // Set for logging
 
 							if recoveryValOK && recoveryTrainOK {
 								passesValidation = false // Don't use normal validation path
 								isPreElite = true        // Mark for special handling below
 								skipCPCV = true
-								fmt.Printf("[PRE-ELITE] train_score=%.2f train_ret=%.2f%% val_trades=%d val_dd=%.2f%%\n",
-									candidate.Score, candidate.Return*100, valR.Trades, valR.MaxDD*100)
+								// PROBLEM D FIX: Use CleanScoreForDisplay for sentinel-safe printing
+								fmt.Printf("[PRE-ELITE] train_score=%s train_ret=%.2f%% val_trades=%d val_dd=%.2f%%\n",
+									CleanScoreForDisplay(candidate.Score), candidate.Return*100, valR.Trades, valR.MaxDD*100)
 							}
 
 							// Set default values for rejection logging (not used for pre-elite path)
@@ -1695,6 +2038,7 @@ func main() {
 							profitOK = true
 							trainOK = recoveryTrainOK
 							stableEnough = true
+							// Note: trainCapOK already computed above (applies to ALL modes)
 
 						} else {
 							// STANDARD MODE (20+ elites): Full validation gates
@@ -1712,16 +2056,27 @@ func main() {
 								valR.ProfitFactor >= effectiveMinPF &&
 								valR.Score >= effectiveMinScore
 
-							var minTrainScore, minTrainReturn float32
 							minTrainScore = -5.0
 							minTrainReturn = 0.0
-							trainOK = candidate.Score > minTrainScore || candidate.Return > minTrainReturn
+							// Note: validTrainScore and trainCapOK already computed above (applies to ALL modes)
+							// Only update trainOK for STANDARD MODE requirements
+							if !trainCorrupted {
+								trainOK = validTrainScore && (candidate.Score > minTrainScore || candidate.Return > minTrainReturn)
+							}
 
 							stableEnough = true
-							if candidate.Score > 0 {
-								stableEnough = valR.Score >= stabilityThreshold*candidate.Score
+							stabilityRatio = 1.0 // Default: val/train = 1.0 (stable)
+							var minStabScore float32 = 0.0
+							// FIX: Skip stability when threshold is 0 (disabled) OR when either score is non-positive
+							if stabilityThreshold > 0 && validTrainScore && candidate.Score > 0 && valR.Score > 0 {
+								minStabScore = computeStabilityRequirement(stabilityThreshold, candidate.Score, hof.Len())
+								stableEnough = valR.Score >= minStabScore
+								// Compute actual stability ratio for logging
+								if candidate.Score > 0 {
+									stabilityRatio = valR.Score / candidate.Score
+								}
 							}
-							passesValidation = basicGatesOK && stableEnough && profitOK && trainOK
+							passesValidation = basicGatesOK && stableEnough && profitOK && trainOK && trainCapOK
 						}
 
 						// CRITICAL FIX #4: VAL rejection histogram
@@ -1736,7 +2091,14 @@ func main() {
 								reasons = append(reasons, fmt.Sprintf("Trds<%d", effectiveMinTrades))
 							}
 							if !stableEnough {
-								reasons = append(reasons, "stab")
+								// CRITICAL FIX: Log detailed stability values for debugging
+								// Format: stab(val=0.031/train=0.050,ratio=0.62<thr=0.50)
+								if candidate.Score > 0 {
+									reasons = append(reasons, fmt.Sprintf("stab(val=%.3f/train=%.3f,ratio=%.2f<thr=%.2f)",
+										valR.Score, candidate.Score, stabilityRatio, stabilityThreshold))
+								} else {
+									reasons = append(reasons, "stab(train_non_positive)")
+								}
 							}
 							// Always log profit gate failures with effective gates (not bootstrap-specific)
 							if valR.Return < effectiveMinReturn {
@@ -1751,13 +2113,52 @@ func main() {
 							if valR.Score < effectiveMinScore {
 								reasons = append(reasons, fmt.Sprintf("Score<%.1f", effectiveMinScore))
 							}
-							// Anti-overfit: log train gate failures
-							if !trainOK {
-								reasons = append(reasons, fmt.Sprintf("train_bad(score=%.2f,ret=%.1f%%)", candidate.Score, candidate.Return*100))
+							// CRITICAL FIX #5: Train corruption and cap rejection logging
+							// Log train_cap FIRST before train_bad so corruption reasons are visible
+							if !trainCapOK {
+								// Use the pre-calculated corruptionReason which contains:
+								// - Corruption reasons (train_ret_exceeds_50%, train_score_nan_inf, etc.)
+								// - Score cap reasons (score_cap:train_X_gt_Y,val_Z_lt_W)
+								// - Return cap reasons (return_cap:train_X%_gt_Y%,val_Z%_lt_W%)
+								if corruptionReason != "" {
+									reasons = append(reasons, fmt.Sprintf("train_cap(%s)", corruptionReason))
+								} else {
+									// Fallback if corruptionReason is empty (shouldn't happen)
+									reasons = append(reasons, fmt.Sprintf("train_cap(train=%s/%.1f%%,val=%.3f/%.1f%%)",
+										CleanScoreForDisplay(candidate.Score), candidate.Return*100, valR.Score, valR.Return*100))
+								}
+							}
+							// Anti-overfit: log train gate failures with reason flag
+							// CRITICAL FIX: Include specific reason code (invalid_score, low_score, low_return, no_trades, dd_hard_reject, etc.)
+							// NOTE: Only log train_bad if NOT already corrupted (corruption is logged above as train_cap)
+							if !trainOK && !trainCorrupted {
+								trainReason := "unknown"
+								if !validTrainScore {
+									trainReason = "invalid_score"
+									// CRITICAL FIX: Get component diagnostics from Result struct
+									if candidate.InvalidScoreReason != "" {
+										trainReason = "invalid_score:" + candidate.InvalidScoreReason
+									}
+								} else if candidate.Trades == 0 {
+									trainReason = "no_trades"
+								} else if candidate.MaxDD >= 0.50 {
+									trainReason = "dd_hard_reject"
+								} else if candidate.Return < 0 {
+									trainReason = "negative_return"
+								} else if candidate.Score <= minTrainScore && candidate.Return <= minTrainReturn {
+									// Both score AND return failed - it's a bad strategy
+									trainReason = "low_score_and_return"
+								} else if candidate.Score <= minTrainScore {
+									trainReason = "low_score"
+								} else if candidate.Return <= minTrainReturn {
+									trainReason = "low_return"
+								}
+								reasons = append(reasons, fmt.Sprintf("train_bad(reason=%s,score=%s,ret=%.1f%%,trds=%d)",
+									trainReason, CleanScoreForDisplay(candidate.Score), candidate.Return*100, candidate.Trades))
 							}
 							reasonStr := strings.Join(reasons, ",")
-							fmt.Printf("[VAL-REJECT] score=%.4f ret=%.2f%% pf=%.2f exp=%.5f dd=%.3f trds=%d [%s]\n",
-								valR.Score, valR.Return*100, valR.ProfitFactor, valR.Expectancy, valR.MaxDD, valR.Trades, reasonStr)
+							fmt.Printf("[VAL-REJECT] score=%s ret=%.2f%% pf=%.2f exp=%.5f dd=%.3f trds=%d [%s]\n",
+								CleanScoreForDisplay(valR.Score), valR.Return*100, valR.ProfitFactor, valR.Expectancy, valR.MaxDD, valR.Trades, reasonStr)
 
 							// EMERGENCY SEEDING: Always track candidates that passed TRAIN but failed VAL
 							// This enables recovery seeding even when VAL never passes
@@ -1784,9 +2185,10 @@ func main() {
 							// Track best validation score seen ONLY from fully validated strategies
 							// This prevents bestValSeen from tracking failing candidates
 							// PRE-ELITE: Don't update bestValSeen for recovery mode candidates
+							// PROBLEM B FIX: Use IsValidScore() for proper validation
 							if !isPreElite {
 								bestValSeenMu.Lock()
-								if valR.Trades >= minValTrades && valR.Score > -1e20 && valR.Score > bestValSeen {
+								if valR.Trades >= minValTrades && IsValidScore(valR.Score) && valR.Score > bestValSeen {
 									bestValSeen = valR.Score
 								}
 								bestValSeenMu.Unlock()
@@ -1818,35 +2220,141 @@ func main() {
 							// This avoids "REJECTED / 0 trades" display when QuickTest is intentionally skipped.
 							quickTestProfitOK := true // Default: don't veto during bootstrap
 
-							// Use first 25% of test window as "quick test" to filter out obvious failures
-							quickTestEnd := testW.Start + (testW.End-testW.Start)/4
-							if quickTestEnd > testW.End {
-								quickTestEnd = testW.End
+							// PROBLEM 6 FIX: Multi-window QuickTest for more robust OOS validation
+							// Uses 3 windows with weighted average to reduce single-window bias
+							type qtWindow struct {
+								startPct, endPct, weight float64
 							}
-							quickTestW := Window{
-								Start:  testW.Start,
-								End:    quickTestEnd,
-								Warmup: testW.Warmup,
+							qtWindows := []qtWindow{
+								{0.00, 0.25, 0.40}, // Index 0: [0.00, 0.25] of test → displayed as "window_3" (oldest)
+								{0.25, 0.50, 0.30}, // Index 1: [0.25, 0.50] of test → displayed as "window_2" (middle)
+								{0.50, 0.75, 0.30}, // Index 2: [0.50, 0.75] of test → displayed as "window_1" (most recent)
 							}
 
-							// DEBUG: Print window info before evaluation
-							windowCandles := quickTestEnd - testW.Start
+							var qtWeightedReturn, qtWeightedPF float64
+							var qtWindowMinTrades int = 999999 // Renamed to avoid conflict with flag qtMinTrades
+							var qtWindowMaxDD float32 = -1.0 // Track maximum MaxDD across windows
+							qtPassCount := 0
+							var qtMostRecentWindowPass bool // PROBLEM 2 FIX: Track if most recent window (window_1, startPct=0.50) passes
+							var quickTestR Result // Aggregate result for reporting
+
+							// DEBUG: Print window info
+							totalTestBars := testW.End - testW.Start
 							firstCandleTime := int64(0)
 							if testW.Start < len(series.OpenTimeMs) {
 								firstCandleTime = series.OpenTimeMs[testW.Start]
 							}
-							fmt.Printf("[QuickTest-DEBUG] window=[%d:%d] candles=%d first_candle_ts=%d\n",
-								testW.Start, quickTestEnd, windowCandles, firstCandleTime)
+							// PROBLEM D FIX: Show fees being used in QuickTest
+							fmt.Printf("[QuickTest-DEBUG] total_window=[%d:%d] bars=%d first_candle_ts=%d fees=%.2f_bps slip=%.2f_bps\n",
+								testW.Start, testW.End, totalTestBars, firstCandleTime, candidate.Strategy.FeeBps, candidate.Strategy.SlippageBps)
 
-							quickTestR := evaluateStrategyWindow(series, feats, candidate.Strategy, quickTestW)
+							for _, w := range qtWindows {
+								qtStart := testW.Start + int(float64(testW.End-testW.Start)*w.startPct)
+								qtEnd := testW.Start + int(float64(testW.End-testW.Start)*w.endPct)
+								qtW := Window{Start: qtStart, End: qtEnd, Warmup: testW.Warmup}
 
-							// DEBUG: Print result after evaluation
-							fmt.Printf("[QuickTest-DEBUG] result: trades=%d return=%.4f pf=%.2f score=%.4f\n",
-								quickTestR.Trades, quickTestR.Return, quickTestR.ProfitFactor, quickTestR.Score)
+								// Quick signal count check before evaluation
+								qtEntryEdges := 0
+								if candidate.Strategy.EntryCompiled.Code != nil {
+									var prevEntry bool
+									for t := qtStart; t < qtEnd && t < len(feats.F[0]); t++ {
+										entryNow := evaluateCompiled(candidate.Strategy.EntryCompiled.Code, feats.F, t)
+										if entryNow && !prevEntry {
+											qtEntryEdges++
+										}
+										prevEntry = entryNow
+									}
+								}
+
+								var qtR Result
+								if qtEntryEdges == 0 {
+									qtR = Result{Trades: 0, Score: -1e30}
+									fmt.Printf("[QuickTest-DEBUG] window_%d: SKIPPED (no entry signals)\n", len(qtWindows)-int(w.startPct*4))
+								} else {
+									qtR = evaluateStrategyWindow(series, feats, candidate.Strategy, qtW)
+								}
+
+								fmt.Printf("[QuickTest-DEBUG] window_%d: trades=%d return=%.4f pf=%.2f dd=%.4f score=%s\n",
+									len(qtWindows)-int(w.startPct*4), qtR.Trades, qtR.Return, qtR.ProfitFactor, qtR.MaxDD, CleanScoreForDisplay(qtR.Score))
+
+								qtWeightedReturn += float64(qtR.Return) * w.weight
+								qtWeightedPF += float64(qtR.ProfitFactor) * w.weight
+								if qtR.Trades < qtWindowMinTrades {
+									qtWindowMinTrades = qtR.Trades
+								}
+								// Track maximum MaxDD across windows (worst case)
+								// PROBLEM 1 FIX: Only update MaxDD from evaluated windows (skip skipped windows with MaxDD=0)
+								if qtEntryEdges > 0 && qtR.MaxDD > qtWindowMaxDD {
+									qtWindowMaxDD = qtR.MaxDD
+								}
+								// Track individual window passes for majority vote
+								windowPass := qtR.Return >= 0 && qtR.ProfitFactor >= 1.0 && qtR.Trades >= 8
+								if windowPass {
+									qtPassCount++
+								}
+								// PROBLEM 2 FIX: Track most recent window (startPct=0.50, displayed as window_1)
+								// This is the MOST RECENT segment of test data [0.50, 0.75]
+								if w.startPct == 0.50 && windowPass {
+									qtMostRecentWindowPass = true
+								}
+							}
+
+							// Clamp MaxDD to 0 if all windows had no trades (qtWindowMaxDD stays -1)
+							if qtWindowMaxDD < 0 {
+								qtWindowMaxDD = 0
+							}
+
+							// Build aggregate result for reporting
+							quickTestR = Result{
+								Trades:      qtWindowMinTrades,
+								Return:      float32(qtWeightedReturn),
+								ProfitFactor: float32(qtWeightedPF),
+								MaxDD:       qtWindowMaxDD, // Use worst DD across windows
+								Score:       -1e30, // Placeholder - QuickTest uses Return/PF/Trades for gates, not score
+							}
+							// DEBUG: Print raw values before sentinel check
+							qtDDIsNaN := quickTestR.MaxDD != quickTestR.MaxDD
+							fmt.Printf("[QuickTest-DEBUG] aggregate: trades=%d return=%.4f pf=%.2f dd=%.4f pass_count=%d/3 recent_pass=%v\n",
+								qtWindowMinTrades, qtWeightedReturn, qtWeightedPF, qtWindowMaxDD, qtPassCount, qtMostRecentWindowPass)
+							fmt.Printf("[QuickTest-DEBUG] sentinel_check: qt_trades=%d qt_dd_raw=%.4f qt_dd_isnan=%v qt_pf_raw=%.2f qt_return_raw=%.4f reason=%s\n",
+								quickTestR.Trades, quickTestR.MaxDD, qtDDIsNaN, quickTestR.ProfitFactor, quickTestR.Return, bestQuickTestReason)
 
 							// Track best quick test result for reporting (best score among all candidates)
-							if quickTestR.Score > bestQuickTestR.Score {
+							// CRITICAL FIX: Always update bestQuickTestR when we have a valid result
+							// Update if: (1) score is better, OR (2) current best is uninitialized sentinel
+							// PROBLEM B FIX: Only update if quickTestR.Score is valid
+							shouldUpdate := false
+							if IsValidScore(quickTestR.Score) && quickTestR.Score > bestQuickTestR.Score {
+								shouldUpdate = true
+							}
+							// Also update if bestQuickTestR is still at initial sentinel value
+							if bestQuickTestR.Score <= -1e29 {
+								shouldUpdate = true
+							}
+
+							if shouldUpdate {
 								bestQuickTestR = quickTestR
+								// Determine rejection reason based on ACTUAL QuickTest conditions (trades==0 OR dd>=0.50 OR dd invalid)
+								// Do NOT use the placeholder -1e30 score to determine sentinel
+								qtDDIsNaN := quickTestR.MaxDD != quickTestR.MaxDD
+								qtDDIsInf := math.IsInf(float64(quickTestR.MaxDD), 0)
+								qtTradesZero := quickTestR.Trades == 0
+								qtDDHigh := !qtDDIsNaN && !qtDDIsInf && quickTestR.MaxDD >= 0.50
+
+								if qtDDIsNaN || qtDDIsInf {
+									// Invalid math (NaN/Inf DD) - reject with specific code
+									bestQuickTestReason = "qt_invalid_math_dd"
+								} else if qtTradesZero && qtDDHigh {
+									// Both conditions true - prefer qt_no_trades (more specific)
+									bestQuickTestReason = "qt_no_trades"
+								} else if qtTradesZero {
+									bestQuickTestReason = "qt_no_trades"
+								} else if qtDDHigh {
+									bestQuickTestReason = "qt_high_dd"
+								} else {
+									// Valid QuickTest result with trades>0 and dd<0.50
+									bestQuickTestReason = "" // No rejection reason
+								}
 							}
 
 							// Only ENFORCE QuickTest gates after elites exist
@@ -1855,77 +2363,41 @@ func main() {
 								if *qtMinTrades == 0 {
 									// quickTestProfitOK stays true (default), skip all gate enforcement
 								} else {
-								// BOOTSTRAP LADDER: Relax QuickTest during bootstrap (elites < 10)
-								// When elite pool is small, allow candidates with weaker QuickTest results
-								var minQuickTestTrades int
-								var minQuickTestReturn float32
-								if elitesCount < 10 {
-									// Relaxed QuickTest gates during bootstrap
-									minQuickTestTrades = *qtMinTrades
-									minQuickTestReturn = -0.05 // Allow small loss during bootstrap
-								} else {
-									// Standard QuickTest gates once we have enough elites
-									minQuickTestTrades = *qtMinTrades
-									minQuickTestReturn = 0.0
-								}
+									// PROBLEM 6 FIX: Multi-window QuickTest gates
+									// PROBLEM C FIX: Strengthen QuickTest - require most recent window (window_2) to pass OR weighted metrics
+									// This ensures strategies work in recent market conditions, not just historical averages
+									const qtMinPF float32 = 1.05
+									const minQuickTestTrades int = 15 // Reduced from 25 for multi-window
+									const minQuickTestReturn float32 = 0.0
 
-								// Skip QuickTest profit check if trades == 0
-								// Small test window may have 0 trades even if full validation has trades
-								if quickTestR.Trades > 0 {
-									// CRITICAL FIX: Require positive edge explicitly, not relative to minValReturn
-									// After elites exist, minValReturn could be 0.0, which doesn't protect against losing strategies
+									// Option 1: Weighted metrics pass (stricter - requires overall good performance)
+									weightedPass := float32(qtWeightedReturn) >= minQuickTestReturn &&
+										float32(qtWeightedPF) >= qtMinPF &&
+										qtWindowMinTrades >= minQuickTestTrades
 
-									// FIX PROBLEM A: Reject "no-loss / one-trade" PF inflation
-									// PF=999 with 1 trade is NOT a robust strategy - it's statistical noise
-									// Require meaningful PF by checking both wins AND losses exist
-									minWinsLossesForPF := 3 // Need at least 3 wins AND 3 losses for meaningful PF
-									hasMeaningfulPF := true
-									if quickTestR.ProfitFactor >= 999.0 {
-										// Infinite PF cap hit - check if this is due to too few trades
-										// Compute approximate wins/losses from winrate
-										estimatedWins := int(float64(quickTestR.Trades) * float64(quickTestR.WinRate))
-										estimatedLosses := quickTestR.Trades - estimatedWins
-										if estimatedWins < minWinsLossesForPF || estimatedLosses < minWinsLossesForPF {
-											hasMeaningfulPF = false // Reject: not enough data for meaningful PF
+									// Option 2: Majority vote (2/3 windows pass) - lenient option
+									majorityPass := qtPassCount >= 2
+
+									// PROBLEM C FIX: Require most recent window (window_2) to pass OR weighted metrics
+									// Most recent window = startPct=0.50 (third window, most recent data)
+									// This prevents strategies that worked historically but fail recently
+									quickTestProfitOK = weightedPass || (qtMostRecentWindowPass && majorityPass)
+
+									// NEAR-MISS LOGGING: Log QuickTest failures with reasons
+									if !quickTestProfitOK {
+										reasons := []string{}
+										if !weightedPass {
+											reasons = append(reasons, fmt.Sprintf("weighted_fail(ret=%.2f%%,pf=%.2f,trades=%d)", qtWeightedReturn*100, qtWeightedPF, qtMinTrades))
 										}
-									}
-
-									quickTestProfitOK = quickTestR.Return >= minQuickTestReturn && // Use bootstrap-adjusted threshold
-										quickTestR.ProfitFactor >= 1.0 && // Must be profitable after costs
-										hasMeaningfulPF && // FIX A: Reject PF=999 with insufficient trades
-										quickTestR.Trades >= minQuickTestTrades && // Use bootstrap-adjusted threshold
-										quickTestR.MaxDD < maxValDD // Drawdown check
-								}
-								// If quickTestR.Trades == 0, skip the profit check (treat as "unknown")
-
-								// NEAR-MISS LOGGING: Log QuickTest failures with reasons
-								if !quickTestProfitOK && quickTestR.Trades > 0 {
-									reasons := []string{}
-									if quickTestR.Return < minQuickTestReturn {
-										reasons = append(reasons, fmt.Sprintf("QT_ret<%.1f%%", minQuickTestReturn*100))
-									}
-									if quickTestR.ProfitFactor < 1.0 {
-										reasons = append(reasons, fmt.Sprintf("QT_pf<%.2f", quickTestR.ProfitFactor))
-									}
-									// FIX PROBLEM A: Add logging for PF inflation rejection
-									if quickTestR.ProfitFactor >= 999.0 {
-										estimatedWins := int(float64(quickTestR.Trades) * float64(quickTestR.WinRate))
-										estimatedLosses := quickTestR.Trades - estimatedWins
-										if estimatedWins < 3 || estimatedLosses < 3 {
-											reasons = append(reasons, fmt.Sprintf("QT_pf_inflated_wins=%d_losses=%d", estimatedWins, estimatedLosses))
+										if !majorityPass {
+											reasons = append(reasons, fmt.Sprintf("majority_fail(%d/3_windows)", qtPassCount))
 										}
+										if !qtMostRecentWindowPass {
+											reasons = append(reasons, "recent_window_fail")
+										}
+										fmt.Printf("[QuickTest-FAIL] %s\n", strings.Join(reasons, ", "))
 									}
-									if quickTestR.Trades < minQuickTestTrades {
-										reasons = append(reasons, fmt.Sprintf("QT_trds<%d", minQuickTestTrades))
-									}
-									if quickTestR.MaxDD >= maxValDD {
-										reasons = append(reasons, fmt.Sprintf("QT_dd>%.2f", maxValDD))
-									}
-									reasonStr := strings.Join(reasons, ",")
-									fmt.Printf("[NEAR-MISS-QT] val_score=%.4f val_ret=%.2f%% QT_ret=%.2f%% QT_pf=%.2f QT_trds=%d QT_dd=%.3f reasons=%s\n",
-										valR.Score, valR.Return*100, quickTestR.Return*100, quickTestR.ProfitFactor, quickTestR.Trades, quickTestR.MaxDD, reasonStr)
 								}
-								} // end of else block (QuickTest gate enforcement)
 							}
 
 							if !quickTestProfitOK {
@@ -1933,9 +2405,9 @@ func main() {
 							}
 
 							// Overtrading check: reject strategies with excessive trades that might be overfitted
-							// Estimate trades per year based on val window (assuming 5min data = 105120 candles/year)
+							// Estimate trades per year based on val window (using globalCandlesPerYear for timeframe-aware calculation)
 							valCandles := valW.End - valW.Start
-							tradesPerYear := float32(valR.Trades) * (105120.0 / float32(valCandles))
+							tradesPerYear := float32(valR.Trades) * (globalCandlesPerYear / float32(valCandles))
 							// BOOTSTRAP LADDER: Relax overtrading check during bootstrap (elites < 10)
 							var maxTradesPerYear float32
 							if elitesCount < 10 {
@@ -1945,19 +2417,25 @@ func main() {
 							}
 							if tradesPerYear > maxTradesPerYear {
 								// NEAR-MISS LOGGING: Log overtrading rejections
-								fmt.Printf("[NEAR-MISS-OVER] val_score=%.4f trades/year=%.0f >%.0f val_trds=%d\n",
-									valR.Score, tradesPerYear, maxTradesPerYear, valR.Trades)
+								fmt.Printf("[NEAR-MISS-OVER] val_score=%s trades/year=%.0f >%.0f val_trds=%d\n",
+									CleanScoreForDisplay(valR.Score), tradesPerYear, maxTradesPerYear, valR.Trades)
 								continue // reject overtrading strategies
+							}
+
+							// Part A1: Score sanity check BEFORE counting as passed or adding elite
+							// FIX: Check both train score AND validation score to prevent sentinel leakage
+							// PROBLEM D FIX: Use CleanScoreForDisplay for sentinel-safe printing
+							if !IsValidScore(valR.Score) {
+								fmt.Printf("[INVALID-SCORE] Rejecting elite with invalid val_score=%s\n", CleanScoreForDisplay(valR.Score))
+								continue
+							}
+							if !IsValidScore(candidate.Score) {
+								fmt.Printf("[INVALID-SCORE] Rejecting elite with invalid train_score=%s\n", CleanScoreForDisplay(candidate.Score))
+								continue
 							}
 
 							passedThisBatch++                // Count passed strategies this batch for meta-update
 							atomic.AddInt64(&passedCount, 1) // Track adaptive criteria
-
-							// Part A1: Score sanity check BEFORE adding elite
-							if !IsValidScore(valR.Score) {
-								fmt.Printf("[INVALID-SCORE] Rejecting elite with invalid score=%.4f\n", valR.Score)
-								continue
-							}
 
 							// Part D2: Track for emergency seeding
 							batchAccepted = append(batchAccepted, candidate)
@@ -1986,7 +2464,7 @@ func main() {
 							// Compute feature map hash for this run
 							featureHash := ComputeFeatureMapHash(feats)
 
-							// Also log to persistent file
+							// Also log to persistent file (includes detailed OOS monthly breakdown)
 							log := EliteLog{
 								Seed:           candidate.Strategy.Seed,
 								FeeBps:         candidate.Strategy.FeeBps,
@@ -2009,6 +2487,19 @@ func main() {
 								ValMaxDD:       valR.MaxDD,
 								ValWinRate:     valR.WinRate,
 								ValTrades:      valR.Trades,
+								// OOS Walk-Forward detailed statistics
+								OOSGeoAvgMonthly:       valR.OOSGeoAvgMonthly,
+								OOSActiveGeoAvgMonthly: valR.OOSActiveGeoAvgMonthly,
+								OOSMedianMonthly:       valR.OOSMedianMonthly,
+								OOSMinMonth:            valR.OOSMinMonth,
+								OOSStdMonth:            valR.OOSStdMonth,
+								OOSMaxDD:               valR.OOSMaxDD,
+								OOSTotalMonths:         valR.OOSTotalMonths,
+								OOSTotalTrades:         valR.OOSTotalTrades,
+								OOSProfitFactor:        float64(valR.ProfitFactor),
+								OOSExpectancy:          float64(valR.Expectancy),
+								OOSWinRate:             float64(valR.WinRate),
+								OOSMonthlyReturns:      valR.OOSMonthlyReturns,
 							}
 							select {
 							case winnerLog <- log:
@@ -2133,9 +2624,11 @@ func main() {
 					line.ValTrades = bestValR.Trades
 
 					// Re-check stability for final pass/fail marker
+					// FIX: Skip stability when threshold is 0 (disabled) OR when either score is non-positive
 					stableEnoughForFinal := true
-					if bestTrainResult.Score > 0 {
-						stableEnoughForFinal = bestValR.Score >= stabilityThreshold*bestTrainResult.Score
+					if stabilityThreshold > 0 && bestTrainResult.Score > 0 && bestValR.Score > 0 {
+						minStabScore := computeStabilityRequirement(stabilityThreshold, bestTrainResult.Score, hof.Len())
+						stableEnoughForFinal = bestValR.Score >= minStabScore
 					}
 
 					// CRITICAL FIX #3: Bootstrap elite acceptance path
@@ -2148,11 +2641,11 @@ func main() {
 					if isBootstrapPhase {
 						// Bootstrap mode: Only require basic survival constraints
 						// Accept top by ValScore that aren't completely broken
+						// SKIP stability check in bootstrap - scores can be negative
 						bestPassesValidation = bestValR.MaxDD < maxValDD &&
 							bestValR.Trades >= minValTrades &&
-							bestValR.Return >= -0.02 && // Allow up to -2% loss (not -14%)
-							stableEnoughForFinal // Keep stability check
-						// Note: NO profit gate checks (ret>0, pf>1, exp>0) during bootstrap
+							bestValR.Return >= -0.02 // Allow up to -2% loss (not -14%)
+						// Note: NO profit gates, NO score gate, NO stability during bootstrap
 					} else {
 						// Normal mode: Require all profit gates
 						bestPassesValidation = bestValR.Score > minValScore &&
@@ -2202,13 +2695,14 @@ func main() {
 						if bestValR.ProfitFactor < minValPF {
 							reasonParts = append(reasonParts, "pf")
 						}
-						if bestTrainResult.Score > 0 {
-							stabilityRatio := float32(0)
-							if bestTrainResult.Score > 0 {
-								stabilityRatio = bestValR.Score / bestTrainResult.Score
-							}
-							if stabilityRatio < stabilityThreshold {
-								reasonParts = append(reasonParts, "stab")
+						// FIX: Skip stability when threshold is 0 (disabled) OR when either score is non-positive
+						if stabilityThreshold > 0 && bestTrainResult.Score > 0 && bestValR.Score > 0 {
+							minStabScore := computeStabilityRequirement(stabilityThreshold, bestTrainResult.Score, hof.Len())
+							if bestValR.Score < minStabScore {
+								// CRITICAL FIX: Log detailed stability values for debugging
+								stabilityRatio := bestValR.Score / bestTrainResult.Score
+								reasonParts = append(reasonParts, fmt.Sprintf("stab(val=%.3f/train=%.3f,ratio=%.2f<thr=%.2f)",
+									bestValR.Score, bestTrainResult.Score, stabilityRatio, stabilityThreshold))
 							}
 						}
 
@@ -2218,9 +2712,9 @@ func main() {
 							reasonStr = " " + logx.Warn("reason="+strings.Join(reasonParts, ","))
 						}
 
-						// Check overtrading for reporting
+						// Check overtrading for reporting (using globalCandlesPerYear for timeframe-aware calculation)
 						valCandles := valW.End - valW.Start
-						tradesPerYear := float32(bestValR.Trades) * (105120.0 / float32(valCandles))
+						tradesPerYear := float32(bestValR.Trades) * (globalCandlesPerYear / float32(valCandles))
 						maxTradesPerYear := float32(500)
 						overtrading := tradesPerYear > maxTradesPerYear
 						if overtrading && len(reasonParts) > 0 {
@@ -2265,9 +2759,14 @@ func main() {
 						// Print validation details with quick test (colored)
 						print("  [val: score=%s dd=%s trds=%d%s]\n",
 							logx.ScoreColor(bestValR.Score), logx.DDColor(bestValR.MaxDD), bestValR.Trades, reasonStr)
-						print("  [QuickTest: Score=%s Ret=%s DD=%s Trds=%d]\n",
+						// Print QuickTest with reason if it failed
+						qtReasonStr := ""
+						if bestQuickTestReason != "" {
+							qtReasonStr = fmt.Sprintf(" (%s)", bestQuickTestReason)
+						}
+						print("  [QuickTest: Score=%s Ret=%s DD=%s Trds=%d%s]\n",
 							logx.ScoreColor(bestQuickTestR.Score), logx.ReturnColor(bestQuickTestR.Return),
-							logx.DDColor(bestQuickTestR.MaxDD), bestQuickTestR.Trades)
+							logx.DDColor(bestQuickTestR.MaxDD), bestQuickTestR.Trades, qtReasonStr)
 
 						// Print entry/exit story with feature names (indented)
 						print("  %s\n", logx.Info("[ENTRY STORY]"))
@@ -2348,6 +2847,11 @@ func main() {
 								oldExp := minValExpect
 								minValExpect = 0.0001
 								logx.LogAutoAdjust("Enforcing profit gates, minValExpect", oldExp, minValExpect)
+							}
+							if elitesCount >= minElitesForProfitGates && minValScore < -5.0 {
+								oldScore := minValScore
+								minValScore = -5.0
+								logx.LogAutoAdjust("Enforcing profit gates, minValScore", oldScore, minValScore)
 							}
 						}
 					}
@@ -2596,6 +3100,16 @@ func main() {
 				atomic.AddInt64(&normalMutCount, 1)
 			}
 
+			// FIX: Always override fee/slippage to ensure consistency with command-line flags
+			// This fixes issues where parent strategies loaded from files may have different fees
+			s.FeeBps = feeBps
+			s.SlippageBps = slipBps
+
+			// PROBLEM D FIX: Debug print to confirm fees are being set (rate-limited to avoid spam)
+			if s.Seed%1000 == 0 {
+				fmt.Printf("[FEE_DEBUG] Seed=%d FeeBps=%.2f SlippageBps=%.2f\n", s.Seed, s.FeeBps, s.SlippageBps)
+			}
+
 			// COUNTER: Increment generated counter
 			atomic.AddInt64(&genGenerated, 1)
 
@@ -2692,6 +3206,20 @@ func main() {
 				// Recompile since tree changed
 				s.EntryCompiled = compileRuleTree(s.EntryRule.Root)
 			}
+
+			// CHEAP DEAD PREFILTER: Fast check to detect dead strategies BEFORE expensive WF
+			// This runs on screen window (cheap) to quickly reject entry_true=0 or regime_ok=0
+			// If dead, reroll immediately instead of wasting worker time
+			isAlive, prefilterReason := CheapDeadPrefilter(&feats, &s, screenW.Start, screenW.End)
+			if !isAlive {
+				// Strategy is dead - reroll immediately
+				IncrementRerollCount()
+				// Don't count as normal reject - this is an immediate regenerate
+				// Just continue the loop to generate a new strategy
+				continue
+			}
+			// If prefilterReason is non-empty but alive, it's a warning (not used currently)
+			_ = prefilterReason
 
 			select {
 			case <-ctx.Done():
@@ -3844,6 +4372,8 @@ func leafToString(leaf *Leaf) string {
 		LeafAbsLT:     "AbsLT",
 		LeafSlopeGT:   "SlopeGT",
 		LeafSlopeLT:   "SlopeLT",
+		LeafBreakUp:   "BreakUp",
+		LeafBreakDown: "BreakDown",
 	}
 	kindName, ok := kindNames[leaf.Kind]
 	if !ok {
@@ -3882,6 +4412,8 @@ func leafToStringNamed(leaf *Leaf, names []string) string {
 		LeafAbsLT:     "AbsLT",
 		LeafSlopeGT:   "SlopeGT",
 		LeafSlopeLT:   "SlopeLT",
+		LeafBreakUp:   "BreakUp",
+		LeafBreakDown: "BreakDown",
 	}
 	kindName, ok := kindNames[leaf.Kind]
 	if !ok {

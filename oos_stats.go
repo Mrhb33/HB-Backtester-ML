@@ -34,6 +34,7 @@ func warnStitch(format string, args ...any) {
 // MonthlyReturn represents return statistics for a single month
 type MonthlyReturn struct {
 	Month   int     // Month index (0 = first OOS month)
+	Date    string  // Month date as YYYY-MM string
 	StartEq float64 // Equity at start of month
 	EndEq   float64 // Equity at end of month
 	Return  float64 // Monthly return: (EndEq - StartEq) / StartEq
@@ -50,10 +51,13 @@ type StitchedOOSData struct {
 
 // MonthlyReturnJSON is the JSON-serializable version of MonthlyReturn for EliteLog output
 type MonthlyReturnJSON struct {
-	Month  int     `json:"month"`
-	Return float64 `json:"return"`
-	DD     float64 `json:"dd"`
-	Trades int     `json:"trades"`
+	Month    int     `json:"month"`              // Month index (0 = first OOS month)
+	Date     string  `json:"date,omitempty"`     // Month date as YYYY-MM string
+	Return   float64 `json:"return"`             // Monthly return (decimal, e.g., 0.05 = 5%)
+	DD       float64 `json:"dd"`                 // Max drawdown within this month
+	Trades   int     `json:"trades"`             // Number of trades this month
+	StartEq  float64 `json:"start_eq,omitempty"` // Equity at start of month
+	EndEq    float64 `json:"end_eq,omitempty"`   // Equity at end of month
 }
 
 // OOSRejectCode identifies the reason for OOS rejection
@@ -68,6 +72,7 @@ const (
 	RejectGeoMonthly
 	RejectActiveMonths  // NEW: Sparse months
 	RejectMedianMonthly // NEW: Median too low
+	RejectFoldDistribution // NEW: Fold trade distribution too uneven (too many zero-trade folds)
 )
 
 // OOSStats holds out-of-sample statistics
@@ -79,6 +84,7 @@ type OOSStats struct {
 	MedianAllMonths     float64 // NEW: Median across ALL months (including sparse)
 	MedianActiveMonths  float64 // NEW: Median across only active months (trades > 0)
 	MinMonth            float64 // Worst single month return
+	MaxMonth            float64 // Best single month return (PROBLEM 8 FIX: for TP multiple constraint)
 	StdMonth            float64 // Std dev of monthly returns (volatility)
 
 	// Breakdown
@@ -91,6 +97,12 @@ type OOSStats struct {
 
 	// Per-month trade stats (FIX #10)
 	MinTradesPerMonth int // Minimum trades across all months
+
+	// Per-fold trade stats (PROBLEM B FIX: Fold distribution check)
+	TotalFolds        int     // Total number of folds
+	ZeroTradeFolds    int     // Number of folds with 0 trades
+	MinTradesPerFold  int     // Minimum trades across all folds
+	ZeroTradeFoldRatio float64 // Zero-trade folds / Total folds
 
 	// Active months ratio (for stability assessment)
 	ActiveMonthsCount int     // Number of months with trades OR meaningful returns
@@ -119,10 +131,13 @@ func convertMonthlyReturnsToJSON(monthlyReturns []MonthlyReturn) []MonthlyReturn
 	result := make([]MonthlyReturnJSON, len(monthlyReturns))
 	for i, mr := range monthlyReturns {
 		result[i] = MonthlyReturnJSON{
-			Month:  mr.Month,
-			Return: mr.Return,
-			DD:     mr.DD,
-			Trades: mr.Trades,
+			Month:   mr.Month,
+			Date:    mr.Date,
+			Return:  mr.Return,
+			DD:      mr.DD,
+			Trades:  mr.Trades,
+			StartEq: mr.StartEq,
+			EndEq:   mr.EndEq,
 		}
 	}
 	return result
@@ -333,6 +348,7 @@ func ComputeMonthlyReturnsFromEquity(stitched StitchedOOSData,
 
 			mr := MonthlyReturn{
 				Month:   monthIndex,
+				Date:    fmt.Sprintf("%d-%02d", currentYear, currentMonth), // YYYY-MM format
 				StartEq: startEq,
 				EndEq:   endEq,
 				Return:  monthRet,
@@ -382,6 +398,7 @@ func ComputeMonthlyReturnsFromEquity(stitched StitchedOOSData,
 
 		mr := MonthlyReturn{
 			Month:   monthIndex,
+			Date:    fmt.Sprintf("%d-%02d", currentYear, currentMonth), // YYYY-MM format for last month
 			StartEq: startEq,
 			EndEq:   endEq,
 			Return:  monthRet,
@@ -526,6 +543,23 @@ func ValidateOOSConstraints(stats *OOSStats, config WFConfig) {
 		return
 	}
 
+	// Constraint 2c: PROBLEM B FIX - Min trades per fold
+	if config.MinTradesPerFold > 0 && stats.MinTradesPerFold < config.MinTradesPerFold {
+		stats.Rejected = true
+		stats.RejectCode = RejectFoldDistribution
+		stats.RejectReason = fmt.Sprintf("Insufficient trades per fold: %d < %d (trades clustered in few folds)", stats.MinTradesPerFold, config.MinTradesPerFold)
+		return
+	}
+
+	// Constraint 2d: PROBLEM B FIX - Max zero-trade fold ratio
+	if config.MaxZeroTradeFoldRatio > 0 && stats.ZeroTradeFoldRatio > config.MaxZeroTradeFoldRatio {
+		stats.Rejected = true
+		stats.RejectCode = RejectFoldDistribution
+		stats.RejectReason = fmt.Sprintf("Too many zero-trade folds: %d/%d (%.1f%%) > %.1f%% (unstable strategy)",
+			stats.ZeroTradeFolds, stats.TotalFolds, stats.ZeroTradeFoldRatio*100, config.MaxZeroTradeFoldRatio*100)
+		return
+	}
+
 	// Constraint 3: Max drawdown
 	if stats.MaxDD > config.MaxDrawdown {
 		stats.Rejected = true
@@ -581,6 +615,20 @@ func ValidateOOSConstraints(stats *OOSStats, config WFConfig) {
 		stats.RejectReason = fmt.Sprintf("Monthly volatility too high: %.2f%% > %.2f%%", stats.StdMonth*100, config.MaxStdMonth*100)
 		return
 	}
+
+	// Constraint 10: TP multiple limit (PROBLEM 8 FIX: prevents Kelly blowup strategies)
+	// Checks if best month is unrealistic compared to median (indicates rare long runs)
+	const maxTPMultiple = 8.0 // Max best month / median month ratio
+	if stats.MedianAllMonths > 0.001 { // Avoid division issues
+		tpMultiple := stats.MaxMonth / stats.MedianAllMonths
+		if tpMultiple > maxTPMultiple {
+			stats.Rejected = true
+			stats.RejectCode = RejectGeoMonthly
+			stats.RejectReason = fmt.Sprintf("TP multiple too high: %.1fx > %.1fx (MaxMo=%.2f%%, MedMo=%.2f%%)",
+				tpMultiple, maxTPMultiple, stats.MaxMonth*100, stats.MedianAllMonths*100)
+			return
+		}
+	}
 }
 
 // CalculateOOSStats computes full statistics from fold results
@@ -618,6 +666,7 @@ func CalculateOOSStats(foldResults []FoldResult, series Series, config WFConfig)
 	var allReturns []float64
 	var activeReturns []float64
 	minMonth := 1.0
+	maxMonth := -1.0 // PROBLEM 8 FIX: Track max month for TP multiple constraint
 	minTrades := 999999
 
 	activeMonths := 0
@@ -627,6 +676,9 @@ func CalculateOOSStats(foldResults []FoldResult, series Series, config WFConfig)
 		allReturns = append(allReturns, mr.Return)
 		if mr.Return < minMonth {
 			minMonth = mr.Return
+		}
+		if mr.Return > maxMonth { // PROBLEM 8 FIX: Track max month
+			maxMonth = mr.Return
 		}
 		if mr.Trades < minTrades {
 			minTrades = mr.Trades
@@ -646,6 +698,7 @@ func CalculateOOSStats(foldResults []FoldResult, series Series, config WFConfig)
 	}
 
 	stats.MinMonth = minMonth
+	stats.MaxMonth = maxMonth // PROBLEM 8 FIX: Set max month for TP multiple constraint
 	stats.MinTradesPerMonth = minTrades
 	if minTrades == 999999 {
 		stats.MinTradesPerMonth = 0
@@ -676,7 +729,36 @@ func CalculateOOSStats(foldResults []FoldResult, series Series, config WFConfig)
 	stats.OOSExpectancy = computeExpectancy(oosTrades)
 	stats.OOSWinRate = computeWinRate(oosTrades)
 
-	// 7. Validate constraints
+	// 7. PROBLEM B FIX: Compute fold trade distribution stats
+	// Track per-fold trades to detect unstable strategies (trades clustered in certain periods)
+	stats.TotalFolds = len(foldResults)
+	stats.MinTradesPerFold = 999999
+	zeroTradeFolds := 0
+	for _, fr := range foldResults {
+		if fr.TestTrades < stats.MinTradesPerFold {
+			stats.MinTradesPerFold = fr.TestTrades
+		}
+		if fr.TestTrades == 0 {
+			zeroTradeFolds++
+		}
+	}
+	if stats.MinTradesPerFold == 999999 {
+		stats.MinTradesPerFold = 0
+	}
+	stats.ZeroTradeFolds = zeroTradeFolds
+	if stats.TotalFolds > 0 {
+		stats.ZeroTradeFoldRatio = float64(zeroTradeFolds) / float64(stats.TotalFolds)
+	}
+
+	// PROBLEM 3 FIX: Debug output for fold distribution (rate-limited to avoid spam)
+	// Print when borderline (within 5% of threshold) to help diagnose issues
+	if stats.TotalFolds >= 3 && stats.ZeroTradeFoldRatio > 0.10 {
+		fmt.Printf("[FOLD_DIST] ZeroTradeFolds=%d/%d (%.1f%%) MinPerFold=%d (thr=%.0f%%, min=%d)\n",
+			stats.ZeroTradeFolds, stats.TotalFolds, stats.ZeroTradeFoldRatio*100,
+			stats.MinTradesPerFold, config.MaxZeroTradeFoldRatio*100, config.MinTradesPerFold)
+	}
+
+	// 8. Validate constraints
 	ValidateOOSConstraints(&stats, config)
 
 	return stats

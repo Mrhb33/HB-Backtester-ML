@@ -138,7 +138,7 @@ func evaluateCPCV(full Series, fullF Features, st Strategy, trainStart, trainEnd
 		}
 
 		// Compute DSR-lite score for this fold with smoothness
-		foldScore := computeScoreWithSmoothness(
+		foldScoreResult := computeScoreWithSmoothness(
 			testResult.Return,
 			testResult.MaxDD,
 			testResult.Expectancy,
@@ -147,6 +147,7 @@ func evaluateCPCV(full Series, fullF Features, st Strategy, trainStart, trainEnd
 			testResult.Trades,
 			testedCount, // Apply DSR-lite penalty
 		)
+		foldScore := foldScoreResult.Score
 
 		result.Scores = append(result.Scores, foldScore)
 		result.Returns = append(result.Returns, testResult.Return)

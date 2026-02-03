@@ -22,16 +22,35 @@ type FeatureType uint8
 const (
 	FeatTypeUnknown FeatureType = iota
 
-	FeatTypePriceLevel   // EMA*, BB_Upper/Lower*, SwingHigh/Low (same "price" units)
-	FeatTypePriceRange   // BB_Width*, Body, HighLowDiff (range/size units)
-	FeatTypeOscillator   // RSI*, ADX, PlusDI, MinusDI, MFI (bounded-ish)
-	FeatTypeZScore       // VolZ*
-	FeatTypeNormalized   // Imbalance, BuyRatio, RangeWidth (0..1-ish)
-	FeatTypeEventFlag    // BOS/FVG/Active style
-	FeatTypeVolume       // OBV, VolPerTrade, VolSMA/EMA (volume units)
-	FeatTypeVolumeDerived // VolZ*, BuyRatio, Imbalance (volume-derived metrics)
-	FeatTypeATR          // ATR*
-	FeatTypeMomentum     // ROC*, MACD*, Hist (centered around 0)
+	// Price level family (same scale)
+	FeatTypePriceLevel // EMA*, HMA*, Kijun26, SwingHigh/Low, HH_, LL_, BB_Upper/Lower, KC_*, Donchian_*, SuperTrend*
+
+	// Oscillator/Returns family (0-100 bounded or similar scale)
+	FeatTypeOscillator // RSI*, MFI14, ADX, PlusDI, MinusDI, Stoch*, WilliamsR*
+
+	// Momentum family (centered around 0, rate-of-change style)
+	FeatTypeMomentum // ROC*, MACD*, MACD_Signal, MACD_Hist, ForceIndex*, Momentum*
+
+	// Volume RAW family (raw volume units)
+	FeatTypeVolumeRaw // OBV, VolPerTrade, VolSMA*, VolEMA*
+
+	// Volume NORMALIZED family (z-scores, standardized)
+	FeatTypeVolumeZScore // VolZ20, VolZ50
+
+	// Range NORMALIZED family (0-1 ratios, percentages)
+	FeatTypeRangeNorm // BB_Width*, RangeWidth, WickUpPct, WickDownPct, BodyPct, ClosePos, Displacement
+
+	// Other volume-derived normalized metrics (0-1 range, but conceptually volume-based)
+	FeatTypeVolumeDerivedNorm // Imbalance, BuyRatio
+
+	// Price range (raw dollar units)
+	FeatTypePriceRange // Body, HighLowDiff
+
+	// ATR (volatility, dollar units)
+	FeatTypeATR // ATR7, ATR14, ATR14_SMA50
+
+	// Event flags (binary/discrete, not for crossing)
+	FeatTypeEventFlag // BOS, FVG*, Sweep*, Active, Squeeze*, Stoch*Bear/BullCross, SuperTrendDir*
 )
 
 type Features struct {
@@ -71,9 +90,10 @@ func GetFeatureMapVersion(f Features) string {
 
 // getFeatureType determines the semantic type of a feature from its name
 // CRITICAL FIX #5: This enables operator validation to prevent nonsense operations
+// Groups features into compatible scale groups for CrossUp/CrossDown/BreakUp/BreakDown
 func getFeatureType(name string) FeatureType {
 	switch {
-	// Price-level features (EMA*, BB_Upper/Lower*, SwingHigh/Low)
+	// ========== PRICE_LEVEL family (same scale: price dollars) ==========
 	case name == "EMA10" || name == "EMA20" || name == "EMA50" || name == "EMA100" || name == "EMA200":
 		return FeatTypePriceLevel
 	case name == "HMA9" || name == "HMA20" || name == "HMA50" || name == "HMA100" || name == "HMA200":
@@ -88,14 +108,16 @@ func getFeatureType(name string) FeatureType {
 		return FeatTypePriceLevel
 	case name == "LL_20_prev" || name == "LL_50_prev" || name == "LL_100_prev" || name == "LL_200_prev":
 		return FeatTypePriceLevel
+	case name == "KC_Middle20" || name == "KC_Upper20" || name == "KC_Lower20":
+		return FeatTypePriceLevel
+	case name == "Donchian_Upper20" || name == "Donchian_Lower20":
+		return FeatTypePriceLevel
+	case name == "Donchian_Upper55" || name == "Donchian_Lower55":
+		return FeatTypePriceLevel
+	case name == "SuperTrend10":
+		return FeatTypePriceLevel
 
-	// Price-range features (in dollar units: Body, HighLowDiff)
-	case name == "Body":
-		return FeatTypePriceRange
-	case name == "HighLowDiff":
-		return FeatTypePriceRange
-
-	// Oscillator features (0-100 bounded)
+	// ========== OSCILLATOR family (0-100 bounded or similar) ==========
 	case name == "RSI7" || name == "RSI14" || name == "RSI21":
 		return FeatTypeOscillator
 	case name == "MFI14":
@@ -104,104 +126,80 @@ func getFeatureType(name string) FeatureType {
 		return FeatTypeOscillator
 	case name == "PlusDI" || name == "MinusDI":
 		return FeatTypeOscillator
+	case name == "StochK_14" || name == "StochD_14" || name == "StochK_5" || name == "StochD_5":
+		return FeatTypeOscillator
+	case name == "WilliamsR_14" || name == "WilliamsR_7":
+		return FeatTypeOscillator
 
-	// Volume-derived z-score features
+	// ========== MOMENTUM family (centered around 0, rate-of-change) ==========
+	case name == "ROC5" || name == "ROC10" || name == "ROC20":
+		return FeatTypeMomentum
+	case name == "MACD" || name == "MACD_Signal" || name == "MACD_Hist":
+		return FeatTypeMomentum
+	case name == "ForceIndex2" || name == "ForceIndex13":
+		return FeatTypeMomentum
+	case name == "Momentum60" || name == "Momentum240":
+		return FeatTypeMomentum
+	case name == "SLOPE_20":
+		return FeatTypeMomentum
+
+	// ========== VOLUME_RAW family (raw volume units) ==========
+	case name == "OBV":
+		return FeatTypeVolumeRaw
+	case name == "VolPerTrade":
+		return FeatTypeVolumeRaw
+	case name == "VolSMA20" || name == "VolSMA50" || name == "VolEMA20" || name == "VolEMA50":
+		return FeatTypeVolumeRaw
+
+	// ========== VOLUME_ZSCORE family (standardized volume) ==========
 	case name == "VolZ20" || name == "VolZ50":
-		return FeatTypeVolumeDerived
+		return FeatTypeVolumeZScore
 
-	// Normalized bounded features (0..1 ratios) - non-volume
+	// ========== RANGE_NORM family (0-1 ratios, percentages) ==========
 	case name == "BB_Width20" || name == "BB_Width50":
-		return FeatTypeNormalized
+		return FeatTypeRangeNorm
 	case name == "RangeWidth":
-		return FeatTypeNormalized
+		return FeatTypeRangeNorm
 	case name == "BodyPct" || name == "WickUpPct" || name == "WickDownPct" || name == "ClosePos":
-		return FeatTypeNormalized
+		return FeatTypeRangeNorm
+	case name == "Displacement":
+		return FeatTypeRangeNorm
 
-	// Volume-derived normalized features
+	// ========== VOLUME_DERIVED_NORM family (0-1 volume-based metrics) ==========
 	case name == "Imbalance":
-		return FeatTypeVolumeDerived // Volume-based buy/sell imbalance
+		return FeatTypeVolumeDerivedNorm
 	case name == "BuyRatio":
-		return FeatTypeVolumeDerived // Volume-based buy ratio
+		return FeatTypeVolumeDerivedNorm
 
-	// Event flag features (binary/discrete)
+	// ========== PRICE_RANGE family (raw dollar units) ==========
+	case name == "Body":
+		return FeatTypePriceRange
+	case name == "HighLowDiff":
+		return FeatTypePriceRange
+
+	// ========== ATR family (volatility in dollar units) ==========
+	case name == "ATR7" || name == "ATR14" || name == "ATR14_SMA50":
+		return FeatTypeATR
+
+	// ========== EVENT_FLAG family (binary/discrete, NOT for crossing) ==========
 	case name == "BOS" || name == "Sweep" || name == "FVGUp" || name == "FVGDown":
 		return FeatTypeEventFlag
 	case name == "SweepUp_20" || name == "SweepUp_50" || name == "SweepUp_100" || name == "SweepUp_200":
 		return FeatTypeEventFlag
 	case name == "SweepDown_20" || name == "SweepDown_50" || name == "SweepDown_100" || name == "SweepDown_200":
 		return FeatTypeEventFlag
-	case name == "Displacement":
-		return FeatTypeNormalized // it's a 0..1 ratio
-
-	// Volume features
-	case name == "OBV":
-		return FeatTypeVolume
-	case name == "VolPerTrade":
-		return FeatTypeVolume
-	case name == "VolSMA20" || name == "VolSMA50" || name == "VolEMA20" || name == "VolEMA50":
-		return FeatTypeVolume
-
-	// ATR (volatility)
-	case name == "ATR7" || name == "ATR14" || name == "ATR14_SMA50":
-		return FeatTypeATR
-
-	// Momentum / ROC-like features
-	case name == "ROC5" || name == "ROC10" || name == "ROC20":
-		return FeatTypeMomentum
-	case name == "MACD" || name == "MACD_Signal" || name == "MACD_Hist":
-		return FeatTypeMomentum
-
-	// Extended features (VOLRET, SLOPE)
-	case name == "VOLRET_20":
-		return FeatTypeVolumeDerived // Volatility-of-returns
-	case name == "SLOPE_20":
-		return FeatTypeMomentum // Trend slope
-
-	// Active bars count
 	case name == "Active":
 		return FeatTypeEventFlag
-
-	// ========== PHASE 1: HIGH-IMPACT NEW INDICATORS ==========
-	// Keltner Channels (price level features like BB)
-	case name == "KC_Middle20" || name == "KC_Upper20" || name == "KC_Lower20":
-		return FeatTypePriceLevel
-
-	// Stochastic Oscillator (0-100 bounded like RSI)
-	case name == "StochK_14" || name == "StochD_14" || name == "StochK_5" || name == "StochD_5":
-		return FeatTypeOscillator
-
-	// Donchian Channels (price level features)
-	case name == "Donchian_Upper20" || name == "Donchian_Lower20":
-		return FeatTypePriceLevel
-	case name == "Donchian_Upper55" || name == "Donchian_Lower55":
-		return FeatTypePriceLevel
-
-	// SuperTrend (price level feature)
-	case name == "SuperTrend10":
-		return FeatTypePriceLevel
 	case name == "SuperTrendDir10":
-		return FeatTypeEventFlag // Direction is +1/-1 flag
-
-	// Williams %R (-100 to 0 oscillator)
-	case name == "WilliamsR_14" || name == "WilliamsR_7":
-		return FeatTypeOscillator
-
-	// Force Index (momentum/volume-derived)
-	case name == "ForceIndex2" || name == "ForceIndex13":
-		return FeatTypeMomentum
-
-	// Momentum (rate of return features)
-	case name == "Momentum60" || name == "Momentum240":
-		return FeatTypeMomentum
-
-	// ========== PHASE 2: HIGH-VALUE EVENT FLAGS ==========
-	// BB-KC Squeeze flags
+		return FeatTypeEventFlag
 	case name == "Squeeze20" || name == "SqueezeBreakUp" || name == "SqueezeBreakDown":
 		return FeatTypeEventFlag
-
-	// Stochastic cross signals
 	case name == "StochBullCross" || name == "StochBearCross":
 		return FeatTypeEventFlag
+
+	// ========== Legacy/Other ==========
+	case name == "VOLRET_20":
+		return FeatTypeMomentum // Volatility-of-returns
 
 	default:
 		return FeatTypeUnknown
@@ -210,44 +208,61 @@ func getFeatureType(name string) FeatureType {
 
 // canCrossFeatures returns true if two feature types are compatible for cross operations
 // CRITICAL FIX #5: Only allow crossing within same semantic scale group.
-// This blocks nonsense like: CrossUp(BB_Upper50, MACD_Hist), CrossDown(BB_Width50, SwingHigh)
+// This blocks nonsense like: CrossUp(VolEMA20, VolZ20) - mixing raw volume with z-score
+//
+// Compatible groups (can cross within group):
+// - price_level: EMA*, HMA*, Kijun26, SwingHigh/Low, HH_, LL_, BB_Upper/Lower, KC_*, Donchian_*, SuperTrend*
+// - returns_osc: RSI*, ROC*, MACD*, ADX, PlusDI, MinusDI, MFI14, Stoch*, WilliamsR*
+// - volume_raw: VolSMA*, VolEMA*, VolPerTrade, OBV
+// - volume_norm: VolZ20, VolZ50 (z-scores, standardized)
+// - range_norm: BB_Width*, RangeWidth, WickUpPct/WickDownPct, BodyPct, ClosePos, Displacement
+// - volume_derived_norm: Imbalance, BuyRatio (volume-based 0-1 metrics)
+//
+// Price-related family (can cross within):
+// - price_level, price_range, ATR
+//
+// IMPORTANT: EventFlags are NEVER allowed in cross operations!
 func canCrossFeatures(typeA, typeB FeatureType) bool {
+	// EventFlags can NEVER be crossed (they're binary/discrete, not continuous)
+	if typeA == FeatTypeEventFlag || typeB == FeatTypeEventFlag {
+		return false
+	}
+
 	if typeA == FeatTypeUnknown || typeB == FeatTypeUnknown {
 		return false
 	}
 
-	// Same type can cross (except EventFlag)
+	// Same type can always cross (except EventFlag handled above)
 	if typeA == typeB {
-		if typeA == FeatTypeEventFlag {
-			return false
-		}
 		return true
 	}
 
-	// Price family: PriceLevel / PriceRange / ATR
+	// Price family: PriceLevel / PriceRange / ATR (all dollar units)
 	priceFamily := []FeatureType{FeatTypePriceLevel, FeatTypePriceRange, FeatTypeATR}
 	if inSlice(priceFamily, typeA) && inSlice(priceFamily, typeB) {
 		return true
 	}
 
-	// Oscillator family
-	oscFamily := []FeatureType{FeatTypeOscillator}
-	if inSlice(oscFamily, typeA) && inSlice(oscFamily, typeB) {
+	// Oscillator + Momentum family (similar scale: oscillating around center)
+	oscMomFamily := []FeatureType{FeatTypeOscillator, FeatTypeMomentum}
+	if inSlice(oscMomFamily, typeA) && inSlice(oscMomFamily, typeB) {
 		return true
 	}
 
-	// Volume family
-	volFamily := []FeatureType{FeatTypeVolume, FeatTypeVolumeDerived}
-	if inSlice(volFamily, typeA) && inSlice(volFamily, typeB) {
+	// Volume RAW + VolumeDerivedNorm family (raw volume units)
+	// Note: VolZ* (z-scores) NOT included - they're in separate group
+	volRawFamily := []FeatureType{FeatTypeVolumeRaw, FeatTypeVolumeDerivedNorm}
+	if inSlice(volRawFamily, typeA) && inSlice(volRawFamily, typeB) {
 		return true
 	}
 
-	// Momentum family
-	momFamily := []FeatureType{FeatTypeMomentum}
-	if inSlice(momFamily, typeA) && inSlice(momFamily, typeB) {
-		return true
-	}
+	// Volume ZScore family (standardized) - ONLY cross within itself
+	// CANNOT mix with raw volume or other normalized features
 
+	// RangeNorm family (0-1 ratios) - ONLY cross within itself
+	// CANNOT mix with volume_zscore or other families
+
+	// All other combinations are INCOMPATIBLE
 	return false
 }
 

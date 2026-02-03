@@ -52,7 +52,6 @@ func isMomentumFeature(name string) bool {
 		strings.Contains(name, "Momentum") ||
 		strings.Contains(name, "MACD") ||
 		strings.Contains(name, "Hist") ||
-		strings.Contains(name, "SuperTrendDir") ||
 		name == "ADX" || name == "PlusDI" || name == "MinusDI" ||
 		strings.Contains(name, "RSI") ||
 		strings.Contains(name, "Stoch") ||
@@ -74,6 +73,14 @@ func isStructureFeature(name string) bool {
 		strings.HasPrefix(name, "Sweep") ||
 		strings.HasPrefix(name, "BOS") ||
 		strings.HasPrefix(name, "FVG") ||
+		strings.HasPrefix(name, "Breakout")
+}
+
+// isCrossableStructureFeature returns true if the feature is a structure feature suitable for Cross/Break operations
+// IMPORTANT: Excludes EventFlags (Sweep*, BOS, FVG) because they're binary/discrete, not continuous
+func isCrossableStructureFeature(name string) bool {
+	return strings.HasPrefix(name, "HH_") ||
+		strings.HasPrefix(name, "LL_") ||
 		strings.HasPrefix(name, "Breakout")
 }
 
@@ -105,10 +112,10 @@ func randomFeatureIndex(rng *rand.Rand, feats Features) int {
 		}
 	}
 
-	// Collect volume-derived features (FeatTypeVolume + FeatTypeVolumeDerived)
+	// Collect volume-derived features (FeatTypeVolumeRaw + FeatTypeVolumeZScore + FeatTypeVolumeDerivedNorm)
 	for i := range feats.Names {
 		if i < len(feats.Types) {
-			if feats.Types[i] == FeatTypeVolume || feats.Types[i] == FeatTypeVolumeDerived {
+			if feats.Types[i] == FeatTypeVolumeRaw || feats.Types[i] == FeatTypeVolumeZScore || feats.Types[i] == FeatTypeVolumeDerivedNorm {
 				volumeIndices = append(volumeIndices, i)
 			}
 		}
@@ -167,7 +174,7 @@ func randomFeatureIndexByGroup(rng *rand.Rand, feats Features, group string) int
 				candidates = append(candidates, i)
 			}
 		case "structure":
-			if isStructureFeature(name) {
+			if isCrossableStructureFeature(name) {
 				candidates = append(candidates, i)
 			}
 		}
@@ -180,36 +187,28 @@ func randomFeatureIndexByGroup(rng *rand.Rand, feats Features, group string) int
 
 // getCompatibleFeatureIndex returns a feature index compatible with the given feature type
 // For Cross/Break operations, we need features of the same category to make valid comparisons
+// Uses canCrossFeatures() to ensure compatibility and block EventFlags from crossing
 func getCompatibleFeatureIndex(rng *rand.Rand, feats Features, aIdx int, aName string) int {
-	// Categorize features by type
-	isOscillator := func(name string) bool {
-		return strings.Contains(name, "RSI") || strings.Contains(name, "ADX") ||
-			strings.Contains(name, "MFI") || strings.Contains(name, "Stoch")
-	}
-	isPrice := func(name string) bool {
-		return strings.Contains(name, "EMA") || strings.Contains(name, "SMA") ||
-			strings.Contains(name, "BB_") || strings.Contains(name, "VWAP") ||
-			name == "Close" || name == "Open" || name == "High" || name == "Low"
-	}
-	isNormalized := func(name string) bool {
-		return strings.Contains(name, "Ratio") || strings.Contains(name, "Pct") ||
-			strings.Contains(name, "Imbalance") || strings.Contains(name, "Body")
-	}
-	isZScore := func(name string) bool {
-		return strings.Contains(name, "VolZ") || strings.Contains(name, "ZScore")
+	// Get feature type for A
+	var typeA FeatureType
+	if aIdx < len(feats.Types) {
+		typeA = feats.Types[aIdx]
+	} else {
+		return aIdx // Invalid index, fallback
 	}
 
 	// Find compatible features
 	var compatible []int
-	for i, name := range feats.Names {
+	for i := range feats.Names {
 		if i == aIdx {
 			continue // Skip self
 		}
-		// Match by category
-		if (isOscillator(aName) && isOscillator(name)) ||
-			(isPrice(aName) && isPrice(name)) ||
-			(isNormalized(aName) && isNormalized(name)) ||
-			(isZScore(aName) && isZScore(name)) {
+		if i >= len(feats.Types) {
+			continue // Skip invalid indices
+		}
+		typeB := feats.Types[i]
+		// Use the proper compatibility check from features.go
+		if canCrossFeatures(typeA, typeB) {
 			compatible = append(compatible, i)
 		}
 	}
@@ -685,7 +684,7 @@ func getFeatureCategory(featType FeatureType) FeatureCategory {
 	switch featType {
 	case FeatTypePriceLevel, FeatTypeOscillator, FeatTypeMomentum:
 		return CatPriceMarket
-	case FeatTypeVolume, FeatTypeATR, FeatTypeVolumeDerived:
+	case FeatTypeVolumeRaw, FeatTypeVolumeZScore, FeatTypeVolumeDerivedNorm, FeatTypeATR:
 		return CatVolumeVolatility
 	default:
 		return CatOther
@@ -993,7 +992,7 @@ func hasStaticPriceThreshold(node *RuleNode, feats Features) bool {
 		// VOLUME FEATURES: VolSMA, VolEMA, OBV, VolPerTrade
 		// These should NOT use absolute volume thresholds (100 to 100000 range)
 		// BTC volume has grown 10x+ from 2017 to 2024
-		if featType == FeatTypeVolume || strings.HasPrefix(featName, "Vol") || featName == "OBV" || featName == "VolPerTrade" {
+		if featType == FeatTypeVolumeRaw || strings.HasPrefix(featName, "Vol") || featName == "OBV" || featName == "VolPerTrade" {
 			if threshold >= 100 && threshold <= 100000 {
 				return true // Static volume threshold - REJECT
 			}
@@ -1194,11 +1193,12 @@ func randomEntryRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int, en
 	randOp := rng.Float32()
 
 	// For entry rules: use AND more aggressively, limit OR count
-	// NOT has 10% probability when not at leaf level
-	if randOp < 0.10 {
+	// CRITICAL FIX: Reduced NOT probability from 10% to 5% to reduce dead strategies
+	// NOT gates reduce signal frequency significantly, so use them sparingly
+	if randOp < 0.05 {
 		op = OpNot
-	} else if randOp < 0.40 && *entryOrCount < maxOrCount {
-		// Allow up to maxOrCount ORs per entry rule
+	} else if randOp < 0.35 && *entryOrCount < maxOrCount {
+		// Allow up to maxOrCount ORs per entry rule (30% probability for OR)
 		op = OpOr
 		*entryOrCount++
 	}
@@ -1428,37 +1428,40 @@ func randomStrategyWithCosts(rng *rand.Rand, feats Features, feeBps, slipBps flo
 		RegimeFilter:     RuleTree{Root: regimeRoot},
 		RegimeCompiled:   compileRuleTree(regimeRoot),
 		VolatilityFilter: randomVolFilterModel(rng), // Volatility regime filter
-		MaxHoldBars:      500 + rng.Intn(500),       // 500..999 bars (~2-4 days for 5min) - allow big winners to run
-		MaxConsecLosses:  20,                        // stop after 20 consecutive losses
-		CooldownBars:     100,                       // Fix B: Raised from 50 to 100 for all timeframes
+		MaxConsecLosses:  20, // stop after 20 consecutive losses
 	}
 
-	// FIX #C: Timeframe-aware cooldown - increase for 1H to reduce overtrading
-	// Fix B: Raised cooldown from 150-250 to 200-300 bars to reduce overtrading
+	// PROBLEM 10 FIX: Fold-aware hold/cooldown sampling
+	// Instead of fixed ranges, use testBars/10 as max hold, testBars/30 as max cooldown
+	// This prevents WF_CLAMP spam by generating values within fold constraints
 	tfMinutes = atomic.LoadInt32(&globalTimeframeMinutes) // Reuse variable from line 781
-	if tfMinutes >= 60 {
-		// 1H: reduce cooldown to allow more trade opportunities while still avoiding churn
-		// 96-168 bars ~= 4-7 days on 1H
-		s.CooldownBars = 96 + rng.Intn(73) // 96-168 bars for 1H
-		// Shorten max hold to increase turnover without forcing early exits (SL/TP still primary)
-		s.MaxHoldBars = 300 + rng.Intn(401) // 300-700 bars for 1H (~12-29 days)
-	}
+	barsPerDay := int(1440.0 / float64(tfMinutes))
+	typicalFoldBars := barsPerDay * 90 // 90-day fold
 
-	// CRITICAL FIX #2: Bootstrap mode - use lower cooldown and MaxHoldBars to speed up learning
-	// When no elites exist yet, use 0-50 cooldown and 50-150 MaxHoldBars for faster feedback
+	// Sample hold_bars based on fold size: max = testBars/10
+	maxHoldBars := typicalFoldBars / 10
+	if maxHoldBars < 20 {
+		maxHoldBars = 20
+	}
+	if maxHoldBars > 120 {
+		maxHoldBars = 120
+	}
+	s.MaxHoldBars = (maxHoldBars / 2) + rng.Intn(maxHoldBars/2+1) // 50% to 100% of max
+
+	// Sample cooldown_bars based on fold size: max = testBars/30
+	maxCooldownBars := typicalFoldBars / 30
+	if maxCooldownBars < 10 {
+		maxCooldownBars = 10
+	}
+	if maxCooldownBars > 48 {
+		maxCooldownBars = 48
+	}
+	s.CooldownBars = (maxCooldownBars / 2) + rng.Intn(maxCooldownBars/2+1)
+
+	// PROBLEM E FIX: Bootstrap mode - shorter values for faster feedback, still within clamps
 	if isBootstrapMode() {
-		if tfMinutes >= 60 {
-			// 1H bootstrap: shorten cooldown to accelerate discovery
-			s.CooldownBars = 48 + rng.Intn(49) // 48-96 bars for 1H during bootstrap
-		} else {
-			// Fix B: 5min/15min bootstrap: raised from 0-50 to 50-100 bars
-			s.CooldownBars = 50 + rng.Intn(51) // 50-100 bars during bootstrap for 5min/15min
-		}
-		if tfMinutes >= 60 {
-			s.MaxHoldBars = 180 + rng.Intn(301) // 180-480 bars during bootstrap for 1H
-		} else {
-			s.MaxHoldBars = 200 + rng.Intn(301) // 200-500 bars during bootstrap (~17-42 hours)
-		}
+		s.MaxHoldBars = (maxHoldBars / 4) + rng.Intn(maxHoldBars*3/4+1)
+		s.CooldownBars = (maxCooldownBars / 4) + rng.Intn(maxCooldownBars*3/4+1)
 	}
 
 	// CRITICAL FIX #1: Force SL/TP to be same kind and enforce RR >= 2.5
@@ -1962,7 +1965,9 @@ func ensureRegimeFilterValid(rng *rand.Rand, st *Strategy, feats Features) {
 }
 
 func randomRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int) *RuleNode {
-	if depth >= maxDepth || rng.Float32() < 0.3 {
+	// PROBLEM A FIX: Increased leaf probability from 0.3 to 0.4 to reduce deep trees
+	// Deep AND trees create too restrictive entry conditions that never trigger
+	if depth >= maxDepth || rng.Float32() < 0.4 {
 		return &RuleNode{
 			Op:   OpLeaf,
 			Leaf: randomLeaf(rng, feats),
@@ -1972,10 +1977,13 @@ func randomRuleNode(rng *rand.Rand, feats Features, depth, maxDepth int) *RuleNo
 	op := OpAnd
 	randOp := rng.Float32()
 
-	// NOT has 10% probability when not at leaf level
-	if randOp < 0.10 {
+	// PROBLEM A FIX: Rebalanced operator probabilities:
+	// - Reduced NOT from 10% to 5% (NOT on rare events = always true = dead)
+	// - Increased OR from 45% to 60% (OR trees have higher entry rate)
+	// - Reduced AND from 45% to 35% (AND trees are too restrictive)
+	if randOp < 0.05 {
 		op = OpNot
-	} else if randOp < 0.55 {
+	} else if randOp < 0.65 {
 		op = OpOr
 	}
 
@@ -2110,6 +2118,17 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 		featName = feats.Names[a]
 	}
 
+	// FIX: If Cross kind was selected but feature A is EventFlag (can't be crossed),
+	// immediately switch to GT/LT instead of falling back later
+	// This prevents the "Cross fallback" issue that produces weird rules
+	if a < len(feats.Types) && feats.Types[a] == FeatTypeEventFlag {
+		if kind == LeafCrossUp || kind == LeafCrossDown || kind == LeafBreakUp || kind == LeafBreakDown || kind == LeafBetween {
+			// EventFlags can't be crossed - switch to GT/LT
+			gtLtKinds := []LeafKind{LeafGT, LeafLT}
+			kind = gtLtKinds[rng.Intn(len(gtLtKinds))]
+		}
+	}
+
 	// FIXED: Use loop instead of recursion to avoid stack blowup
 	// For 1H: skip fragile feature types
 	if is1H {
@@ -2175,35 +2194,48 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 				}
 			}
 		}
-		// FIX: If no compatible B found, fall back to GT/LT (fast threshold operators)
-		// OLD BUG: kind = LeafRising - too slow, causes edges=0 in WF folds
-		// NEW: Use GT/LT with immediate threshold computation
+		// PROBLEM E FIX: Hard-reject invalid Cross - resample completely
+		// If no compatible B found, generate a FRESH leaf with new A (not fallback with same A)
+		// Keeping same A but changing operator changes semantic meaning and creates garbage patterns
 		if !found {
-			// Fallback to fast threshold operator
-			var thresholdValue float32
-			if rng.Float32() < 0.5 {
-				kind = LeafGT
-				// 60th-80th percentile
-				k := 0.25 + rng.Float32()*0.59
-				thresholdValue = feats.Stats[a].Mean + k*feats.Stats[a].Std
-			} else {
-				kind = LeafLT
-				// 20th-40th percentile
-				k := -0.84 + rng.Float32()*0.59
-				thresholdValue = feats.Stats[a].Mean + k*feats.Stats[a].Std
+			// Pick a completely new feature (fresh resample, not fallback)
+			newA := randomFeatureIndex(rng, feats)
+			newFeatName := ""
+			if newA < len(feats.Names) {
+				newFeatName = feats.Names[newA]
 			}
-			if a < len(feats.Names) {
-				thresholdValue = clampThresholdByFeature(thresholdValue, feats.Names[a])
-			}
-			b = a
-			lookback = 0
-			threshold = thresholdValue
 
-			// Return immediately - don't rely on default case
-			// Fall through to Leaf below to handle GT/LT setup
+			// Pick GT or LT (guaranteed to work with any feature)
+			var newKind LeafKind
+			var newThreshold float32
+			if rng.Float32() < 0.5 {
+				newKind = LeafGT
+				if newA < len(feats.Stats) {
+					k := float32(0.25 + rng.Float32()*0.59)
+					newThreshold = feats.Stats[newA].Mean + k*feats.Stats[newA].Std
+				}
+			} else {
+				newKind = LeafLT
+				if newA < len(feats.Stats) {
+					k := float32(-0.84 + rng.Float32()*0.59)
+					newThreshold = feats.Stats[newA].Mean + k*feats.Stats[newA].Std
+				}
+			}
+			newThreshold = clampThresholdByFeature(newThreshold, newFeatName)
+
+			// Return fresh leaf immediately (hard-reject the Cross attempt)
+			return Leaf{
+				Kind:     newKind,
+				A:        newA,
+				B:        newA,
+				X:        newThreshold,
+				Y:        0,
+				Lookback: 0,
+			}
+		} else {
+			lookback = 0  // Cross/Break leaves don't use lookback
+			threshold = 0 // Cross/Break leaves don't use threshold
 		}
-		lookback = 0  // Cross/Break leaves don't use lookback
-		threshold = 0 // Cross/Break leaves don't use threshold
 	case LeafRising, LeafFalling:
 		// FIX 2: Very short lookback for faster triggers: 2-5 bars (was 2-10)
 		lookback = rng.Intn(4) + 2 // 2, 3, 4, or 5 bars only
@@ -2360,8 +2392,9 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 		threshold = clampThresholdByFeature(threshold, featName)
 	case LeafSlopeGT, LeafSlopeLT:
 		// Slope comparison over lookback period
+		// PROBLEM A FIX: Reduced lookback from 2-10 to 2-6 bars to increase trigger frequency
 		b = a
-		lookback = rng.Intn(9) + 2                   // 2-10 bars (reduced from 5-20)
+		lookback = rng.Intn(5) + 2                   // 2-6 bars (reduced from 2-10)
 		threshold = float32(rng.NormFloat64() * 0.1) // Small slope values
 		// CRITICAL FIX #4: Clamp to feature-specific bounds
 		threshold = clampThresholdByFeature(threshold, featName)
@@ -2371,16 +2404,16 @@ func randomLeaf(rng *rand.Rand, feats Features) Leaf {
 		b = a
 		if a < len(feats.Stats) {
 			stats := feats.Stats[a]
-			// Use quantiles instead of raw random values to make conditions naturally selective
-			// LT (20th-40th percentile): Mean - (0.84 to 0.25) * Std
-			// GT (60th-80th percentile): Mean + (0.25 to 0.84) * Std
+			// PROBLEM 3 FIX: Use tighter quantiles to reduce "entry rate too low" failures
+			// LT (30th-45th percentile): Mean - (0.52 to 0.25) * Std
+			// GT (55th-70th percentile): Mean + (0.13 to 0.52) * Std
 			var k float32
 			if kind == LeafLT {
-				// LT: pick from 20th-40th percentile (below mean)
-				k = -0.84 + rng.Float32()*0.59 // range: -0.84 to -0.25 (approx 20th-40th percentile)
+				// LT: pick from 30th-45th percentile (less extreme)
+				k = -0.52 + rng.Float32()*0.27 // range: -0.52 to -0.25 (Q30-Q45)
 			} else { // LeafGT
-				// GT: pick from 60th-80th percentile (above mean)
-				k = 0.25 + rng.Float32()*0.59 // range: 0.25 to 0.84 (approx 60th-80th percentile)
+				// GT: pick from 55th-70th percentile (less extreme)
+				k = 0.13 + rng.Float32()*0.39 // range: 0.13 to 0.52 (Q55-Q70)
 			}
 			threshold = stats.Mean + k*stats.Std
 
@@ -2523,11 +2556,39 @@ func randomEntryLeaf(rng *rand.Rand, feats Features, allowBetween bool) Leaf {
 	}
 
 	// Cross/Break leaves: ensure A != B and compatible
+	// PROBLEM E FIX: Hard-reject if no compatible B found - resample with GT/LT
 	if kind == LeafCrossUp || kind == LeafCrossDown || kind == LeafBreakUp || kind == LeafBreakDown {
 		b := getCompatibleFeatureIndex(rng, feats, a, featName)
-		if b == a {
-			for attempts := 0; attempts < 10 && b == a; attempts++ {
-				b = randomFeatureIndex(rng, feats)
+		if b == a || b < 0 {
+			// No compatible B found - hard-reject Cross, resample with GT/LT and fresh feature
+			newA := randomFeatureIndex(rng, feats)
+			newFeatName := ""
+			if newA < len(feats.Names) {
+				newFeatName = feats.Names[newA]
+			}
+			var newKind LeafKind
+			var newThreshold float32
+			if rng.Float32() < 0.5 {
+				newKind = LeafGT
+				if newA < len(feats.Stats) {
+					k := float32(0.25 + rng.Float32()*0.59)
+					newThreshold = feats.Stats[newA].Mean + k*feats.Stats[newA].Std
+				}
+			} else {
+				newKind = LeafLT
+				if newA < len(feats.Stats) {
+					k := float32(-0.84 + rng.Float32()*0.59)
+					newThreshold = feats.Stats[newA].Mean + k*feats.Stats[newA].Std
+				}
+			}
+			newThreshold = clampThresholdByFeature(newThreshold, newFeatName)
+			return Leaf{
+				Kind:     newKind,
+				A:        newA,
+				B:        newA,
+				X:        newThreshold,
+				Y:        0,
+				Lookback: 0,
 			}
 		}
 		leaf.B = b
@@ -2740,20 +2801,34 @@ func randomExitLeaf(rng *rand.Rand, feats Features) Leaf {
 		return leaf
 
 	case LeafCrossDown, LeafCrossUp:
-		// Cross leaves require A != B
-		// For exit: use A crossing below/above B
-		var b int
-		if kind == LeafCrossDown || kind == LeafCrossUp {
-			// Get compatible B feature
-			b = getCompatibleFeatureIndex(rng, feats, a, featName)
-			if b == a || b < 0 {
-				// Fallback: pick different feature
-				for attempts := 0; attempts < 10 && (b == a || b < 0); attempts++ {
-					b = randomFeatureIndexByGroup(rng, feats, featureGroup)
-					if b < 0 {
-						b = randomFeatureIndex(rng, feats)
-					}
-				}
+		// Cross leaves require A != B and compatible types
+		// PROBLEM E FIX: Hard-reject if no compatible B found - resample with LT
+		b := getCompatibleFeatureIndex(rng, feats, a, featName)
+		if b == a || b < 0 {
+			// No compatible B found - hard-reject Cross, resample with LT and fresh feature
+			// For exit leaves, prefer LT (exit when value drops below threshold)
+			newA := randomFeatureIndexByGroup(rng, feats, featureGroup)
+			if newA < 0 {
+				newA = randomFeatureIndex(rng, feats)
+			}
+			newFeatName := ""
+			if newA >= 0 && newA < len(feats.Names) {
+				newFeatName = feats.Names[newA]
+			}
+			var newThreshold float32
+			if newA >= 0 && newA < len(feats.Stats) {
+				// For exit LT: below mean threshold (20th-40th percentile)
+				k := float32(-0.84 + rng.Float32()*0.59)
+				newThreshold = feats.Stats[newA].Mean + k*feats.Stats[newA].Std
+			}
+			newThreshold = clampThresholdByFeature(newThreshold, newFeatName)
+			return Leaf{
+				Kind:     LeafLT,
+				A:        newA,
+				B:        newA,
+				X:        newThreshold,
+				Y:        0,
+				Lookback: 0,
 			}
 		}
 		leaf.B = b
@@ -2812,11 +2887,14 @@ func randomStopModel(rng *rand.Rand) StopModel {
 	// FIX #1: Enforce ATR-based stops (98% ATR, 2% fixed with strict minimum)
 	kind := rng.Intn(100)
 	if kind < 98 { // 98% ATR (increased from 70%)
+		// PROBLEM C FIX: Tighten ATR SL range to reduce fat-tail risk
+		// Previous: 1.5-4.5x ATR (1H) and 2-6x ATR (5min/15min)
+		// New: 1.2-3.5x ATR (1H) and 1.5-4.5x ATR (5min/15min)
 		var atrMin, atrMax, atrMean float64
 		if is1H {
-			atrMin, atrMax, atrMean = 1.5, 4.5, 3.0 // Fix C: Tighter for 1H
+			atrMin, atrMax, atrMean = 1.2, 3.5, 2.5 // Problem C: Tighter for 1H (was 1.5-4.5)
 		} else {
-			atrMin, atrMax, atrMean = 2.0, 6.0, 4.5 // Normal for 5min/15min
+			atrMin, atrMax, atrMean = 1.5, 4.5, 3.0 // Problem C: Tighter for 5min/15min (was 2-6)
 		}
 		atr := rng.NormFloat64()*1.5 + atrMean
 		if atr < atrMin {
@@ -2831,11 +2909,14 @@ func randomStopModel(rng *rand.Rand) StopModel {
 			Value:   0,
 		}
 	} else { // 2% fixed - must be large to match ATR minimum
+		// PROBLEM C FIX: Tighten SL range to reduce "survive anything" stops
+		// Previous: 3-6% (1H) and 4-8% (5min/15min)
+		// New: 2-4% (1H) and 3-5% (5min/15min)
 		var valMin, valMax, valMean float64
 		if is1H {
-			valMin, valMax, valMean = 3.0, 6.0, 4.5 // Fix C: 3-6% for 1H (was 4-8%)
+			valMin, valMax, valMean = 2.0, 4.0, 3.0 // Problem C: 2-4% for 1H (was 3-6%)
 		} else {
-			valMin, valMax, valMean = 4.0, 8.0, 6.0 // Normal: 4-8% for 5min/15min
+			valMin, valMax, valMean = 3.0, 5.0, 4.0 // Problem C: 3-5% for 5min/15min (was 4-8%)
 		}
 		val := rng.NormFloat64()*1.0 + valMean
 		if val < valMin {

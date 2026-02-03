@@ -19,6 +19,15 @@ const (
 
 var pfDebugCount uint64 // package-level counter for throttled PF debug logging
 
+// CRITICAL FIX: ScoreResult stores both the score and an optional invalid reason
+// This allows scoring functions to return diagnostic information that survives parallel execution
+type ScoreResult struct {
+	Score  float32
+	Reason string // Empty if valid, contains diagnostic if invalid
+}
+
+// slippageRef returns the last fully-known bar index at the time of a fill.
+
 // slippageRef returns the last fully-known bar index at the time of a fill.
 // For fills at bar t open or intrabar during bar t, use t-1.
 // For force-close at final close, use finalIdx-1 (if possible).
@@ -133,19 +142,20 @@ type GoldenResult struct {
 }
 
 type Result struct {
-	Strategy     Strategy
-	Score        float32
-	Return       float32
-	MaxDD        float32
-	MaxDDRaw     float32 // Raw max drawdown (not normalized)
-	WinRate      float32
-	Expectancy   float32
-	ProfitFactor float32
-	Trades       int
-	SmoothVol    float32 // EMA volatility of equity changes (lower = smoother)
-	DownsideVol  float32 // Downside volatility for Sortino ratio (negative returns only)
-	ValResult    *Result // Optional validation result from multi-fidelity
-	ExitReasons  map[string]int // Count of trades by exit reason
+	Strategy           Strategy
+	Score              float32
+	Return             float32
+	MaxDD              float32
+	MaxDDRaw           float32 // Raw max drawdown (not normalized)
+	WinRate            float32
+	Expectancy         float32
+	ProfitFactor       float32
+	Trades             int
+	SmoothVol          float32 // EMA volatility of equity changes (lower = smoother)
+	DownsideVol        float32 // Downside volatility for Sortino ratio (negative returns only)
+	InvalidScoreReason string  // CRITICAL FIX: Store which component caused invalid score (logReturn/calmar/sortino/smoothness/deflation etc.)
+	ValResult          *Result // Optional validation result from multi-fidelity
+	ExitReasons        map[string]int // Count of trades by exit reason
 
 	// OOS Stats (Walk-Forward Validation)
 	OOSGeoAvgMonthly       float64  `json:"oos_geo_avg_monthly,omitempty"`       // Geometric average monthly return (all months)
@@ -237,7 +247,13 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 	}
 
 	// Score using raw metrics (RiskPct=1.0) to prevent score inflation
-	score := computeScoreWithSmoothness(rawReturn, core.rawMaxDD, core.expectancy, core.smoothVol, core.downsideVol, core.totalTrades, 0)
+	scoreResult := computeScoreWithSmoothness(rawReturn, core.rawMaxDD, core.expectancy, core.smoothVol, core.downsideVol, core.totalTrades, 0)
+	score := scoreResult.Score
+	// Store invalid reason if present
+	var invalidReason string
+	if scoreResult.Reason != "" {
+		invalidReason = scoreResult.Reason
+	}
 
 	// If no trades, set score to very low number
 	if core.totalTrades == 0 {
@@ -258,211 +274,547 @@ func evaluateStrategyRange(s Series, f Features, st Strategy, tradeStartLocal, e
 	}
 
 	// Return raw metrics (RiskPct=1.0) for scoring to prevent score inflation
+	// CRITICAL: Sanitize score to prevent NaN/Inf/corrupted values from entering the system
 	return Result{
-		Strategy:     st,
-		Score:        score,
-		Return:       rawReturn,       // Raw return (RiskPct=1.0)
-		MaxDD:        core.rawMaxDD,   // Raw max DD (RiskPct=1.0)
-		MaxDDRaw:     core.rawMaxDD,   // Keep raw maxDDRaw as is
-		WinRate:      core.winRate,
-		Expectancy:   core.expectancy,
-		ProfitFactor: core.profitFactor,
-		Trades:       core.totalTrades,
-		SmoothVol:    core.smoothVol,
-		DownsideVol:  core.downsideVol,
-		ExitReasons:  core.exitReasons,
+		Strategy:           st,
+		Score:              SanitizeScore(score),
+		Return:             rawReturn,       // Raw return (RiskPct=1.0)
+		MaxDD:              core.rawMaxDD,   // Raw max DD (RiskPct=1.0)
+		MaxDDRaw:           core.rawMaxDD,   // Keep raw maxDDRaw as is
+		WinRate:            core.winRate,
+		Expectancy:         core.expectancy,
+		ProfitFactor:       core.profitFactor,
+		Trades:             core.totalTrades,
+		SmoothVol:          core.smoothVol,
+		DownsideVol:        core.downsideVol,
+		InvalidScoreReason: invalidReason, // Store any invalid score component reason
+		ExitReasons:        core.exitReasons,
 	}
 }
 
-func computeScore(ret, dd, expectancy float32, trades int, testedCount int64) float32 {
-	// PROBLEM C FIX: Comprehensive input validation - check for NaN, Inf, or absurd values
-	invalidScore := false
-	invalidReason := ""
+// safeLog32 computes natural log with guard against invalid inputs
+// Returns (log_value, is_valid) - if invalid, returns 0 and false
+func safeLog32(x float64) (float32, bool) {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return 0, false
+	}
+	if x <= 0 {
+		// log(negative) or log(0) is invalid
+		return 0, false
+	}
+	result := math.Log(x)
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0, false
+	}
+	return float32(result), true
+}
+
+// safeDiv32 computes division with guard against division by zero
+// Returns (quotient, is_valid) - if invalid, returns 0 and false
+func safeDiv32(num, den float32) (float32, bool) {
+	const epsilon = 1e-6
+	if math.IsNaN(float64(num)) || math.IsInf(float64(num), 0) {
+		return 0, false
+	}
+	if math.IsNaN(float64(den)) || math.IsInf(float64(den), 0) {
+		return 0, false
+	}
+	if math.Abs(float64(den)) < epsilon {
+		return 0, false
+	}
+	result := num / den
+	if math.IsNaN(float64(result)) || math.IsInf(float64(result), 0) {
+		return 0, false
+	}
+	return result, true
+}
+
+func computeScore(ret, dd, expectancy float32, trades int, testedCount int64) ScoreResult {
+	// PROBLEM 9 FIX: Hard guards at ENTRY - reject immediately if any input is invalid
+	// This prevents CORRUPTED scores from being generated in the first place
+
+	// Check for NaN in all inputs
+	if math.IsNaN(float64(ret)) || math.IsNaN(float64(dd)) || math.IsNaN(float64(expectancy)) {
+		reason := fmt.Sprintf("invalid_math:NaN|ret=%v|dd=%v|exp=%v", ret, dd, expectancy)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+
+	// Check for Inf in all inputs
+	if math.IsInf(float64(ret), 0) || math.IsInf(float64(dd), 0) || math.IsInf(float64(expectancy), 0) {
+		reason := fmt.Sprintf("invalid_math:Inf|ret=%v|dd=%v|exp=%v", ret, dd, expectancy)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+
+	// Check for impossible values
+	if dd < 0 || dd > 1.5 { // dd can be slightly >1 due to calculation timing
+		reason := fmt.Sprintf("invalid_math:dd_out_of_range|dd=%v", dd)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+	if trades < 0 {
+		reason := fmt.Sprintf("invalid_math:trades_negative|trades=%d", trades)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+
+	// Check for absurd returns (indicates calculation error)
+	if math.Abs(float64(ret)) > 10.0 { // > 1000% return is suspicious
+		reason := fmt.Sprintf("invalid_math:ret_absurd|ret=%.1f%%", ret*100)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+
+	// Check for negative return that would cause log domain error
+	if ret < -1.0 {
+		reason := fmt.Sprintf("invalid_math:ret_below_minus_1|ret=%.1f%%", ret*100)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+
+	// CRITICAL FIX #1: Track invalid components with detailed reasons
+	invalidComponents := []string{}
+	componentLogReturn := float32(0)
+	componentCalmar := float32(0)
+	componentExpReward := float32(0)
+	componentTradesReward := float32(0)
+	componentDdPenalty := float32(0)
+	componentTradePenalty := float32(0)
+	componentRetPenalty := float32(0)
+	componentHoldPenalty := float32(0)
 
 	// Check trades count
 	if trades < 0 {
-		invalidScore = true
-		invalidReason += fmt.Sprintf("trades=%d<0 ", trades)
+		invalidComponents = append(invalidComponents, fmt.Sprintf("trades=%d<0", trades))
 	}
 
-	// Check for NaN/Inf in inputs
-	if math.IsNaN(float64(ret)) || math.IsInf(float64(ret), 0) {
-		invalidScore = true
-		invalidReason += fmt.Sprintf("ret=%v ", ret)
+	// PROBLEM A FIX: Single consistent return cap (not two-tier)
+	// The 105% base cap was too restrictive and blocking evolution
+	// Now using one cap at 300% - rely on validation/OOS to eliminate overfit
+	const trainRetCap float32 = 3.0  // 300% max return - let validation filter overfit
+
+	if ret > trainRetCap {
+		invalidComponents = append(invalidComponents, fmt.Sprintf("ret=%.1f%%_exceeds_%.0f%%", ret*100, trainRetCap*100))
 	}
-	if math.IsNaN(float64(dd)) || math.IsInf(float64(dd), 0) {
-		invalidScore = true
-		invalidReason += fmt.Sprintf("dd=%v ", dd)
-	}
-	if math.IsNaN(float64(expectancy)) || math.IsInf(float64(expectancy), 0) {
-		invalidScore = true
-		invalidReason += fmt.Sprintf("exp=%v ", expectancy)
+	// Also reject absurd negative returns (< -80%) - relaxed from -50%
+	if ret < -0.80 {
+		invalidComponents = append(invalidComponents, fmt.Sprintf("ret=%.1f%%_below_-80%%", ret*100))
 	}
 
 	// Check for absurd values (indicates calculation error)
 	if math.Abs(float64(ret)) > 1e9 {
-		invalidScore = true
-		invalidReason += fmt.Sprintf("ret=abs(>1e9) ")
+		invalidComponents = append(invalidComponents, "ret=abs(>1e9)")
 	}
 	if dd < 0 || dd > 1 {
-		invalidScore = true
-		invalidReason += fmt.Sprintf("dd=%v(out_of_0_1) ", dd)
+		invalidComponents = append(invalidComponents, fmt.Sprintf("dd=%v(out_of_0_1)", dd))
 	}
 
 	// Hard-reject broken strategies
-	// PROBLEM B FIX: Raised DD threshold from 0.45 to 0.60 for discovery (safety while allowing more exploration)
-	if trades == 0 || dd >= 0.60 {
-		return -1e30
+	sentinelMaxDD := getSentinelMaxDD()
+	if trades == 0 || dd >= sentinelMaxDD {
+		return ScoreResult{Score: -1e30}
 	}
 
-	// PROBLEM C FIX: Log invalid score with components
-	if invalidScore {
-		fmt.Printf("[TRAIN_SCORE_INVALID] %s| ret=%.4f dd=%.4f exp=%.4f trades=%d tested=%d\n",
-			invalidReason, ret, dd, expectancy, trades, testedCount)
-		return -1e30
+	// If inputs are invalid, dump all components and reject
+	if len(invalidComponents) > 0 {
+		reason := fmt.Sprintf("invalid_input:%s|ret=%.4f|dd=%.4f|exp=%.4f|trds=%d",
+			strings.Join(invalidComponents, ","), ret, dd, expectancy, trades)
+		fmt.Printf("[TRAIN_SCORE_INVALID] reason=%s | ret=%.4f dd=%.4f exp=%.4f trades=%d tested=%d\n",
+			strings.Join(invalidComponents, ","), ret, dd, expectancy, trades, testedCount)
+		return ScoreResult{Score: -1e30, Reason: reason}
 	}
 
-	// Penalty system instead of hard rejection
+	// Penalty system
 	tradePenalty := float32(0)
 	if trades < 20 {
-		tradePenalty = -2.0 // align with validation crit trds>=20
+		tradePenalty = -2.0
+		componentTradePenalty = tradePenalty
 	}
 
 	retPenalty := float32(0)
 	if ret < 0.0 {
-		retPenalty = -1.0 // losing strategies score lower but still exist
+		retPenalty = -1.0
+		componentRetPenalty = retPenalty
 	}
 
-	// Hold duration constraint: reject strategies with tiny hold times
 	holdPenalty := float32(0)
-	if trades > 0 {
-		// Only applies if we have avg hold data (from golden mode, otherwise 0)
-		// Main evaluator doesn't track individual trades, so we skip this constraint there
+	componentHoldPenalty = holdPenalty
+
+	// CRITICAL FIX #2: Component-level guards with specific failure reasons
+
+	// logReturn: log(1+ret) - guard against ret <= -1.0 (100% loss)
+	logReturn, validLogReturn := safeLog32(1.0 + float64(ret))
+	if !validLogReturn {
+		invalidComponents = append(invalidComponents, fmt.Sprintf("logReturn:ret=%.4f(log_domain_error)", ret))
+	} else {
+		componentLogReturn = logReturn * 8.0
 	}
 
-	// Calmar-ish: return per drawdown
-	calmar := ret / (dd + 1e-4)
-	if calmar > 10 {
-		calmar = 10
-	}
-
-	// Expectancy should matter more than trade count
-	expReward := expectancy * 200.0
-	if expReward > 5 {
-		expReward = 5
-	}
-	if expReward < -5 {
-		expReward = -5
-	}
-
-	// Very small trades reward (reliability only)
-	tradesReward := float32(math.Log(float64(trades))) * 0.01
-
-	// Strong DD penalty
-	ddPenalty := 6.0 * dd
-
-	// Return is important (log to reduce outliers)
-	logReturn := float32(math.Log(float64(1+ret))) * 6.0
-
-	baseScore := logReturn + 2.0*calmar + expReward + tradesReward - ddPenalty + tradePenalty + retPenalty + holdPenalty
-
-	// DEBUG: Log score components (once per 1000 evaluations to avoid spam)
-	doLog := false
-	if testedCount > 0 && testedCount%1000 == 1 {
-		doLog = true
-	}
-	if doLog {
-		deflationPenalty := float32(0.0)
-		if testedCount > 0 {
-			deflationPenalty = float32(0.5 * math.Log(1.0 + float64(testedCount)/10000.0))
+	// calmar: ret / (dd + epsilon) - guard against division by near-zero
+	calmar, validCalmar := safeDiv32(ret, dd+1e-4)
+	if !validCalmar {
+		invalidComponents = append(invalidComponents, fmt.Sprintf("calmar:ret=%.4f/dd=%.4f(div_by_zero)", ret, dd))
+	} else {
+		// CRITICAL FIX #3: Cap calmar to prevent absurd values
+		// When ret is very negative and dd is tiny, calmar can explode to hundreds
+		// This causes the final score to exceed 1e9 and be marked as CORRUPTED
+		if calmar > 10 {
+			calmar = 10
 		}
-		fmt.Printf("[SCORE_COMPONENTS] logRet=%.3f calmar=%.3f exp=%.3f trdRew=%.3f ddPen=%.3f trdPen=%.3f retPen=%.3f holPen=%.3f def=%.3f => base=%.3f\n",
-			logReturn, calmar*2, expReward, tradesReward, ddPenalty, tradePenalty, retPenalty, holdPenalty, deflationPenalty, baseScore)
+		if calmar < -10 {
+			calmar = -10
+		}
+		componentCalmar = 2.0 * calmar
 	}
 
-	// DSR-lite: apply deflation penalty as tested count grows
-	// This forces strategies to have higher significance as we test more
-	// Formula: deflated = baseScore - k * log(1 + testedCount / 10000)
-	// k = 0.5 means after 10000 strategies, bar increases by ~0.5 points
-	// CRITICAL FIX: Don't modify sentinel values
+	// expReward: expectancy * 200 - capped to [-5, 5]
+	if !math.IsNaN(float64(expectancy)) && !math.IsInf(float64(expectancy), 0) {
+		expReward := expectancy * 200.0
+		if expReward > 5 {
+			expReward = 5
+		}
+		if expReward < -5 {
+			expReward = -5
+		}
+		componentExpReward = expReward
+	} else {
+		invalidComponents = append(invalidComponents, fmt.Sprintf("expReward:exp=%v", expectancy))
+	}
+
+	// tradesReward: log(trades) * 0.01 - guard against trades <= 0
+	if trades > 0 {
+		tradesLog, validTradesLog := safeLog32(float64(trades))
+		if validTradesLog {
+			componentTradesReward = tradesLog * 0.01
+		} else {
+			invalidComponents = append(invalidComponents, fmt.Sprintf("tradesReward:trades=%d(log_error)", trades))
+		}
+	}
+
+	// ddPenalty: always valid (dd is already validated above)
+	componentDdPenalty = 4.0 * dd
+
+	// PROBLEM C FIX: Additional penalty for excessive DD (>25%)
+	// Strategies with DD > 25% have fat-tail risk and ugly months
+	if dd > 0.25 {
+		excessDD := dd - 0.25
+		componentDdPenalty += 8.0 * excessDD // 8x penalty on excess DD above 25%
+	}
+
+	// If any component failed, dump full diagnostics and reject
+	if len(invalidComponents) > 0 {
+		reason := fmt.Sprintf("component:%s|logRet=%.2f|calmar=%.2f|exp=%.2f|trds=%.2f|ddPen=%.2f|ret=%.4f|dd=%.4f|trds=%d",
+			strings.Join(invalidComponents, ","), componentLogReturn, componentCalmar, componentExpReward, componentTradesReward, componentDdPenalty, ret, dd, trades)
+		fmt.Printf("[TRAIN_SCORE_INVALID] reason=invalid_component:%s | logReturn=%.4f calmar=%.4f expReward=%.4f tradesReward=%.4f ddPenalty=%.4f tradePenalty=%.4f retPenalty=%.4f holdPenalty=%.4f | ret=%.4f dd=%.4f exp=%.4f trades=%d\n",
+			strings.Join(invalidComponents, ","), componentLogReturn, componentCalmar, componentExpReward, componentTradesReward, componentDdPenalty, componentTradePenalty, componentRetPenalty, componentHoldPenalty, ret, dd, expectancy, trades)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+
+	baseScore := componentLogReturn + componentCalmar + componentExpReward + componentTradesReward - componentDdPenalty + componentTradePenalty + componentRetPenalty + componentHoldPenalty
+
+	// DSR-lite deflation penalty
 	if testedCount > 0 && baseScore > -1e29 {
-		deflationPenalty := float32(0.5 * math.Log(1.0 + float64(testedCount)/10000.0))
+		deflationPenalty := float32(0.3 * math.Log(1.0 + float64(testedCount)/10000.0))
 		baseScore -= deflationPenalty
 	}
 
-	// PROBLEM C FIX: Final sanity check on computed score
+	// CRITICAL FIX #3: Final sanity check with full component dump
 	if math.IsNaN(float64(baseScore)) || math.IsInf(float64(baseScore), 0) || math.Abs(float64(baseScore)) > 1e9 {
-		fmt.Printf("[TRAIN_SCORE_INVALID] computed_score=%s ret=%.4f dd=%.4f exp=%.4f trades=%d\n",
-			fmt.Sprintf("%v", baseScore), ret, dd, expectancy, trades)
-		return -1e30
+		reason := fmt.Sprintf("computed_invalid|val=%v|logRet=%.2f|calmar=%.2f|exp=%.2f|trds=%.2f|ddPen=%.2f|ret=%.4f|dd=%.4f|trds=%d",
+			baseScore, componentLogReturn, componentCalmar, componentExpReward, componentTradesReward, componentDdPenalty, ret, dd, trades)
+		fmt.Printf("[TRAIN_SCORE_INVALID] reason=computed_score_invalid | computed=%v | logReturn=%.4f calmar=%.4f expReward=%.4f tradesReward=%.4f ddPenalty=%.4f tradePenalty=%.4f retPenalty=%.4f holdPenalty=%.4f | ret=%.4f dd=%.4f exp=%.4f trades=%d\n",
+			baseScore, componentLogReturn, componentCalmar, componentExpReward, componentTradesReward, componentDdPenalty, componentTradePenalty, componentRetPenalty, componentHoldPenalty, ret, dd, expectancy, trades)
+		return ScoreResult{Score: -1e30, Reason: reason}
 	}
 
-	return baseScore
+	return ScoreResult{Score: SanitizeScore(baseScore)}
 }
 
 // IsValidScore checks if a score value is numerically valid
 // Exported (capital I) so it can be called from other packages
 // Returns false for NaN, Inf, or absurdly large magnitudes
+// PROBLEM D FIX: Also checks for sentinel values (-1e30) and extreme negatives
 func IsValidScore(score float32) bool {
 	if math.IsNaN(float64(score)) || math.IsInf(float64(score), 0) {
 		return false
 	}
 	// Check for absurd magnitudes (e.g., sentinel arithmetic leak)
-	if math.Abs(float64(score)) > 1e9 {
+	// PROBLEM D FIX: Lowered from 1e9 to 1e8 to catch more corruption
+	if math.Abs(float64(score)) > 1e8 {
+		return false
+	}
+	// PROBLEM D FIX: Explicitly reject sentinel-range values
+	// Sentinel is -1e30, so anything < -1e20 is likely corrupted
+	if score < -1e20 {
 		return false
 	}
 	return true
 }
 
+// SanitizeScore sanitizes a score value to prevent corruption from leaking into selection/display
+// CRITICAL: Use this after EVERY score computation (train, val, QT, any ranking)
+//
+// Rules:
+//   - If NaN or Inf → return -1e30 (sentinel rejection)
+//   - If abs(score) > 1e9 → return -1e30 (corruption sentinel)
+//   - Otherwise → return score (possibly clamped to reasonable range)
+//
+// This prevents corrupted values from breaking display/ranking/selection logic
+func SanitizeScore(score float32) float32 {
+	// Check NaN first (NaN comparisons always return false)
+	if score != score { // NaN check: NaN != NaN is true
+		return -1e30
+	}
+	// Check Inf (both positive and negative)
+	if math.IsInf(float64(score), 0) {
+		return -1e30
+	}
+	// Check for absurd magnitudes (indicates corruption/overflow)
+	// CRITICAL: abs(score) > 1e9 means something went wrong
+	absScore := math.Abs(float64(score))
+	if absScore > 1e9 {
+		return -1e30
+	}
+	// Sentinel check (very large negative values, including -1e30)
+	if score < -1e20 {
+		return -1e30
+	}
+	// Clamp to reasonable range for display safety
+	if score < -1e6 {
+		return -1e6
+	}
+	if score > 1e6 {
+		return 1e6
+	}
+	return score
+}
+
+// ScoreReason tracks why a score was rejected/sanitized
+type ScoreReason struct {
+	IsInvalid  bool
+	ReasonCode string // "nan", "inf", "overflow", "sentinel", "valid"
+	RawScore   float32
+	Sanitized  float32
+}
+
+// Debug counter for score corruption sampling (log 1 in N)
+var scoreCorruptionCount int64 = 0
+var scoreCorruptionSampleInterval int64 = 100
+
+// SanitizeScoreWithReason sanitizes a score and returns detailed diagnostic info
+// Use this when you need to know WHY a score was rejected
+// Also logs debug trace when corruption is detected (sampled 1 in N)
+func SanitizeScoreWithReason(score float32) ScoreReason {
+	reason := ScoreReason{
+		RawScore:   score,
+		Sanitized:  score,
+		ReasonCode: "valid",
+		IsInvalid:  false,
+	}
+
+	// Check NaN first
+	if score != score {
+		reason.IsInvalid = true
+		reason.ReasonCode = "nan"
+		reason.Sanitized = -1e30
+		logScoreCorruption(reason, 0, 0, 0) // Debug trace
+		return reason
+	}
+
+	// Check Inf
+	if math.IsInf(float64(score), 0) {
+		reason.IsInvalid = true
+		reason.ReasonCode = "inf"
+		reason.Sanitized = -1e30
+		logScoreCorruption(reason, 0, 0, 0) // Debug trace
+		return reason
+	}
+
+	// Check for absurd magnitudes
+	absScore := math.Abs(float64(score))
+	if absScore > 1e9 {
+		reason.IsInvalid = true
+		reason.ReasonCode = "overflow"
+		reason.Sanitized = -1e30
+		logScoreCorruption(reason, 0, 0, 0) // Debug trace
+		return reason
+	}
+
+	// Sentinel check
+	if score < -1e20 {
+		reason.IsInvalid = true
+		reason.ReasonCode = "sentinel"
+		reason.Sanitized = -1e30
+		// Don't log sentinel values (they're intentional rejections)
+		return reason
+	}
+
+	// Clamp display range
+	if score < -1e6 {
+		reason.Sanitized = -1e6
+	} else if score > 1e6 {
+		reason.Sanitized = 1e6
+	}
+
+	return reason
+}
+
+// logScoreCorruption logs debug trace when score corruption is detected
+// Logs: raw score, reason code, and optional component scores
+// Sampled 1 in scoreCorruptionSampleInterval to avoid spam
+func logScoreCorruption(reason ScoreReason, ret, dd, exp float32) {
+	count := atomic.AddInt64(&scoreCorruptionCount, 1)
+	if count%scoreCorruptionSampleInterval == 1 {
+		fmt.Printf("[SCORE_CORRUPTION] reason=%s raw_score=%.6e sanitized=%.6e ret=%.4f dd=%.4f exp=%.4f\n",
+			reason.ReasonCode, reason.RawScore, reason.Sanitized, ret, dd, exp)
+	}
+}
+
+// IsSentinelScore checks if a score is the sentinel rejection value
+// Use this for clean conditional checks instead of magic number comparisons
+func IsSentinelScore(score float32) bool {
+	// Check NaN first
+	if score != score {
+		return true
+	}
+	// Check Inf
+	if math.IsInf(float64(score), 0) {
+		return true
+	}
+	return score < -1e20
+}
+
+// CleanScoreForDisplay returns a clean string representation of a score
+// CRITICAL: This must catch ALL corruption to prevent leaking into display
+// Handles sentinel values, NaN, Inf, overflow, and formats regular scores nicely
+func CleanScoreForDisplay(score float32) string {
+	// Check NaN first (NaN != NaN is true)
+	if score != score {
+		return "NaN"
+	}
+	// Check Inf
+	if math.IsInf(float64(score), 0) {
+		if score > 0 {
+			return "+Inf"
+		}
+		return "-Inf"
+	}
+	// CRITICAL FIX: Check for extreme magnitudes that indicate corruption
+	// abs(score) > 1e9 means something went very wrong
+	absScore := math.Abs(float64(score))
+	if absScore > 1e9 {
+		return "CORRUPTED"
+	}
+	// Sentinel check (catch values near -1e30)
+	if score < -1e20 {
+		return "SENTINEL"
+	}
+	// Clamp display to avoid crazy numbers
+	if score < -1e6 {
+		return fmt.Sprintf("<-1e6")
+	}
+	if score > 1e6 {
+		return fmt.Sprintf(">1e6")
+	}
+	return fmt.Sprintf("%.4f", score)
+}
+
 // computeScoreWithSmoothness applies a smoothness penalty to strategies with volatile equity curves
 // and includes Sortino ratio for downside risk focus
 // PROBLEM B FIX: Reduced stability weight by 4x (from 0.5 to 0.125) during discovery
-func computeScoreWithSmoothness(ret, dd, expectancy, smoothVol, downsideVol float32, trades int, testedCount int64) float32 {
-	baseScore := computeScore(ret, dd, expectancy, trades, testedCount)
+func computeScoreWithSmoothness(ret, dd, expectancy, smoothVol, downsideVol float32, trades int, testedCount int64) ScoreResult {
+	baseResult := computeScore(ret, dd, expectancy, trades, testedCount)
+	baseScore := baseResult.Score
+
+	// If computeScore already detected corruption, return immediately with the reason
+	if baseResult.Reason != "" {
+		return baseResult
+	}
 
 	// CRITICAL FIX: Don't operate on sentinel values
-	// If computeScore returned -1e30 (hard rejection), return it directly
-	// Use a slightly more lenient check to catch values close to sentinel
 	if baseScore <= -1e29 {
-		return baseScore
+		return ScoreResult{Score: baseScore}
 	}
 
-	// CRITICAL: Check if baseScore is already close to sentinel (possible corruption)
+	// CRITICAL: Check if baseScore is already corrupted
 	if math.Abs(float64(baseScore)) > 1e20 {
-		fmt.Printf("[SCORE_WARNING] baseScore too large: %.6e ret=%.4f dd=%.4f trades=%d - clamping to sentinel\n",
-			baseScore, ret, dd, trades)
-		return -1e30
+		reason := fmt.Sprintf("baseScore_too_large|val=%.6e|ret=%.4f|dd=%.4f|exp=%.4f|trds=%d",
+			baseScore, ret, dd, expectancy, trades)
+		fmt.Printf("[SCORE_SMOOTHNESS_INVALID] reason=baseScore_too_large | baseScore=%.6e | ret=%.4f dd=%.4f exp=%.4f trades=%d\n",
+			baseScore, ret, dd, expectancy, trades)
+		return ScoreResult{Score: -1e30, Reason: reason}
 	}
 
-	// ---- Guardrails to prevent score explosion ----
-	// Floor downsideVol so Sortino can't go infinite / absurd.
-	// (Tune 0.002-0.01 depending on your bar timeframe.)
-	const downsideFloor = float32(0.005)
-	if downsideVol < downsideFloor {
-		downsideVol = downsideFloor
+	// CRITICAL FIX #1: Component-level guards for Sortino and smoothness
+	invalidComponents := []string{}
+	componentSortino := float32(0)
+	componentSmoothPenalty := float32(0)
+	componentSortinoContrib := float32(0) // 0.125 * sortino
+
+	// Validate volatility inputs
+	if math.IsNaN(float64(smoothVol)) || math.IsInf(float64(smoothVol), 0) {
+		invalidComponents = append(invalidComponents, fmt.Sprintf("smoothVol=%v", smoothVol))
+	}
+	if math.IsNaN(float64(downsideVol)) || math.IsInf(float64(downsideVol), 0) {
+		invalidComponents = append(invalidComponents, fmt.Sprintf("downsideVol=%v", downsideVol))
 	}
 
-	sortino := ret / (downsideVol + 1e-4)
+	// Sortino: ret / (downsideVol + epsilon) - guard against division issues
+	if len(invalidComponents) == 0 {
+		// Floor downsideVol to prevent division by absurdly small values
+		const downsideFloor = float32(0.005)
+		if downsideVol < downsideFloor {
+			downsideVol = downsideFloor
+		}
 
-	// Cap Sortino contribution so it can't dominate everything
-	if sortino > 20 {
-		sortino = 20
-	}
-	if sortino < -10 {
-		sortino = -10
+		sortino, validSortino := safeDiv32(ret, downsideVol+1e-4)
+		if !validSortino {
+			invalidComponents = append(invalidComponents, fmt.Sprintf("sortino:ret=%.4f/downsideVol=%.4f(div_error)", ret, downsideVol))
+		} else {
+			// Cap Sortino to prevent domination
+			if sortino > 20 {
+				sortino = 20
+			}
+			if sortino < -10 {
+				sortino = -10
+			}
+			componentSortino = sortino
+			componentSortinoContrib = 0.125 * sortino
+		}
 	}
 
-	// PROBLEM B FIX: Reduced smoothness penalty by 4x (from 0.5 to 0.125) for discovery
-	// This prevents "monthly consistency" from killing profitable strategies
-	smoothPenalty := float32(0)
-	if trades >= 50 {
-		denom := float32(math.Abs(float64(ret))) + 1e-6
-		normalized := smoothVol / denom
-		smoothPenalty = normalized * 0.125 // Reduced from 0.5 to 0.125 (4x reduction)
+	// Smoothness penalty: smoothVol / (|ret| + epsilon) - guard against division issues
+	if len(invalidComponents) == 0 && trades >= 50 {
+		retAbs := float32(math.Abs(float64(ret)))
+		if math.IsInf(float64(retAbs), 0) {
+			invalidComponents = append(invalidComponents, fmt.Sprintf("smoothPenalty:ret=%.4f(abs_overflow)", ret))
+		} else {
+			denom := retAbs + 1e-6
+			normalized, validNorm := safeDiv32(smoothVol, denom)
+			if validNorm {
+				componentSmoothPenalty = normalized * 0.125
+			} else {
+				invalidComponents = append(invalidComponents, fmt.Sprintf("smoothPenalty:smoothVol=%.4f/|ret|=%.4f(div_error)", smoothVol, retAbs))
+			}
+		}
 	}
 
-	// PROBLEM B FIX: Reduced Sortino weight by 4x (from 0.5 to 0.125) for discovery
-	return baseScore + 0.125*sortino - smoothPenalty // Reduced from 0.5 to 0.125
+	// If any component failed, dump full diagnostics and reject
+	if len(invalidComponents) > 0 {
+		reason := fmt.Sprintf("smoothness:%s|sortino=%.2f|smoothPen=%.2f|ret=%.4f|dd=%.4f|exp=%.4f|trds=%d",
+			strings.Join(invalidComponents, ","), componentSortino, componentSmoothPenalty, ret, dd, expectancy, trades)
+		fmt.Printf("[SCORE_SMOOTHNESS_INVALID] reason=invalid_component:%s | sortino=%.4f smoothPenalty=%.4f sortinoContrib=%.4f | ret=%.4f dd=%.4f exp=%.4f trades=%d\n",
+			strings.Join(invalidComponents, ","), componentSortino, componentSmoothPenalty, componentSortinoContrib, ret, dd, expectancy, trades)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+
+	// CRITICAL FIX #2: Final score validation with component dump
+	finalScore := baseScore + componentSortinoContrib - componentSmoothPenalty
+
+	if math.IsNaN(float64(finalScore)) || math.IsInf(float64(finalScore), 0) || math.Abs(float64(finalScore)) > 1e9 {
+		reason := fmt.Sprintf("smooth_final_invalid|val=%v|base=%.2f|sortino=%.2f|smoothPen=%.2f|ret=%.4f|dd=%.4f|exp=%.4f|trds=%d",
+			finalScore, baseScore, componentSortino, componentSmoothPenalty, ret, dd, expectancy, trades)
+		fmt.Printf("[SCORE_SMOOTHNESS_INVALID] reason=computed_score_invalid | computed=%v | baseScore=%.4f sortino=%.4f smoothPenalty=%.4f sortinoContrib=%.4f | ret=%.4f dd=%.4f exp=%.4f trades=%d\n",
+			finalScore, baseScore, componentSortino, componentSmoothPenalty, componentSortinoContrib, ret, dd, expectancy, trades)
+		return ScoreResult{Score: -1e30, Reason: reason}
+	}
+
+	return ScoreResult{Score: SanitizeScore(finalScore)}
 }
 
 // evaluateStrategyWithTrades runs a backtest and returns detailed trade information
@@ -939,6 +1291,10 @@ func leafKindToString(kind LeafKind) string {
 		return "SlopeGT"
 	case LeafSlopeLT:
 		return "SlopeLT"
+	case LeafBreakUp:
+		return "BreakUp"
+	case LeafBreakDown:
+		return "BreakDown"
 	default:
 		return "?"
 	}
@@ -1008,15 +1364,24 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 	mtmEquityCurve := make([]float64, 0, endLocal-tradeStartLocal)
 	rawMTMEquityCurve := make([]float64, 0, endLocal-tradeStartLocal)
 
-	trades := []Trade{}
-	exitReasons := make(map[string]int)
-	states := []StateRecord{} // Per-bar state tracking
-	signalProofs := make(map[int][]LeafProof) // Track proofs for signal bars
+	// OPTIMIZATION: Pre-allocate slices with estimated capacity to reduce reallocations
+	// Typical backtest has ~50-500 trades, states match bar count
+	estimatedTrades := (endLocal - tradeStartLocal) / 100 // Rough estimate: 1 trade per 100 bars
+	if estimatedTrades < 50 {
+		estimatedTrades = 50
+	}
+	trades := make([]Trade, 0, estimatedTrades)
+	exitReasons := make(map[string]int, 8) // Pre-size for common exit reasons
+	states := make([]StateRecord, 0, endLocal-tradeStartLocal)
 
-	// Proof throttling DISABLED for full proof logging (set to high number)
-	// Original value was 3, which limited proofs to first 3 signals per leaf kind
-	const maxProofsPerLeafKind = 999999  // Essentially unlimited - log all proofs
-	proofCounts := make(map[string]int) // Track how many times we've built proofs for each leaf kind
+	// OPTIMIZATION: Only allocate proof tracking if debugSignals is enabled
+	var signalProofs map[int][]LeafProof
+	var proofCounts map[string]int
+	const maxProofsPerLeafKind = 999999 // Essentially unlimited - log all proofs
+	if debugSignals {
+		signalProofs = make(map[int][]LeafProof)
+		proofCounts = make(map[string]int)
+	}
 
 	// Smoothness metric: EMA volatility of equity changes (only if computeSmoothness is true)
 	var prevMarkEquity float32
@@ -1064,6 +1429,8 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 	atr14Idx, ok14 := f.Index["ATR14"]
 	activeIdx, okActive := f.Index["Active"]
 	volZIdx, okVolZ := f.Index["VolZ20"]
+	// OPTIMIZATION: Cache ATR14_SMA50 index outside the loop (was being looked up on every bar)
+	atrSMA50Idx, okSMA50 := f.Index["ATR14_SMA50"]
 
 	// Debug: track first N signals for detailed print (set to 0 to disable)
 	const debugMaxSignals = 0 // Print first 0 signals (disabled)
@@ -1084,30 +1451,29 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 
 	// checkVolatilityFilter returns true if volatility is high enough to trade
 	// ATR14 must be > Threshold × ATR14_SMA50
+	// OPTIMIZATION: Uses cached atrSMA50Idx instead of map lookup per call
 	checkVolatilityFilter := func(t int) bool {
 		if !st.VolatilityFilter.IsActive() {
 			return true // Filter disabled, always trade
 		}
 
-		// Get ATR14
-		atrIdx := atr14Idx
-		if !ok14 || atrIdx < 0 || atrIdx >= len(f.F) {
+		// Get ATR14 (using cached index)
+		if !ok14 || atr14Idx < 0 || atr14Idx >= len(f.F) {
 			return true // Feature not available, allow trade
 		}
-		if t < 0 || t >= len(f.F[atrIdx]) {
+		if t < 0 || t >= len(f.F[atr14Idx]) {
 			return true // Out of bounds, allow trade
 		}
-		atr14 := f.F[atrIdx][t]
+		atr14 := f.F[atr14Idx][t]
 
-		// Get ATR14_SMA50
-		smaIdx, okSMA := f.Index["ATR14_SMA50"]
-		if !okSMA || smaIdx < 0 || smaIdx >= len(f.F) {
+		// Get ATR14_SMA50 (using cached index - no more map lookup per call)
+		if !okSMA50 || atrSMA50Idx < 0 || atrSMA50Idx >= len(f.F) {
 			return true // Feature not available, allow trade
 		}
-		if t < 0 || t >= len(f.F[smaIdx]) {
+		if t < 0 || t >= len(f.F[atrSMA50Idx]) {
 			return true // Out of bounds, allow trade
 		}
-		atrSMA := f.F[smaIdx][t]
+		atrSMA := f.F[atrSMA50Idx][t]
 
 		// Check if ATR14 is above threshold × SMA
 		threshold := st.VolatilityFilter.Threshold
@@ -1244,6 +1610,10 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		return result
 	}
 
+	// OPTIMIZATION: Pre-allocate statuses slice outside loop to reduce allocations
+	// Capacity of 10 handles typical bar status (most bars have 2-5 statuses)
+	statuses := make([]string, 0, 10)
+
 	// Always loop from 1 so t-1 exists for indicator access
 	for t := 1; t < endLocal; t++ {
 		closePrice := s.Close[t]
@@ -1252,8 +1622,8 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 		openPrice := s.Open[t]
 		barTime := time.Unix(int64(s.OpenTimeMs[t])/1000, 0)
 
-		// State tracking for debugging - build status string
-		statuses := []string{}
+		// Reset statuses for this bar (keep capacity, reset length)
+		statuses = statuses[:0]
 
 		// Declare all variables at the top to avoid goto issues
 		var isActive bool
@@ -1793,16 +2163,15 @@ func coreBacktest(s Series, f Features, st Strategy, tradeStartLocal, endLocal i
 				// Build sub-conditions string for logging
 				subConds := buildSubConditionString(st, f, t)
 
-				// Collect proofs for ALL trades (mathematical proof of no lookahead bias)
-				// THROTTLED: Only build proofs for first N occurrences per leaf kind
+				// Collect proofs for trades (only when debugging to reduce overhead)
+				// OPTIMIZATION: Skip proof building in production runs
 				var proofs []LeafProof
-				if st.EntryRule.Root != nil {
+				if debugSignals && st.EntryRule.Root != nil && proofCounts != nil {
 					proofs = buildSubConditionProofsThrottled(st.EntryRule.Root, f, t, proofCounts, maxProofsPerLeafKind)
-				}
-
-				// Store proofs for this signal bar (for state export)
-				if len(proofs) > 0 {
-					signalProofs[t] = proofs
+					// Store proofs for this signal bar (for state export)
+					if len(proofs) > 0 && signalProofs != nil {
+						signalProofs[t] = proofs
+					}
 				}
 
 				// Schedule entry for next bar

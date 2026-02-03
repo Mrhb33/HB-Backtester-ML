@@ -1,6 +1,19 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
+
+// Pool for reusing boolean stacks in bytecode evaluation
+// This reduces GC pressure significantly since evaluateCompiled is called 3x per bar
+var boolStackPool = sync.Pool{
+	New: func() interface{} {
+		// Pre-allocate with capacity 32 (handles most rule trees)
+		s := make([]bool, 0, 32)
+		return &s
+	},
+}
 
 type OpKind uint8
 
@@ -157,7 +170,9 @@ func evaluateCompiled(code []ByteCode, features [][]float32, t int) bool {
 		// Fall through to full VM if fast path can't handle this leaf
 	}
 
-	stack := make([]bool, 0, 32)
+	// OPTIMIZATION: Use pooled stack to reduce allocations (called 3x per bar)
+	stackPtr := boolStackPool.Get().(*[]bool)
+	stack := (*stackPtr)[:0] // Reset length, keep capacity
 	sp := 0
 
 	for i := 0; i < len(code); i++ {
@@ -396,10 +411,14 @@ func evaluateCompiled(code []ByteCode, features [][]float32, t int) bool {
 		}
 	}
 
+	// Return stack to pool before returning result
+	var result bool
 	if sp > 0 {
-		return stack[sp-1]
+		result = stack[sp-1]
 	}
-	return false
+	*stackPtr = stack // Preserve any capacity growth
+	boolStackPool.Put(stackPtr)
+	return result
 }
 
 // evaluateLeavesDebug returns a map of leaf index -> boolean result for debugging

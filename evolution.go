@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"math/rand"
 	"sort"
 	"sync"
@@ -45,9 +44,9 @@ func (h *HallOfFame) Add(e Elite) {
 func (h *HallOfFame) addLocked(e Elite) {
 	// CRITICAL FIX: Reject elites with invalid scores (sentinel corruption)
 	// Sentinel -1e30 means uninitialized/overflow score - these should not be in HallOfFame
-	if e.ValScore < -1e20 || math.IsNaN(float64(e.ValScore)) || math.IsInf(float64(e.ValScore), 0) {
+	if IsSentinelScore(e.ValScore) {
 		if Verbose {
-			fmt.Printf("[HOF-REJECT] Invalid score=%.4f - rejecting corrupted elite\n", e.ValScore)
+			fmt.Printf("[HOF-REJECT] Invalid score=%s - rejecting corrupted elite\n", CleanScoreForDisplay(e.ValScore))
 		}
 		return
 	}
@@ -282,26 +281,32 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 			if leaf.A < len(feats.Types) {
 				typeA = feats.Types[leaf.A]
 			}
-			// Find a compatible B
-			maxAttempts := 50
-			found := false
-			for attempt := 0; attempt < maxAttempts; attempt++ {
-				leaf.B = rng.Intn(len(feats.F))
-				if leaf.B == leaf.A {
-					continue
-				}
-				if leaf.B < len(feats.Types) {
-					typeB := feats.Types[leaf.B]
-					if canCrossFeatures(typeA, typeB) {
-						found = true
-						break // Found compatible B
+			// FIX: If A is EventFlag, can't cross - switch to GT/LT immediately
+			if typeA == FeatTypeEventFlag {
+				gtLtKinds := []LeafKind{LeafGT, LeafLT}
+				leaf.Kind = gtLtKinds[rng.Intn(len(gtLtKinds))]
+			} else {
+				// Find a compatible B
+				maxAttempts := 50
+				found := false
+				for attempt := 0; attempt < maxAttempts; attempt++ {
+					leaf.B = rng.Intn(len(feats.F))
+					if leaf.B == leaf.A {
+						continue
+					}
+					if leaf.B < len(feats.Types) {
+						typeB := feats.Types[leaf.B]
+						if canCrossFeatures(typeA, typeB) {
+							found = true
+							break // Found compatible B
+						}
 					}
 				}
-			}
-			// FIX: If no compatible B found, fall back to Rising
-			if !found {
-				leaf.Kind = LeafRising
-				leaf.Lookback = 2 + rng.Intn(9) // Reduced from 5+16 to 2-10 for more trades
+				// FIX: If no compatible B found, fall back to GT/LT (not Rising)
+				if !found {
+					gtLtKinds := []LeafKind{LeafGT, LeafLT}
+					leaf.Kind = gtLtKinds[rng.Intn(len(gtLtKinds))]
+				}
 			}
 		}
 	case 2: // change kind
@@ -316,26 +321,32 @@ func mutateLeaf(rng *rand.Rand, leaf *Leaf, feats Features) {
 			if leaf.A < len(feats.Types) {
 				typeA = feats.Types[leaf.A]
 			}
-			// Find a compatible B
-			maxAttempts := 50
-			found := false
-			for attempt := 0; attempt < maxAttempts; attempt++ {
-				leaf.B = rng.Intn(len(feats.F))
-				if leaf.B == leaf.A {
-					continue
-				}
-				if leaf.B < len(feats.Types) {
-					typeB := feats.Types[leaf.B]
-					if canCrossFeatures(typeA, typeB) {
-						found = true
-						break // Found compatible B
+			// FIX: If A is EventFlag, can't cross - switch to GT/LT immediately
+			if typeA == FeatTypeEventFlag {
+				gtLtKinds := []LeafKind{LeafGT, LeafLT}
+				leaf.Kind = gtLtKinds[rng.Intn(len(gtLtKinds))]
+			} else {
+				// Find a compatible B
+				maxAttempts := 50
+				found := false
+				for attempt := 0; attempt < maxAttempts; attempt++ {
+					leaf.B = rng.Intn(len(feats.F))
+					if leaf.B == leaf.A {
+						continue
+					}
+					if leaf.B < len(feats.Types) {
+						typeB := feats.Types[leaf.B]
+						if canCrossFeatures(typeA, typeB) {
+							found = true
+							break // Found compatible B
+						}
 					}
 				}
-			}
-			// FIX: If no compatible B found, fall back to Rising
-			if !found {
-				leaf.Kind = LeafRising
-				leaf.Lookback = 2 + rng.Intn(9) // Reduced from 5+16 to 2-10 for more trades
+				// FIX: If no compatible B found, fall back to GT/LT (not Rising)
+				if !found {
+					gtLtKinds := []LeafKind{LeafGT, LeafLT}
+					leaf.Kind = gtLtKinds[rng.Intn(len(gtLtKinds))]
+				}
 			}
 		}
 	case 3: // tweak lookback (skip for CrossUp/CrossDown/BreakUp/BreakDown)
@@ -869,6 +880,33 @@ func mutateStrategy(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 	// Ensure regime filter remains non-empty and compilable
 	ensureRegimeFilterValid(rng, &child, feats)
 
+	// PROBLEM 10 FIX: Fold-aware hold/cooldown sampling during mutation
+	// Instead of clamping after inheritance, sample within fold constraints
+	tfMinutes := atomic.LoadInt32(&globalTimeframeMinutes)
+	barsPerDay := int(1440.0 / float64(tfMinutes))
+	typicalFoldBars := barsPerDay * 90 // 90-day fold
+
+	// Sample hold_bars based on fold size: max = testBars/10
+	maxHoldBars := typicalFoldBars / 10
+	if maxHoldBars < 20 {
+		maxHoldBars = 20
+	}
+	if maxHoldBars > 120 {
+		maxHoldBars = 120
+	}
+	// Sample within 25% to 100% of max (more variation than initial generation)
+	child.MaxHoldBars = (maxHoldBars / 4) + rng.Intn(maxHoldBars*3/4+1)
+
+	// Sample cooldown_bars based on fold size: max = testBars/30
+	maxCooldownBars := typicalFoldBars / 30
+	if maxCooldownBars < 10 {
+		maxCooldownBars = 10
+	}
+	if maxCooldownBars > 48 {
+		maxCooldownBars = 48
+	}
+	child.CooldownBars = (maxCooldownBars / 4) + rng.Intn(maxCooldownBars*3/4+1)
+
 	return child
 }
 
@@ -976,6 +1014,32 @@ func crossover(rng *rand.Rand, a, b Strategy, feats Features) Strategy {
 
 	// Ensure regime filter remains non-empty and compilable
 	ensureRegimeFilterValid(rng, &child, feats)
+
+	// PROBLEM 10 FIX: Fold-aware hold/cooldown sampling during crossover
+	// Same logic as mutation to prevent clamped duplicates
+	tfMinutes := atomic.LoadInt32(&globalTimeframeMinutes)
+	barsPerDay := int(1440.0 / float64(tfMinutes))
+	typicalFoldBars := barsPerDay * 90 // 90-day fold
+
+	// Sample hold_bars based on fold size: max = testBars/10
+	maxHoldBars := typicalFoldBars / 10
+	if maxHoldBars < 20 {
+		maxHoldBars = 20
+	}
+	if maxHoldBars > 120 {
+		maxHoldBars = 120
+	}
+	child.MaxHoldBars = (maxHoldBars / 4) + rng.Intn(maxHoldBars*3/4+1)
+
+	// Sample cooldown_bars based on fold size: max = testBars/30
+	maxCooldownBars := typicalFoldBars / 30
+	if maxCooldownBars < 10 {
+		maxCooldownBars = 10
+	}
+	if maxCooldownBars > 48 {
+		maxCooldownBars = 48
+	}
+	child.CooldownBars = (maxCooldownBars / 4) + rng.Intn(maxCooldownBars*3/4+1)
 
 	return child
 }
@@ -1110,6 +1174,16 @@ func bigMutation(rng *rand.Rand, parent Strategy, feats Features) Strategy {
 
 	// Ensure regime filter remains non-empty and compilable
 	ensureRegimeFilterValid(rng, &child, feats)
+
+	// PROBLEM E FIX: Clamp MaxHoldBars and CooldownBars in bigMutation
+	const maxHoldClampBig = 120
+	const maxCooldownClampBig = 48
+	if child.MaxHoldBars > maxHoldClampBig {
+		child.MaxHoldBars = maxHoldClampBig
+	}
+	if child.CooldownBars > maxCooldownClampBig {
+		child.CooldownBars = maxCooldownClampBig
+	}
 
 	return child
 }

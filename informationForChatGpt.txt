@@ -1,0 +1,840 @@
+PS C:\HB_bactest_checker> .\hb_backtest.exe `
+>>       -checkpoint checkpoint.json `
+>>       -data btc_data_60m.csv -timeframe 60m `
+>>       -mode search -scoring balanced `
+>>       -fee_bps 1 -slip_bps 1 `
+>>       -wf `
+>>       -wf_train_days 360 -wf_test_days 120 -wf_step_days 120 `
+>>       -wf_min_trades_oos 12 `
+>>       -wf_min_edges_per_year 8 -wf_fold_min_edges_per_year 2 `
+>>       -wf_min_active_months_ratio 0.10 -wf_max_sparse_months_ratio 0.90 `
+>>       -wf_max_dd 0.60 `
+>>       -wf_min_geo_monthly 0.0003 -wf_min_median_monthly 0.0003 `
+>>       -min_val_return 0.0010 -min_val_pf 1.00 -max_val_dd 0.60 `
+>>       -min_val_score -1.4 -min_val_trades 8 -stability_threshold 0.02 `
+>>       -ignore_meta -debug_wf `
+>>       -recovery
+HB Backtest Strategy Search Engine
+Build: 2026-02-02_FIX_QT_V4
+====================================
+=== STARTUP CONFIGURATION ===
+Fee: 1.00 bps (0.010%)
+Slippage: 1.00 bps (0.010%)
+Warmup (custom): 2000 bars
+=============================
+
+====================================================================================================
+SCORING FORMULA: v3 (computeScore with smoothness)
+  Components: logReturn*6.0 + calmar*2.0 + expectancy*200.0 + tradesReward*0.01 - ddPenalty*6.0
+              + sortino*0.5 - smoothPenalty*0.5 - deflationPenalty
+  Caps: calmar=[-inf,10], expectancy=[-5,5], sortino=[-10,20]
+  Sentinel: -1e30 for hard rejection (trades==0 || dd>=0.65)
+====================================================================================================
+
+Scoring mode: BALANCED (DD<0.60, ret>0.1%, pf>1.00, exp>0.0000, score>-1.4) [WARM-START]
+GATE THRESHOLDS:
+  Val:    minReturn=0.0010, minPF=1.00, minExp=0.0000, maxDD=0.60, minTrades=8
+  RelaxLevel: 1 (0=strict, 1=normal, 2=relaxed, 3=very-relaxed) [Normal]
+  Overlap: entry_rate=[0.1%, 30.0%] (effective max: 31.0%), regime_rate=[1.0%, 99.0%] (effective max: 99.7%)
+  QuickTest: minPF=1.00, minReturn=adaptive(-5% bootstrap, 0% normal), minTrades=5, maxDD=0.60
+====================================================================================================
+
+CPU Cores: 20, Using: 8 workers (~40%)
+Loading data...[DATA] Detected 60-minute bar interval from 72831 samples
+[DATA] Updated global timeframe to 60m (was using command-line flag)
+Loaded 72832 candles
+Computing features...
+Computed 73 features
+Screen window: 4320 candles (33871 -> 38191)
+Feature stats computed on train window (38191 candles)
+
+Data split:
+  Train:  38191 candles (0 -> 38191)
+  Val:    17518 candles (38191 -> 55709)
+  Test:   17123 candles (55709 -> 72832)
+  Total:  72832 candles
+
+Data load time: 108.7737ms
+
+Ignoring meta.json (-ignore_meta flag set)
+Seed: 1770054312934327900 (time-based)
+Loaded surrogate weights from surrogate.json
+Starting strategy search (press Ctrl+C to stop)...[FEE_DEBUG] Seed=2236460226251224000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=4057514236048706000 FeeBps=1.00 SlippageBps=1.00
+
+[FOLD EDGE DIAGNOSTIC #1 seed=1586818928909042352]
+  Folds: 16, SumTestEdges: 677, ZeroTradeFolds: 0/16
+  Tradable edges/year: 129.04, Threshold: 8.00
+  Per-fold edge counts: [45 42 37 27 32 43 46 47 51 50 43 40 48 43 45 38]
+  entry_rule: (AND (Between VolZ50 0.4426 0.7182) (Falling ADX 12))
+  regime_filter: (NOT (LT MinusDI 17.4509))
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 76/2869 bars (2.6%)
+    Regime OK: 1923/2869 bars (67.0%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+[FOLD 0] bars=2869 signals=28 entries=28 exits=28 test_trades=28  -> 2018-08
+[SAMPLED REJECTION #1] reason=wf_overlap_gate: entry_regime_no_overlap: entry_true=19 (0.22%), regime_ok=5324 (62.12%), overlap=1 (0.01%), need count>=10 or rate>=0.03%, seed=7740781301108141074, trades=0, ret=0.00%, pf=0.00, exp=0.00000, dd=0.00%
+[FOLD 1] bars=2874 signals=27 entries=27 exits=27 test_trades=27 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=22 entries=22 exits=22 test_trades=22 2018-04 -> 2019-04
+
+[FOLD EDGE DIAGNOSTIC #1 seed=7085720134106704562]
+  Folds: 16, SumTestEdges: 1452, ZeroTradeFolds: 0/16
+  Tradable edges/year: 276.75, Threshold: 8.00
+  Per-fold edge counts: [138 158 115 113 168 142 119 31 29 37 49 31 62 123 55 82]
+  entry_rule: (AND (SlopeLT RSI7 1.0000 9) (LT MinusDI 16.7229))
+  regime_filter: (OR (Falling EMA10 5) (LT ATR14 119.2273))
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 473/2869 bars (16.5%)
+    Regime OK: 2839/2869 bars (99.0%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #1 seed=7711210593391705866]
+  Folds: 16, SumTestEdges: 70, ZeroTradeFolds: 0/16
+  Tradable edges/year: 13.34, Threshold: 8.00
+  Per-fold edge counts: [1 6 6 1 5 1 5 8 6 6 3 7 5 6 2 2]
+  entry_rule: (AND (CrossUp ATR7 ATR14_SMA50) (NOT (SlopeLT MinusDI 0.0437 12)))
+  regime_filter: (Rising HH_20_prev 2)
+[FOLD 15] bars=2880 signals=21 entries=21 exits=21 test_trades=21 2022-07 -> 2023-07
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 68/2869 bars (2.4%)
+    Regime OK: 280/2869 bars (9.8%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #1 seed=6720209577376727984]
+  Folds: 16, SumTestEdges: 3131, ZeroTradeFolds: 0/16
+  Tradable edges/year: 596.78, Threshold: 8.00
+  Per-fold edge counts: [192 214 206 179 196 215 243 204 147 214 177 163 179 207 194 201]
+  entry_rule: (AND (OR (GT SweepDown_100 0.0407) (AND (GT ROC20 -1.8683) (LT BodyPct 0.4676))) (Rising VolSMA20 9))
+  regime_filter: (OR (Rising EMA10 4) (AND (BreakUp VolSMA50 BuyRatio) (BreakDown PlusDI MinusDI)))
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 629/2869 bars (21.9%)
+    Regime OK: 1428/2869 bars (49.8%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #1 seed=326123641784779457]
+  Folds: 16, SumTestEdges: 2602, ZeroTradeFolds: 0/16
+  Tradable edges/year: 495.95, Threshold: 8.00
+  Per-fold edge counts: [150 157 195 159 158 150 174 183 181 175 170 153 160 143 159 135]
+  entry_rule: (AND (GT VolZ50 -0.0033) (OR (AND (GT MACD 44.2721) (LT MACD_Hist 24.1212)) (SlopeGT MACD_Signal 0.0439 5)))
+  regime_filter: (Between VolZ50 -0.4436 0.3998)
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 512/2869 bars (17.8%)
+    Regime OK: 1121/2869 bars (39.1%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #2 seed=926748774419172334]
+  Folds: 16, SumTestEdges: 902, ZeroTradeFolds: 0/16
+  Tradable edges/year: 171.92, Threshold: 8.00
+  Per-fold edge counts: [87 95 74 87 85 78 65 28 23 17 30 35 56 55 53 34]
+  entry_rule: (AND (AND (OR (GT VolEMA50 0.1347) (SlopeLT SweepUp_100 -0.0061 11)) (SlopeGT ROC20 -0.0432 6)) (AND (SlopeGT MinusDI -0.0217 9) (SlopeLT ROC10 -0.0564 15)))
+  regime_filter: (LT Body 42.7810)
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 143/2869 bars (5.0%)
+    Regime OK: 2526/2869 bars (88.0%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #2 seed=5031579546364764431]
+  Folds: 16, SumTestEdges: 146, ZeroTradeFolds: 0/16
+  Tradable edges/year: 27.83, Threshold: 8.00
+  Per-fold edge counts: [8 9 7 17 12 9 8 6 10 14 10 10 10 3 5 8]
+  entry_rule: (AND (SlopeLT ADX 0.0710 10) (AND (AND (Between BB_Width20 0.0240 0.0302) (LT RSI7 52.9876)) (AND (LT Imbalance 0.0000) (SlopeGT ROC10 0.0489 12))))
+  regime_filter: (OR (OR (BreakUp MinusDI PlusDI) (LT MFI14 43.6027)) (CrossDown HH_100_prev HH_20_prev))
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 27/2869 bars (0.9%)
+    Regime OK: 1063/2869 bars (37.1%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #2 seed=5586446805074351610]
+  Folds: 16, SumTestEdges: 60, ZeroTradeFolds: 0/16
+  Tradable edges/year: 11.44, Threshold: 8.00
+  Per-fold edge counts: [1 2 5 2 4 6 4 4 4 5 4 4 2 5 4 4]
+  entry_rule: (AND (Rising MinusDI 11) (CrossDown LL_20_prev EMA50))
+  regime_filter: (LT MFI14 44.8568)
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 4/2869 bars (0.1%)
+    Regime OK: 1080/2869 bars (37.6%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #3 seed=1494017513604150261]
+  Folds: 16, SumTestEdges: 4575, ZeroTradeFolds: 0/16
+  Tradable edges/year: 872.01, Threshold: 8.00
+  Per-fold edge counts: [388 342 347 444 335 384 336 123 129 84 82 191 386 330 346 328]
+  entry_rule: (AND (NOT (AND (Falling MFI14 7) (SlopeGT PlusDI 5.0000 9))) (AND (AND (SlopeGT BodyPct 0.0000 11) (GT MinusDI 19.2338)) (OR (LT ATR14_SMA50 256.2105) (Between BB_Width50 0.0700 0.0983)))) 
+  regime_filter: (OR (OR (LT ROC10 -0.5811) (LT BodyPct 0.3451)) (OR (LT RSI14 46.3865) (GT ROC10 1.0611)))
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 816/2869 bars (28.4%)
+    Regime OK: 2232/2869 bars (77.8%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #4 seed=5107864808178750590]
+  Folds: 16, SumTestEdges: 3835, ZeroTradeFolds: 0/16
+  Tradable edges/year: 730.96, Threshold: 8.00
+  Per-fold edge counts: [254 259 226 250 240 254 257 194 233 272 246 232 235 236 244 203]
+  entry_rule: (AND (SlopeGT ATR14 -0.0071 3) (OR (LT BB_Width50 0.0921) (AND (SlopeGT HMA100 0.0025 5) (SlopeGT MACD_Hist 0.0494 13))))
+  regime_filter: (AbsLT SweepDown_200 0.0619)
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 878/2869 bars (30.6%)
+    Regime OK: 2831/2869 bars (98.7%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #5 seed=4535637091612831366]
+  Folds: 16, SumTestEdges: 632, ZeroTradeFolds: 0/16
+  Tradable edges/year: 120.46, Threshold: 8.00
+  Per-fold edge counts: [36 34 34 47 34 39 39 30 38 47 44 36 48 38 41 47]
+  entry_rule: (AND (AND (OR (CrossDown VolSMA50 Imbalance) (SlopeGT RSI7 1.0000 14)) (Rising RSI7 12)) (SlopeGT MinusDI 0.0007 7))
+  regime_filter: (Rising RangeWidth 3)
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 75/2869 bars (2.6%)
+    Regime OK: 1449/2869 bars (50.5%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+
+[FOLD EDGE DIAGNOSTIC #5 seed=3173463259323711890]
+  Folds: 16, SumTestEdges: 243, ZeroTradeFolds: 0/16
+  Tradable edges/year: 46.32, Threshold: 8.00
+  Per-fold edge counts: [21 16 12 31 22 10 15 6 15 15 10 12 13 13 17 15]
+  entry_rule: (AND (OR (GT VolZ50 91.8491) (AND (Rising ADX 4) (LT ROC20 0.0890))) (Rising RSI21 6))
+  regime_filter: (BreakDown VolZ20 VolZ50)
+  Fold 0 diagnosis (bars 8570-11439, total 2869):
+    Entry true: 287/2869 bars (10.0%)
+    Regime OK: 253/2869 bars (8.8%)
+    Active: 2869/2869 bars (100.0%)
+[END DIAGNOSTIC]
+
+[FEE_DEBUG] Seed=7138932093695287000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=950106376861766000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=758276692453026000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5751973669299616000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=20 entries=20 exits=20 test_trades=20  -> 2018-08
+[FOLD 1] bars=2874 signals=20 entries=20 exits=20 test_trades=20 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=11 entries=11 exits=11 test_trades=11 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=16 entries=16 exits=16 test_trades=16 2022-07 -> 2023-07
+Tested: 1,024 | Rate: 102/s | Best: 0.0000 | Elites: 0 | Gen: 0
+gen=8039 rej_sur=0(0.0%) rej_seen=0/8039(0.0%) rerolled=0(0.0%) rej_novelty=0(0.0%) prefilter=5991[dead=4795,sparse=250,regime=946](74.5%) sent=1500(18.7%)[FEE_DEBUG] Seed=4690085739008266000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=7867935589204785000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=8059499741108445000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=4161661981550862000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=2860024858859292000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5475386798687408000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=26 entries=26 exits=26 test_trades=26  -> 2018-08
+[FOLD 1] bars=2874 signals=29 entries=29 exits=29 test_trades=29 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=17 entries=17 exits=17 test_trades=17 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=25 entries=25 exits=25 test_trades=25 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=4951814774224310000 FeeBps=1.00 SlippageBps=1.00
+[AUTO-RECOVERY] ENABLED (elites=0 < 25), minEdges=2
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=55 return=0.0127 pf=1.06 dd=0.1498 score=-0.1324
+[QuickTest-DEBUG] window_2: trades=54 return=0.2129 pf=1.58 dd=0.0730 score=9.6622
+[QuickTest-DEBUG] window_1: trades=55 return=0.0657 pf=1.19 dd=0.0791 score=2.7255
+[QuickTest-DEBUG] aggregate: trades=54 return=0.0887 pf=1.26 dd=0.1498 pass_count=3/3 recent_pass=true
+[QuickTest-DEBUG] sentinel_check: qt_trades=54 qt_dd_raw=0.1498 qt_dd_isnan=false qt_pf_raw=1.26 qt_return_raw=0.0887 reason=no_candidates
+ [META: radicalP 0.10->0.09, surExploreP 0.10->0.09]17:45:31Z  [PROG]  Batch 1: Tested 2048 | Train: -1.6805 | batchValScore: -2.4798 | Ret: 1.07% | GeoAvg: 1.07% | Median: 0.0684% | WR: 40.1% | Trds: 604 | Rate: 549/s | Runtime: 18s | fp: (AND (OR (AND (Rising F[13] 7) (GT F[38] -0.04)) (AND (BreakDown F[59]) (Rising F[12] 8))) (NOT (Falling F[40] 5)))|(AND (NOT (Falling F[13] 3)) (AND (Falling F[29] 3) (CrossDown F[29] F[21])))|(NOT (OR (CrossDown F[19] F[54]) (AbsGT F[31] 27.67)))|ATR*3.02|ATR*10.15|ATR*2.50|hold=62|loss=20|cd=41|fees=1.0000|slip=1.0000|risk=1.0000|dir=1|vol_ATR14>SMA50*0.58| ✓     
+  [OOS] GeoAvg=+1.07%  Median=+0.07%  MinMo=-21.05%  Months=64  Trades=604  OOS_DD=43.32%
+  [crit: score>-1.40, trds>=8, DD<0.60, ret>0.1%, exp>0.0000, pf>1.00, stab>2%]
+  [val: score=-2.4798 dd=43.32% trds=604 reason=score]
+  [QuickTest: Score=REJECTED Ret=8.87% DD=14.98% Trds=54]
+  [ENTRY STORY]
+    Regime Filter (must be true):     (NOT (OR (CrossDown BB_Width50(F[19]) Displacement(F[54])) (AbsGT MinusDI(F[31]) 27.67)))
+    Entry Signal (candle t close):     (AND (OR (AND (Rising RSI21(F[13]) 7) (GT VolZ50(F[38]) -0.04)) (AND (BreakDown HH_50_prev(F[59])) (Rising RSI14(F[12]) 8))) (NOT (Falling Imbalance(F[40]) 5)))    
+    Entry Execution (candle t+1 open): pending entry enters at next bar open
+    Exit Signal:     (AND (NOT (Falling RSI21(F[13]) 3)) (AND (Falling ADX(F[29]) 3) (CrossDown ADX(F[29]) MACD_Signal(F[21]))))
+  [RISK MANAGEMENT]
+    StopLoss: ATR*3.02
+    TakeProfit: ATR*10.15
+    Trail: ATR*2.50
+
+[FEE_DEBUG] Seed=7763103787159903000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=21 entries=21 exits=21 test_trades=21  -> 2018-08
+[FOLD 1] bars=2874 signals=23 entries=23 exits=23 test_trades=23 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=17 entries=17 exits=17 test_trades=17 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=25 entries=25 exits=25 test_trades=25 2022-07 -> 2023-07
+Tested: 2,432 | Rate: 141/s | Best: 0.0000 | Elites: 1 | Gen: 1
+gen=16654 rej_sur=0(0.0%) rej_seen=27/16681(0.2%) rerolled=27(0.2%) rej_novelty=0(0.0%) prefilter=11875[dead=9458,sparse=528,regime=1889](71.3%) sent=3408(20.5%)[FEE_DEBUG] Seed=4853562402538972000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=3700462774331359000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=5 entries=5 exits=5 test_trades=5  -> 2018-08
+[FOLD 1] bars=2874 signals=4 entries=4 exits=4 test_trades=4 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=14 entries=14 exits=14 test_trades=14 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=2 entries=2 exits=2 test_trades=2 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=790.9%_exceeds_300% | ret=7.9089 dd=0.3227 exp=0.0059 trades=431 tested=0
+[FOLD 0] bars=2869 signals=7 entries=7 exits=7 test_trades=7  -> 2018-08
+[FOLD 1] bars=2874 signals=2 entries=2 exits=2 test_trades=2 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=20 entries=20 exits=20 test_trades=20 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=19 entries=19 exits=19 test_trades=19 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=8795170510921480000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=9049447727339039000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6258376105828140000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=33612561719333000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=4976704097885369000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5156037599234778000 FeeBps=1.00 SlippageBps=1.00
+Tested: 4,096 | Rate: 166/s | Best: 0.0000 | Elites: 1 | Gen: 1
+gen=25421 rej_sur=0(0.0%) rej_seen=379/25800(1.5%) rerolled=379(1.5%) rej_novelty=0(0.0%) prefilter=16617[dead=13168,sparse=704,regime=2745](65.4%) sent=5965(23.5%)Gen: 25,421 (heavy_mut))
+[FOLD 0] bars=2869 signals=38 entries=38 exits=38 test_trades=38  -> 2018-08
+[FOLD 1] bars=2874 signals=33 entries=33 exits=33 test_trades=33 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=38 entries=38 exits=38 test_trades=38 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=34 entries=34 exits=34 test_trades=34 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=6578858089943169000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1094284877888312000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6912053118702360000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=7295538319727485000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=8438566938243236000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6333430590072465000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=22 entries=22 exits=22 test_trades=22  -> 2018-08
+[FOLD 1] bars=2874 signals=25 entries=25 exits=25 test_trades=25 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=26 entries=26 exits=26 test_trades=26 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=29 entries=29 exits=29 test_trades=29 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=489.3%_exceeds_300% | ret=4.8930 dd=0.4654 exp=0.0038 trades=590 tested=0
+[FEE_DEBUG] Seed=8539778250584403000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=8282020778904439000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=8015985608430170000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=2132390156445296000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=340.6%_exceeds_300% | ret=3.4061 dd=0.5315 exp=0.0029 trades=705 tested=0
+[FEE_DEBUG] Seed=9109654505202773000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1050139365513159000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=42 entries=42 exits=42 test_trades=42  -> 2018-08
+[FOLD 1] bars=2874 signals=43 entries=43 exits=43 test_trades=43 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=41 entries=41 exits=41 test_trades=41 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=41 entries=41 exits=41 test_trades=41 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=6258942696783979000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=325.5%_exceeds_300% | ret=3.2547 dd=0.4132 exp=0.0035 trades=530 tested=0
+[TRAIN_SCORE_INVALID] reason=ret=383.4%_exceeds_300% | ret=3.8336 dd=0.4751 exp=0.0045 trades=427 tested=0
+[FEE_DEBUG] Seed=7754982371165415000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=4668876369763732000 FeeBps=1.00 SlippageBps=1.00
+Tested: 6,016 | Rate: 192/s | Best: 0.0000 | Elites: 1 | Gen: 1
+gen=33353 rej_sur=0(0.0%) rej_seen=898/34251(2.6%) rerolled=898(2.7%) rej_novelty=0(0.0%) prefilter=20847[dead=16461,sparse=857,regime=3529](62.5%) sent=8326(25.0%)[FEE_DEBUG] Seed=4091750703072030000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1301813097877610000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=3 entries=3 exits=3 test_trades=3  -> 2018-08
+[FOLD 1] bars=2874 signals=15 entries=15 exits=15 test_trades=15 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=10 entries=10 exits=10 test_trades=10 2018-04 -> 2019-04
+[FEE_DEBUG] Seed=6215621092691784000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 15] bars=2880 signals=7 entries=7 exits=7 test_trades=7 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=2650701600349166000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5360339953160141000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=42 entries=42 exits=42 test_trades=42  -> 2018-08
+[FOLD 1] bars=2874 signals=57 entries=57 exits=57 test_trades=57 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=44 entries=44 exits=44 test_trades=44 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=43 entries=43 exits=43 test_trades=43 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=1837021982663805000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=697.0%_exceeds_300% | ret=6.9697 dd=0.3108 exp=0.0045 trades=580 tested=0
+[FEE_DEBUG] Seed=1242700641861902000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=468.2%_exceeds_300% | ret=4.6817 dd=0.3174 exp=0.0048 trades=434 tested=0
+[TRAIN_SCORE_INVALID] reason=ret=542.8%_exceeds_300% | ret=5.4281 dd=0.5164 exp=0.0045 trades=508 tested=0
+[TRAIN_SCORE_INVALID] reason=ret=453.5%_exceeds_300% | ret=4.5355 dd=0.3775 exp=0.0048 trades=412 tested=0
+[FOLD 0] bars=2869 signals=47 entries=47 exits=47 test_trades=47  -> 2018-08
+[FOLD 1] bars=2874 signals=45 entries=45 exits=45 test_trades=45 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=45 entries=45 exits=45 test_trades=45 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=39 entries=39 exits=39 test_trades=39 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=2454044466550454000 FeeBps=1.00 SlippageBps=1.00
+Tested: 7,936 | Rate: 192/s | Best: 0.0000 | Elites: 1 | Gen: 1
+gen=41194 rej_sur=0(0.0%) rej_seen=1578/42772(3.7%) rerolled=1578(3.8%) rej_novelty=0(0.0%) prefilter=25196[dead=19781,sparse=1049,regime=4366](61.2%) sent=10545(25.6%)[FEE_DEBUG] Seed=3964436104949779000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=59 entries=59 exits=59 test_trades=59  -> 2018-08
+[FOLD 1] bars=2874 signals=60 entries=60 exits=60 test_trades=60 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=55 entries=55 exits=55 test_trades=55 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=52 entries=52 exits=52 test_trades=52 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=7134417375546975000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=9148591208380512000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=387.0%_exceeds_300% | ret=3.8699 dd=0.3103 exp=0.0051 trades=340 tested=0
+[FEE_DEBUG] Seed=7825519133603060000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=22 entries=22 exits=22 test_trades=22  -> 2018-08
+[FOLD 1] bars=2874 signals=26 entries=26 exits=26 test_trades=26 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=29 entries=29 exits=29 test_trades=29 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=24 entries=24 exits=24 test_trades=24 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=2079665713994137000 FeeBps=1.00 SlippageBps=1.00
+[SAMPLED REJECTION #10001] reason=wf_oos_rejected: Insufficient trades per month: 0 < 2, seed=1827509589213189269, trades=187, ret=-0.03%, pf=1.04, exp=0.00043, dd=39.34%
+[FOLD 0] bars=2869 signals=12 entries=12 exits=12 test_trades=12  -> 2018-08
+[FOLD 1] bars=2874 signals=9 entries=9 exits=9 test_trades=9 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=8 entries=8 exits=8 test_trades=8 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=14 entries=14 exits=14 test_trades=14 2022-07 -> 2023-07
+Tested: 9,856 | Rate: 192/s | Best: 0.0000 | Elites: 1 | Gen: 1
+gen=48923 rej_sur=0(0.0%) rej_seen=2276/51199(4.4%) rerolled=2276(4.7%) rej_novelty=0(0.0%) prefilter=29432[dead=23062,sparse=1219,regime=5151](60.2%) sent=12722(26.0%)Gen: 48,923 (heavy_mut))
+Rejects: entry_low=3,429 | Pass: 0.0%
+
+✓ Checkpoint saved: checkpoint.json (runtime: 1m)
+[FEE_DEBUG] Seed=2729689626576576000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=821.9%_exceeds_300% | ret=8.2187 dd=0.3622 exp=0.0047 trades=563 tested=0
+[FEE_DEBUG] Seed=7422474119979642000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=8648683085219171000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6626147276186713000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=7419602304867780000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=2630310183322450000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=42 entries=42 exits=42 test_trades=42  -> 2018-08
+[FOLD 1] bars=2874 signals=45 entries=45 exits=45 test_trades=45 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=36 entries=36 exits=36 test_trades=36 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=38 entries=38 exits=38 test_trades=38 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=7690684932083681000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5109030725109830000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=40 entries=40 exits=40 test_trades=40  -> 2018-08
+[FOLD 1] bars=2874 signals=44 entries=44 exits=44 test_trades=44 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=49 entries=49 exits=49 test_trades=49 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=41 entries=41 exits=41 test_trades=41 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=8107062990052261000 FeeBps=1.00 SlippageBps=1.00
+Tested: 11,776 | Rate: 192/s | Best: 0.0000 | Elites: 1 | Gen: 1
+gen=56650 rej_sur=0(0.0%) rej_seen=3046/59696(5.1%) rerolled=3046(5.4%) rej_novelty=0(0.0%) prefilter=33678[dead=26327,sparse=1381,regime=5970](59.4%) sent=14921(26.3%)[FEE_DEBUG] Seed=4347445224240284000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=2 entries=2 exits=2 test_trades=2  -> 2018-08
+[FOLD 1] bars=2874 signals=3 entries=3 exits=3 test_trades=3 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=10 entries=10 exits=10 test_trades=10 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=2 entries=2 exits=2 test_trades=2 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=387.0%_exceeds_300% | ret=3.8699 dd=0.3103 exp=0.0051 trades=340 tested=12032
+[TRAIN_RET_CAP] ret=387.0% dd=31.03% trades=340 pf=1.64 score=CAPPED cap=300%
+[VAL-REJECT] score=0.5463 ret=2.77% pf=1.61 exp=0.00460 dd=0.275 trds=423 []
+[VAL-REJECT] score=-2.9667 ret=1.93% pf=1.24 exp=0.00222 dd=0.495 trds=649 [train_cap(return_cap(train_133.0%_gt_80%,val_1.9%_lt_2.0%))]
+[TRAIN_SCORE_INVALID] reason=ret=468.2%_exceeds_300% | ret=4.6817 dd=0.3174 exp=0.0048 trades=434 tested=12032
+[TRAIN_RET_CAP] ret=468.2% dd=31.74% trades=434 pf=1.44 score=CAPPED cap=300%
+[VAL-REJECT] score=-2.6985 ret=1.05% pf=1.18 exp=0.00161 dd=0.436 trds=539 []
+[VAL-REJECT] score=-3.1390 ret=0.90% pf=1.12 exp=0.00114 dd=0.461 trds=795 [train_cap(score_cap(train_13.3_gt_12.0,val_-3.139_lt_1.0))]
+[TRAIN_SCORE_INVALID] reason=ret=325.5%_exceeds_300% | ret=3.2547 dd=0.4132 exp=0.0035 trades=530 tested=12032
+[TRAIN_RET_CAP] ret=325.5% dd=41.32% trades=530 pf=1.32 score=CAPPED cap=300%
+[VAL-REJECT] score=-1.8477 ret=1.88% pf=1.24 exp=0.00219 dd=0.401 trds=656 []
+[VAL-REJECT] score=-1.4170 ret=0.69% pf=1.17 exp=0.00165 dd=0.320 trds=392 [train_cap(return_cap(train_119.7%_gt_80%,val_0.7%_lt_2.0%))]
+[TRAIN_SCORE_INVALID] reason=ret=383.4%_exceeds_300% | ret=3.8336 dd=0.4751 exp=0.0045 trades=427 tested=12032
+[TRAIN_RET_CAP] ret=383.4% dd=47.51% trades=427 pf=1.40 score=CAPPED cap=300%
+[VAL-REJECT] score=-3.4069 ret=0.76% pf=1.15 exp=0.00135 dd=0.482 trds=530 []
+[TRAIN_SCORE_INVALID] reason=ret=542.8%_exceeds_300% | ret=5.4281 dd=0.5164 exp=0.0045 trades=508 tested=12032
+[TRAIN_RET_CAP] ret=542.8% dd=51.64% trades=508 pf=1.42 score=CAPPED cap=300%
+[VAL-REJECT] score=-1.3985 ret=1.17% pf=1.18 exp=0.00161 dd=0.333 trds=622 []
+[VAL-REJECT] score=-1.3486 ret=1.46% pf=1.21 exp=0.00191 dd=0.343 trds=613 [train_cap(score_cap(train_12.7_gt_12.0,val_-1.349_lt_1.0))]
+[VAL-REJECT] score=-2.1055 ret=1.61% pf=1.19 exp=0.00168 dd=0.406 trds=750 [train_cap(return_cap(train_91.0%_gt_80%,val_1.6%_lt_2.0%))]
+[VAL-REJECT] score=-1.2461 ret=1.18% pf=1.25 exp=0.00251 dd=0.335 trds=385 [train_cap(score_cap(train_16.4_gt_12.0,val_-1.246_lt_1.0))]
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=33 return=-0.0874 pf=0.64 dd=0.1063 score=-5.2646
+[QuickTest-DEBUG] window_2: trades=35 return=-0.1238 pf=0.53 dd=0.1415 score=-6.3202
+[QuickTest-DEBUG] window_1: trades=40 return=0.1345 pf=1.59 dd=0.0538 score=8.1267
+[QuickTest-DEBUG] aggregate: trades=33 return=-0.0317 pf=0.89 dd=0.1415 pass_count=1/3 recent_pass=true
+[QuickTest-DEBUG] sentinel_check: qt_trades=33 qt_dd_raw=0.1415 qt_dd_isnan=false qt_pf_raw=0.89 qt_return_raw=-0.0317 reason=no_candidates
+[QuickTest-FAIL] weighted_fail(ret=-3.17%,pf=0.89,trades=824633764624), majority_fail(1/3_windows)
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=39 return=0.0633 pf=1.22 dd=0.0923 score=2.3686
+[QuickTest-DEBUG] window_2: trades=43 return=0.2046 pf=1.63 dd=0.0716 score=9.4438
+[QuickTest-DEBUG] window_1: trades=42 return=-0.2324 pf=0.29 dd=0.2391 score=-8.4689
+[QuickTest-DEBUG] aggregate: trades=39 return=0.0170 pf=1.07 dd=0.2391 pass_count=2/3 recent_pass=false
+[QuickTest-DEBUG] sentinel_check: qt_trades=39 qt_dd_raw=0.2391 qt_dd_isnan=false qt_pf_raw=1.07 qt_return_raw=0.0170 reason=
+[VAL-REJECT] score=-1.6019 ret=1.03% pf=1.15 exp=0.00140 dd=0.342 trds=669 [train_cap(score_cap(train_17.3_gt_12.0,val_-1.602_lt_1.0))]
+[VAL-REJECT] score=-2.9579 ret=1.08% pf=1.19 exp=0.00172 dd=0.460 trds=523 [train_cap(score_cap(train_17.3_gt_12.0,val_-2.958_lt_1.0))]
+[VAL-REJECT] score=-0.7641 ret=1.99% pf=1.29 exp=0.00275 dd=0.326 trds=562 [train_cap(return_cap(train_143.2%_gt_80%,val_2.0%_lt_2.0%))]
+[VAL-REJECT] score=-1.6115 ret=2.06% pf=1.25 exp=0.00256 dd=0.394 trds=627 [train_cap(score_cap(train_16.1_gt_12.0,val_-1.612_lt_1.0))]
+[TRAIN_SCORE_INVALID] reason=ret=489.3%_exceeds_300% | ret=4.8930 dd=0.4654 exp=0.0038 trades=590 tested=12032
+[TRAIN_RET_CAP] ret=489.3% dd=46.54% trades=590 pf=1.33 score=CAPPED cap=300%
+[VAL-REJECT] score=-1.8462 ret=1.65% pf=1.20 exp=0.00180 dd=0.388 trds=752 []
+[VAL-REJECT] score=-2.6258 ret=1.69% pf=1.25 exp=0.00227 dd=0.461 trds=590 []
+[VAL-REJECT] score=-2.6361 ret=0.84% pf=1.14 exp=0.00132 dd=0.420 trds=565 [train_cap(return_cap(train_80.3%_gt_80%,val_0.8%_lt_2.0%))]
+ [META: radicalP 0.09->0.07, surExploreP 0.09->0.08]17:46:23Z  [PROG]  Batch 2: Tested 12032 | Train: -4.7559 | batchValScore: -0.4604 | Ret: 0.90% | GeoAvg: 0.90% | Median: 0.0519% | WR: 37.5% | Trds: 344 | Rate: 189/s | Runtime: 1m11s | fp: (AND (SlopeLT F[29] -0.13 14) (LT F[11] 48.65))|(AND (CrossDown F[30] F[29]) (Falling F[29] 6))|(BreakDown F[11])|ATR*1.20|ATR*3.24|none|hold=106|loss=20|cd=33|fees=1.0000|slip=1.0000|risk=1.0000|dir=1|vol_off| ✓
+  [OOS] GeoAvg=+0.90%  Median=+0.05%  MinMo=-14.45%  Months=64  Trades=344  OOS_DD=25.30%
+  [crit: score>-1.40, trds>=20, DD<0.60, ret>0.1%, exp>0.0000, pf>1.00, stab>2%]
+  [val: score=-0.4604 dd=25.30% trds=344]
+  [QuickTest: Score=REJECTED Ret=1.70% DD=23.91% Trds=39]
+  [ENTRY STORY]
+    Regime Filter (must be true):     (BreakDown RSI7(F[11]))
+    Entry Signal (candle t close):     (AND (SlopeLT ADX(F[29]) -0.13 14) (LT RSI7(F[11]) 48.65))
+    Entry Execution (candle t+1 open): pending entry enters at next bar open
+    Exit Signal:     (AND (CrossDown PlusDI(F[30]) ADX(F[29])) (Falling ADX(F[29]) 6))
+  [RISK MANAGEMENT]
+    StopLoss: ATR*1.20
+    TakeProfit: ATR*3.24
+    Trail: none
+
+[FEE_DEBUG] Seed=2644081393783469000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=4239223033652022000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=14 entries=14 exits=14 test_trades=14  -> 2018-08
+[FOLD 1] bars=2874 signals=16 entries=16 exits=16 test_trades=16 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=15 entries=15 exits=15 test_trades=15 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=10 entries=10 exits=10 test_trades=10 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=1298286955878974000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=456481143414756000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=40 entries=40 exits=40 test_trades=40  -> 2018-08
+[FOLD 1] bars=2874 signals=41 entries=41 exits=41 test_trades=41 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=37 entries=37 exits=37 test_trades=37 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=45 entries=45 exits=45 test_trades=45 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=6472436260051579000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5962386757721116000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6206371207500350000 FeeBps=1.00 SlippageBps=1.00
+Tested: 13,824 | Rate: 205/s | Best: 0.5463 | Elites: 2 | Gen: 2
+gen=64519 rej_sur=0(0.0%) rej_seen=3991/68510(5.8%) rerolled=3991(6.2%) rej_novelty=0(0.0%) prefilter=37994[dead=29664,sparse=1552,regime=6778](58.9%) sent=17215(26.7%)[FOLD 0] bars=2869 signals=41 entries=41 exits=41 test_trades=41  -> 2018-08
+[FOLD 1] bars=2874 signals=42 entries=42 exits=42 test_trades=42 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=35 entries=35 exits=35 test_trades=35 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=32 entries=32 exits=32 test_trades=32 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=286306767215590000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=2478547229554955000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5891256958236561000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=373694471109162000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6350086536989271000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=37 entries=37 exits=37 test_trades=37  -> 2018-08
+[FOLD 1] bars=2874 signals=40 entries=40 exits=40 test_trades=40 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=39 entries=39 exits=39 test_trades=39 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=37 entries=37 exits=37 test_trades=37 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=8251532216896625000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5606273877251774000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=8996639694098761000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1875623102041973000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=5 entries=5 exits=5 test_trades=5  -> 2018-08
+[FOLD 1] bars=2874 signals=7 entries=7 exits=7 test_trades=7 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=14 entries=14 exits=14 test_trades=14 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=7 entries=7 exits=7 test_trades=7 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=4199903412155850000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=8681347087737224000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=2510483451316472000 FeeBps=1.00 SlippageBps=1.00
+Tested: 15,872 | Rate: 205/s | Best: 0.5463 | Elites: 2 | Gen: 2
+gen=72301 rej_sur=0(0.0%) rej_seen=5032/77333(6.5%) rerolled=5032(7.0%) rej_novelty=0(0.0%) prefilter=42400[dead=33073,sparse=1713,regime=7614](58.6%) sent=19381(26.8%)Gen: 72,301 (heavy_mut))
+[FEE_DEBUG] Seed=6503399960694227000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=41 entries=41 exits=41 test_trades=41  -> 2018-08
+[FOLD 1] bars=2874 signals=41 entries=41 exits=41 test_trades=41 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=41 entries=41 exits=41 test_trades=41 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=44 entries=44 exits=44 test_trades=44 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=8380528321557780000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=7280840465163965000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=3391023515975458000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=7 entries=7 exits=7 test_trades=7  -> 2018-08
+[FOLD 1] bars=2874 signals=14 entries=14 exits=14 test_trades=14 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=16 entries=16 exits=16 test_trades=16 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=10 entries=10 exits=10 test_trades=10 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=354.0%_exceeds_300% | ret=3.5395 dd=0.3899 exp=0.0063 trades=284 tested=0
+[FEE_DEBUG] Seed=8027937850343960000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6865719387724789000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=16 entries=16 exits=16 test_trades=16  -> 2018-08
+[FOLD 1] bars=2874 signals=10 entries=10 exits=10 test_trades=10 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=29 entries=29 exits=29 test_trades=29 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=6 entries=6 exits=6 test_trades=6 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=5445796913760096000 FeeBps=1.00 SlippageBps=1.00
+Tested: 18,048 | Rate: 218/s | Best: 0.5463 | Elites: 2 | Gen: 2
+gen=79801 rej_sur=0(0.0%) rej_seen=6080/85881(7.1%) rerolled=6080(7.6%) rej_novelty=0(0.0%) prefilter=46531[dead=36215,sparse=1879,regime=8437](58.3%) sent=21557(27.0%)[FEE_DEBUG] Seed=3952453815728552000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1553169579191780000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=3464845071663109000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=35 entries=35 exits=35 test_trades=35  -> 2018-08
+[FOLD 1] bars=2874 signals=42 entries=42 exits=42 test_trades=42 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=39 entries=39 exits=39 test_trades=39 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=33 entries=33 exits=33 test_trades=33 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=3658446918557174000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=50 entries=50 exits=50 test_trades=50  -> 2018-08
+[FOLD 1] bars=2874 signals=53 entries=53 exits=53 test_trades=53 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=47 entries=47 exits=47 test_trades=47 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=46 entries=46 exits=46 test_trades=46 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=3027877930398823000 FeeBps=1.00 SlippageBps=1.00
+[SAMPLED REJECTION #20001] reason=wf_oos_rejected: TP multiple too high: 323.0x > 8.0x (MaxMo=41.87%, MedMo=0.13%), seed=1296720446081220921, trades=587, ret=1.58%, pf=1.24, exp=0.00227, dd=45.82%
+[FEE_DEBUG] Seed=1067294588277673000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=3 entries=3 exits=3 test_trades=3  -> 2018-08
+[FOLD 1] bars=2874 signals=2 entries=2 exits=2 test_trades=2 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=11 entries=11 exits=11 test_trades=11 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=14 entries=14 exits=14 test_trades=14 2022-07 -> 2023-07
+Tested: 20,352 | Rate: 230/s | Best: 0.5463 | Elites: 2 | Gen: 2
+gen=88332 rej_sur=0(0.0%) rej_seen=7382/95712(7.7%) rerolled=7380(8.4%) rej_novelty=0(0.0%) prefilter=51273[dead=39885,sparse=2061,regime=9327](58.0%) sent=23942(27.1%)[TRAIN_SCORE_INVALID] reason=ret=414.2%_exceeds_300% | ret=4.1421 dd=0.4803 exp=0.0042 trades=482 tested=0
+[FEE_DEBUG] Seed=1744076522123792000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=6 entries=6 exits=6 test_trades=6  -> 2018-08
+[FOLD 1] bars=2874 signals=4 entries=4 exits=4 test_trades=4 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=9 entries=9 exits=9 test_trades=9 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=5 entries=5 exits=5 test_trades=5 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=334.4%_exceeds_300% | ret=3.3436 dd=0.3400 exp=0.0036 trades=551 tested=0
+[FEE_DEBUG] Seed=160544276727231000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5865027544366245000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=55 entries=55 exits=55 test_trades=55  -> 2018-08
+[FOLD 1] bars=2874 signals=56 entries=56 exits=56 test_trades=56 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=53 entries=53 exits=53 test_trades=53 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=55 entries=55 exits=55 test_trades=55 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=2753891644818446000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_RET_CAP] ret=1241.9% dd=26.40% trades=461 pf=1.61 score=CAPPED cap=300%
+[VAL-REJECT] score=-1.3106 ret=2.17% pf=1.31 exp=0.00284 dd=0.368 trds=576 []
+[VAL-REJECT] score=-2.8760 ret=1.67% pf=1.26 exp=0.00256 dd=0.476 trds=500 [train_cap(score_cap(train_14.1_gt_12.0,val_-2.876_lt_1.0))]
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=44 return=0.0079 pf=1.06 dd=0.1660 score=-0.2741
+[QuickTest-DEBUG] window_2: trades=40 return=0.0903 pf=1.34 dd=0.0800 score=3.8249
+[QuickTest-DEBUG] window_1: trades=34 return=0.0324 pf=1.16 dd=0.0989 score=1.0855
+[QuickTest-DEBUG] aggregate: trades=34 return=0.0400 pf=1.18 dd=0.1660 pass_count=3/3 recent_pass=true
+[QuickTest-DEBUG] sentinel_check: qt_trades=34 qt_dd_raw=0.1660 qt_dd_isnan=false qt_pf_raw=1.18 qt_return_raw=0.0400 reason=no_candidates
+[VAL-REJECT] score=-1.0160 ret=0.72% pf=1.18 exp=0.00170 dd=0.280 trds=378 [train_cap(score_cap(train_13.0_gt_12.0,val_-1.016_lt_1.0))]
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=61 return=0.0978 pf=1.26 dd=0.1894 score=2.2878
+[QuickTest-DEBUG] window_2: trades=55 return=0.3828 pf=2.08 dd=0.0521 score=20.8210
+[QuickTest-DEBUG] window_1: trades=62 return=-0.1193 pf=0.74 dd=0.1607 score=-5.5598
+[QuickTest-DEBUG] aggregate: trades=55 return=0.1182 pf=1.35 dd=0.1894 pass_count=2/3 recent_pass=false
+[QuickTest-DEBUG] sentinel_check: qt_trades=55 qt_dd_raw=0.1894 qt_dd_isnan=false qt_pf_raw=1.35 qt_return_raw=0.1182 reason=
+[VAL-REJECT] score=-3.4786 ret=0.53% pf=1.11 exp=0.00118 dd=0.469 trds=497 [train_cap(return_cap(train_107.0%_gt_80%,val_0.5%_lt_2.0%))]
+[VAL-REJECT] score=-2.6736 ret=0.54% pf=1.15 exp=0.00138 dd=0.405 trds=339 [train_cap(score_cap(train_13.4_gt_12.0,val_-2.674_lt_1.0))]
+[VAL-REJECT] score=-1.2653 ret=0.64% pf=1.15 exp=0.00144 dd=0.293 trds=419 [train_cap(score_cap(train_13.3_gt_12.0,val_-1.265_lt_1.0))]
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=55 return=-0.1775 pf=0.67 dd=0.2384 score=-6.7951
+[QuickTest-DEBUG] window_2: trades=54 return=0.0582 pf=1.19 dd=0.0893 score=2.1728
+[QuickTest-DEBUG] window_1: trades=55 return=0.0215 pf=1.08 dd=0.0880 score=0.6355
+[QuickTest-DEBUG] aggregate: trades=54 return=-0.0471 pf=0.95 dd=0.2384 pass_count=2/3 recent_pass=true
+[QuickTest-DEBUG] sentinel_check: qt_trades=54 qt_dd_raw=0.2384 qt_dd_isnan=false qt_pf_raw=0.95 qt_return_raw=-0.0471 reason=
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=37 return=0.0271 pf=1.13 dd=0.0702 score=1.1395
+[QuickTest-DEBUG] window_2: trades=35 return=0.2844 pf=2.18 dd=0.0715 score=13.6979
+[QuickTest-DEBUG] window_1: trades=32 return=0.0494 pf=1.28 dd=0.0562 score=2.8207
+[QuickTest-DEBUG] aggregate: trades=32 return=0.1110 pf=1.49 dd=0.0715 pass_count=3/3 recent_pass=true
+[QuickTest-DEBUG] sentinel_check: qt_trades=32 qt_dd_raw=0.0715 qt_dd_isnan=false qt_pf_raw=1.49 qt_return_raw=0.1110 reason=
+[TRAIN_SCORE_INVALID] reason=ret=334.4%_exceeds_300% | ret=3.3436 dd=0.3400 exp=0.0036 trades=551 tested=22016
+[TRAIN_RET_CAP] ret=334.4% dd=34.00% trades=551 pf=1.28 score=CAPPED cap=300%
+[VAL-REJECT] score=-4.3439 ret=0.39% pf=1.08 exp=0.00082 dd=0.530 trds=678 []
+[VAL-REJECT] score=-2.7617 ret=1.35% pf=1.17 exp=0.00167 dd=0.442 trds=708 [train_cap(return_cap(train_148.9%_gt_80%,val_1.3%_lt_2.0%))]
+[VAL-REJECT] score=-1.9454 ret=1.08% pf=1.24 exp=0.00224 dd=0.376 trds=396 [train_cap(score_cap(train_20.5_gt_12.0,val_-1.945_lt_1.0))]
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=33 return=-0.0481 pf=0.89 dd=0.1386 score=-3.1091
+[QuickTest-DEBUG] window_2: trades=35 return=0.1848 pf=1.72 dd=0.0859 score=7.7076
+[QuickTest-DEBUG] window_1: trades=34 return=-0.1329 pf=0.63 dd=0.1651 score=-6.0825
+[QuickTest-DEBUG] aggregate: trades=33 return=-0.0037 pf=1.06 dd=0.1651 pass_count=1/3 recent_pass=false
+[QuickTest-DEBUG] sentinel_check: qt_trades=33 qt_dd_raw=0.1651 qt_dd_isnan=false qt_pf_raw=1.06 qt_return_raw=-0.0037 reason=
+[QuickTest-FAIL] weighted_fail(ret=-0.37%,pf=1.06,trades=824633764624), majority_fail(1/3_windows), recent_window_fail
+[VAL-REJECT] score=0.6577 ret=2.94% pf=1.46 exp=0.00372 dd=0.248 trds=569 [train_cap(score_cap(train_20.4_gt_12.0,val_0.658_lt_1.0))]
+[TRAIN_SCORE_INVALID] reason=ret=414.2%_exceeds_300% | ret=4.1421 dd=0.4803 exp=0.0042 trades=482 tested=22016
+[TRAIN_RET_CAP] ret=414.2% dd=48.03% trades=482 pf=1.37 score=CAPPED cap=300%
+[VAL-REJECT] score=-3.6712 ret=1.31% pf=1.19 exp=0.00183 dd=0.519 trds=596 []
+[VAL-REJECT] score=-1.0678 ret=1.90% pf=1.27 exp=0.00264 dd=0.337 trds=573 [train_cap(score_cap(train_13.4_gt_12.0,val_-1.068_lt_1.0))]
+[VAL-REJECT] score=-0.7687 ret=1.32% pf=1.30 exp=0.00297 dd=0.299 trds=361 [train_cap(score_cap(train_15.6_gt_12.0,val_-0.769_lt_1.0))]
+[VAL-REJECT] score=-1.3585 ret=1.35% pf=1.19 exp=0.00195 dd=0.332 trds=595 [train_cap(return_cap(train_86.5%_gt_80%,val_1.3%_lt_2.0%))]
+[VAL-REJECT] score=-0.8178 ret=1.55% pf=1.22 exp=0.00214 dd=0.297 trds=581 [train_cap(return_cap(train_124.2%_gt_80%,val_1.5%_lt_2.0%))]
+ [META: radicalP 0.07->0.06, surExploreP 0.08->0.07]17:47:09Z  [PROG]  Batch 3: Tested 22016 | Train: -0.4477 | batchValScore: -0.4063 | Ret: 1.92% | GeoAvg: 1.92% | Median: 0.0809% | WR: 40.9% | Trds: 585 | Rate: 222/s | Runtime: 1m56s | fp: (AND (AND (Rising F[13] 7) (GT F[38] -0.04)) (NOT (Falling F[40] 5)))|(AND (NOT (Falling F[13] 3)) (AND (Falling F[29] 3) (CrossDown F[29] F[21])))|(NOT (OR (CrossDown F[19] F[54]) (AbsGT F[31] 27.67)))|ATR*4.00|ATR*11.28|ATR*2.50|hold=44|loss=20|cd=43|fees=1.0000|slip=1.0000|risk=1.0000|dir=1|vol_ATR14>SMA50*0.58| ✓
+  [OOS] GeoAvg=+1.92%  Median=+0.08%  MinMo=-18.13%  Months=64  Trades=585  OOS_DD=28.14%
+  [crit: score>-1.40, trds>=20, DD<0.60, ret>0.1%, exp>0.0000, pf>1.00, stab>2%]
+  [val: score=-0.4063 dd=28.14% trds=585]
+  [QuickTest: Score=REJECTED Ret=-0.37% DD=16.51% Trds=33]
+  [ENTRY STORY]
+    Regime Filter (must be true):     (NOT (OR (CrossDown BB_Width50(F[19]) Displacement(F[54])) (AbsGT MinusDI(F[31]) 27.67)))
+    Entry Signal (candle t close):     (AND (AND (Rising RSI21(F[13]) 7) (GT VolZ50(F[38]) -0.04)) (NOT (Falling Imbalance(F[40]) 5)))
+    Entry Execution (candle t+1 open): pending entry enters at next bar open
+    Exit Signal:     (AND (NOT (Falling RSI21(F[13]) 3)) (AND (Falling ADX(F[29]) 3) (CrossDown ADX(F[29]) MACD_Signal(F[21]))))
+  [RISK MANAGEMENT]
+    StopLoss: ATR*4.00
+    TakeProfit: ATR*11.28
+    Trail: ATR*2.50
+
+[FEE_DEBUG] Seed=7694537449926202000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=57 entries=57 exits=57 test_trades=57  -> 2018-08
+[FOLD 1] bars=2874 signals=62 entries=62 exits=62 test_trades=62 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=60 entries=60 exits=60 test_trades=60 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=55 entries=55 exits=55 test_trades=55 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=6270695941639198000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6970852973088489000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5972115700311316000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=150985577094527000 FeeBps=1.00 SlippageBps=1.00
+Tested: 22,912 | Rate: 256/s | Best: 0.6577 | Elites: 6 | Gen: 3
+gen=97624 rej_sur=0(0.0%) rej_seen=8388/106008(7.9%) rerolled=8384(8.6%) rej_novelty=0(0.0%) prefilter=56409[dead=43921,sparse=2234,regime=10254](57.8%) sent=26564(27.2%)Gen: 97,624 (heavy_mut))
+Rejects: entry_low=7,595 | Pass: 0.0%
+
+✓ Checkpoint saved: checkpoint.json (runtime: 2m)
+[FOLD 0] bars=2869 signals=17 entries=17 exits=17 test_trades=17  -> 2018-08
+[FOLD 1] bars=2874 signals=20 entries=20 exits=20 test_trades=20 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=13 entries=13 exits=13 test_trades=13 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=27 entries=27 exits=27 test_trades=27 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=353.9%_exceeds_300% | ret=3.5395 dd=0.5667 exp=0.0037 trades=506 tested=0
+[FEE_DEBUG] Seed=898726385735215000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=3133605689992026000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1292230106848532000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=3393270387838143000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=37 entries=37 exits=37 test_trades=37  -> 2018-08
+[FOLD 1] bars=2874 signals=37 entries=37 exits=37 test_trades=37 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=39 entries=39 exits=39 test_trades=39 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=29 entries=29 exits=29 test_trades=29 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=2944994605292898000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=422.7%_exceeds_300% | ret=4.2266 dd=0.4259 exp=0.0043 trades=469 tested=0
+[FEE_DEBUG] Seed=6850195924409942000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5804478928575727000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=4089507767210004000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=5 entries=5 exits=5 test_trades=5  -> 2018-08
+[FOLD 1] bars=2874 signals=6 entries=6 exits=6 test_trades=6 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=6 entries=6 exits=6 test_trades=6 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=10 entries=10 exits=10 test_trades=10 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=8826352462124248000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=456.1%_exceeds_300% | ret=4.5614 dd=0.3456 exp=0.0048 trades=443 tested=0
+[TRAIN_SCORE_INVALID] reason=ret=436.4%_exceeds_300% | ret=4.3635 dd=0.4415 exp=0.0042 trades=488 tested=0
+[FOLD 0] bars=2869 signals=34 entries=34 exits=34 test_trades=34  -> 2018-08
+[FOLD 1] bars=2874 signals=35 entries=35 exits=35 test_trades=35 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=39 entries=39 exits=39 test_trades=39 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=25 entries=25 exits=25 test_trades=25 2022-07 -> 2023-07
+Tested: 25,472 | Rate: 256/s | Best: 0.6577 | Elites: 6 | Gen: 3
+gen=106831 rej_sur=0(0.0%) rej_seen=8932/115759(7.7%) rerolled=8928(8.4%) rej_novelty=0(0.0%) prefilter=61337[dead=47803,sparse=2441,regime=11093](57.4%) sent=29373(27.5%)[FEE_DEBUG] Seed=6509186768107816000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=7163458961757718000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=359.7%_exceeds_300% | ret=3.5975 dd=0.3974 exp=0.0037 trades=535 tested=0
+[FEE_DEBUG] Seed=3899614732630117000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=16 entries=16 exits=16 test_trades=16  -> 2018-08
+[FOLD 1] bars=2874 signals=10 entries=10 exits=10 test_trades=10 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=16 entries=16 exits=16 test_trades=16 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=8 entries=8 exits=8 test_trades=8 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=8633837100845115000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=415.2%_exceeds_300% | ret=4.1523 dd=0.3633 exp=0.0044 trades=473 tested=0
+[FOLD 0] bars=2869 signals=30 entries=30 exits=30 test_trades=30  -> 2018-08
+[FOLD 1] bars=2874 signals=23 entries=23 exits=23 test_trades=23 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=33 entries=33 exits=33 test_trades=33 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=29 entries=29 exits=29 test_trades=29 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=4540467127508150000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5860666514092874000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=22 entries=22 exits=22 test_trades=22  -> 2018-08
+[FOLD 1] bars=2874 signals=25 entries=25 exits=25 test_trades=25 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=24 entries=24 exits=24 test_trades=24 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=22 entries=22 exits=22 test_trades=22 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=6540840933236886000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5728720185224694000 FeeBps=1.00 SlippageBps=1.00
+Tested: 28,032 | Rate: 256/s | Best: 0.6577 | Elites: 6 | Gen: 3
+gen=116246 rej_sur=0(0.0%) rej_seen=9712/125952(7.7%) rerolled=9706(8.3%) rej_novelty=0(0.0%) prefilter=66520[dead=51885,sparse=2627,regime=12008](57.2%) sent=32067(27.6%)[FOLD 0] bars=2869 signals=15 entries=15 exits=15 test_trades=15  -> 2018-08
+[FOLD 1] bars=2874 signals=16 entries=16 exits=16 test_trades=16 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=23 entries=23 exits=23 test_trades=23 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=10 entries=10 exits=10 test_trades=10 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=421.9%_exceeds_300% | ret=4.2192 dd=0.5483 exp=0.0048 trades=414 tested=0
+[FEE_DEBUG] Seed=4268241221770152000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=22 entries=22 exits=22 test_trades=22  -> 2018-08
+[FOLD 1] bars=2874 signals=29 entries=29 exits=29 test_trades=29 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=25 entries=25 exits=25 test_trades=25 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=23 entries=23 exits=23 test_trades=23 2022-07 -> 2023-07
+[FOLD 0] bars=2869 signals=27 entries=27 exits=27 test_trades=27  -> 2018-08
+[FOLD 1] bars=2874 signals=24 entries=24 exits=24 test_trades=24 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=28 entries=28 exits=28 test_trades=28 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=30 entries=30 exits=30 test_trades=30 2022-07 -> 2023-07
+[SAMPLED REJECTION #30001] reason=wf_per_fold_entry_rate_too_low: fold=0/16, fold_edges=0, fold_bars=2869, fold_edge_rate=0.0/year < 2.0, seed=5943820443987420634, trades=744, ret=0.00%, pf=0.00, exp=0.00000, dd=0.00%
+[FEE_DEBUG] Seed=8360512163535112000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1997251677473276000 FeeBps=1.00 SlippageBps=1.00
+Gen: 125,370 (heavy_mut))
+Tested: 30,208 | Rate: 218/s | Best: 0.6577 | Elites: 6 | Gen: 3
+gen=125371 rej_sur=0(0.0%) rej_seen=10604/135969(7.8%) rerolled=10598(8.5%) rej_novelty=0(0.0%) prefilter=71471[dead=55778,sparse=2812,regime=12881](57.0%) sent=34766(27.7%)[FOLD 0] bars=2869 signals=34 entries=34 exits=34 test_trades=34  -> 2018-08
+[FOLD 1] bars=2874 signals=35 entries=35 exits=35 test_trades=35 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=27 entries=27 exits=27 test_trades=27 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=36 entries=36 exits=36 test_trades=36 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=303.7%_exceeds_300% | ret=3.0369 dd=0.4438 exp=0.0029 trades=646 tested=0
+[FEE_DEBUG] Seed=4729029904355914000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=8 entries=8 exits=8 test_trades=8  -> 2018-08
+[FOLD 1] bars=2874 signals=6 entries=6 exits=6 test_trades=6 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=19 entries=19 exits=19 test_trades=19 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=7 entries=7 exits=7 test_trades=7 2022-07 -> 2023-07
+[TRAIN_SCORE_INVALID] reason=ret=306.7%_exceeds_300% | ret=3.0670 dd=0.5692 exp=0.0038 trades=467 tested=0
+[FEE_DEBUG] Seed=8280970421730633000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=456.1%_exceeds_300% | ret=4.5614 dd=0.3456 exp=0.0048 trades=443 tested=32000
+[TRAIN_RET_CAP] ret=456.1% dd=34.56% trades=443 pf=1.40 score=CAPPED cap=300%
+[VAL-REJECT] score=-1.3185 ret=1.76% pf=1.28 exp=0.00275 dd=0.348 trds=513 []
+[TRAIN_SCORE_INVALID] reason=ret=306.7%_exceeds_300% | ret=3.0670 dd=0.5692 exp=0.0038 trades=467 tested=32000
+[TRAIN_RET_CAP] ret=306.7% dd=56.92% trades=467 pf=1.32 score=CAPPED cap=300%
+[VAL-REJECT] score=0.3947 ret=2.92% pf=1.40 exp=0.00376 dd=0.263 trds=578 []
+[TRAIN_SCORE_INVALID] reason=ret=421.9%_exceeds_300% | ret=4.2192 dd=0.5483 exp=0.0048 trades=414 tested=32000
+[TRAIN_RET_CAP] ret=421.9% dd=54.83% trades=414 pf=1.42 score=CAPPED cap=300%
+[VAL-REJECT] score=-0.5738 ret=2.01% pf=1.32 exp=0.00302 dd=0.300 trds=514 []
+[VAL-REJECT] score=-1.2317 ret=2.07% pf=1.30 exp=0.00276 dd=0.351 trds=591 [train_cap(score_cap(train_12.0_gt_12.0,val_-1.232_lt_1.0))]
+[VAL-REJECT] score=-1.6212 ret=1.28% pf=1.21 exp=0.00209 dd=0.347 trds=542 [train_cap(score_cap(train_13.8_gt_12.0,val_-1.621_lt_1.0))]
+[TRAIN_SCORE_INVALID] reason=ret=353.9%_exceeds_300% | ret=3.5395 dd=0.5667 exp=0.0037 trades=506 tested=32000
+[TRAIN_RET_CAP] ret=353.9% dd=56.67% trades=506 pf=1.34 score=CAPPED cap=300%
+[VAL-REJECT] score=-3.2316 ret=1.38% pf=1.20 exp=0.00181 dd=0.478 trds=644 []
+[VAL-REJECT] score=-2.0300 ret=1.28% pf=1.29 exp=0.00272 dd=0.390 trds=381 [train_cap(score_cap(train_22.0_gt_12.0,val_-2.030_lt_1.0))]
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=31 return=0.1476 pf=1.67 dd=0.0912 score=6.1083
+[QuickTest-DEBUG] window_2: trades=39 return=0.0001 pf=1.02 dd=0.1556 score=-0.5504
+[QuickTest-DEBUG] window_1: trades=31 return=0.0720 pf=1.34 dd=0.1158 score=2.4354
+[QuickTest-DEBUG] aggregate: trades=31 return=0.0807 pf=1.38 dd=0.1556 pass_count=3/3 recent_pass=true
+[QuickTest-DEBUG] sentinel_check: qt_trades=31 qt_dd_raw=0.1556 qt_dd_isnan=false qt_pf_raw=1.38 qt_return_raw=0.0807 reason=no_candidates
+[VAL-REJECT] score=-0.6088 ret=1.68% pf=1.39 exp=0.00355 dd=0.300 trds=365 [train_cap(score_cap(train_16.0_gt_12.0,val_-0.609_lt_1.0))]
+[VAL-REJECT] score=-0.7953 ret=2.01% pf=1.29 exp=0.00283 dd=0.314 trds=558 [train_cap(score_cap(train_13.7_gt_12.0,val_-0.795_lt_1.0))]
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=57 return=0.0195 pf=1.08 dd=0.1062 score=0.4052
+[QuickTest-DEBUG] window_2: trades=57 return=0.3350 pf=1.87 dd=0.0854 score=13.4074
+[QuickTest-DEBUG] window_1: trades=54 return=0.0667 pf=1.23 dd=0.0844 score=2.6482
+[QuickTest-DEBUG] aggregate: trades=54 return=0.1283 pf=1.36 dd=0.1062 pass_count=3/3 recent_pass=true
+[QuickTest-DEBUG] sentinel_check: qt_trades=54 qt_dd_raw=0.1062 qt_dd_isnan=false qt_pf_raw=1.36 qt_return_raw=0.1283 reason=
+[VAL-REJECT] score=-1.6443 ret=0.74% pf=1.15 exp=0.00151 dd=0.322 trds=466 [train_cap(score_cap(train_24.6_gt_12.0,val_-1.644_lt_1.0))]
+[TRAIN_SCORE_INVALID] reason=ret=422.7%_exceeds_300% | ret=4.2266 dd=0.4259 exp=0.0043 trades=469 tested=32000
+[TRAIN_RET_CAP] ret=422.7% dd=42.59% trades=469 pf=1.39 score=CAPPED cap=300%
+[VAL-REJECT] score=-3.3885 ret=0.65% pf=1.12 exp=0.00113 dd=0.457 trds=583 []
+[VAL-REJECT] score=-1.8535 ret=1.55% pf=1.19 exp=0.00185 dd=0.371 trds=688 []
+[TRAIN_SCORE_INVALID] reason=ret=436.4%_exceeds_300% | ret=4.3635 dd=0.4415 exp=0.0042 trades=488 tested=32000
+[TRAIN_RET_CAP] ret=436.4% dd=44.15% trades=488 pf=1.37 score=CAPPED cap=300%
+[VAL-REJECT] score=-4.3414 ret=0.71% pf=1.11 exp=0.00110 dd=0.538 trds=597 []
+[QuickTest-DEBUG] total_window=[55709:72832] bars=17123 first_candle_ts=1704067200000 fees=1.00_bps slip=1.00_bps
+[QuickTest-DEBUG] window_3: trades=55 return=0.1409 pf=1.36 dd=0.1140 score=5.0628
+[QuickTest-DEBUG] window_2: trades=49 return=0.1408 pf=1.40 dd=0.1204 score=4.6473
+[QuickTest-DEBUG] window_1: trades=52 return=-0.1585 pf=0.64 dd=0.1795 score=-6.7016
+[QuickTest-DEBUG] aggregate: trades=49 return=0.0511 pf=1.16 dd=0.1795 pass_count=2/3 recent_pass=false
+[QuickTest-DEBUG] sentinel_check: qt_trades=49 qt_dd_raw=0.1795 qt_dd_isnan=false qt_pf_raw=1.16 qt_return_raw=0.0511 reason=
+[VAL-REJECT] score=-1.1657 ret=0.45% pf=1.13 exp=0.00123 dd=0.269 trds=358 [train_cap(return_cap(train_93.8%_gt_80%,val_0.5%_lt_2.0%))]
+[VAL-REJECT] score=-4.4906 ret=1.25% pf=1.24 exp=0.00236 dd=0.587 trds=435 [train_cap(score_cap(train_13.5_gt_12.0,val_-4.491_lt_1.0))]
+[VAL-REJECT] score=-1.7223 ret=0.30% pf=1.09 exp=0.00087 dd=0.304 trds=477 [train_cap(return_cap(train_105.4%_gt_80%,val_0.3%_lt_2.0%))]
+[VAL-REJECT] score=-1.5712 ret=1.19% pf=1.20 exp=0.00189 dd=0.337 trds=548 [train_cap(score_cap(train_12.5_gt_12.0,val_-1.571_lt_1.0))]
+17:47:48Z  [PROG]  Batch 4: Tested 32000 | Train: -1.8670 | batchValScore: -0.7055 | Ret: 1.95% | GeoAvg: 1.95% | Median: 0.0994% | WR: 43.8% | Trds: 427 | Rate: 252/s | Runtime: 2m35s | fp: (BreakUp F[46])|(AND (NOT (Falling F[13] 3)) (AND (Falling F[29] 3) (CrossDown F[29] F[21])))|(NOT (OR (CrossDown F[19] F[54]) (AbsGT F[31] 27.67)))|ATR*4.00|ATR*11.28|ATR*2.50|hold=36|loss=20|cd=42|fees=1.0000|slip=1.0000|risk=1.0000|dir=1|vol_ATR14>SMA50*0.58| ✓
+  [OOS] GeoAvg=+1.95%  Median=+0.10%  MinMo=-12.46%  Months=64  Trades=427  OOS_DD=31.30%
+  [crit: score>-1.40, trds>=20, DD<0.60, ret>0.1%, exp>0.0000, pf>1.00, stab>2%]
+  [val: score=-0.7055 dd=31.30% trds=427]
+  [QuickTest: Score=REJECTED Ret=5.11% DD=17.95% Trds=49]
+  [ENTRY STORY]
+    Regime Filter (must be true):     (NOT (OR (CrossDown BB_Width50(F[19]) Displacement(F[54])) (AbsGT MinusDI(F[31]) 27.67)))
+    Entry Signal (candle t close):     (BreakUp BodyPct(F[46]))
+    Entry Execution (candle t+1 open): pending entry enters at next bar open
+    Exit Signal:     (AND (NOT (Falling RSI21(F[13]) 3)) (AND (Falling ADX(F[29]) 3) (CrossDown ADX(F[29]) MACD_Signal(F[21]))))
+  [RISK MANAGEMENT]
+    StopLoss: ATR*4.00
+    TakeProfit: ATR*11.28
+    Trail: ATR*2.50
+
+[FOLD 0] bars=2869 signals=51 entries=51 exits=51 test_trades=51  -> 2018-08
+[FOLD 1] bars=2874 signals=56 entries=56 exits=56 test_trades=56 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=46 entries=46 exits=46 test_trades=46 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=46 entries=46 exits=46 test_trades=46 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=1810735799191536000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5716415892147483000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=7775284485568766000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=341.4%_exceeds_300% | ret=3.4145 dd=0.3473 exp=0.0035 trades=530 tested=0
+[FOLD 0] bars=2869 signals=38 entries=38 exits=38 test_trades=38  -> 2018-08
+[FOLD 1] bars=2874 signals=42 entries=42 exits=42 test_trades=42 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=45 entries=45 exits=45 test_trades=45 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=47 entries=47 exits=47 test_trades=47 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=5572256341695383000 FeeBps=1.00 SlippageBps=1.00
+Tested: 32,896 | Rate: 269/s | Best: 0.6577 | Elites: 9 | Gen: 4
+gen=135461 rej_sur=0(0.0%) rej_seen=11666/147121(7.9%) rerolled=11660(8.6%) rej_novelty=0(0.0%) prefilter=76761[dead=59944,sparse=3007,regime=13810](56.7%) sent=37812(27.9%)[FOLD 0] bars=2869 signals=26 entries=26 exits=26 test_trades=26  -> 2018-08
+[FOLD 1] bars=2874 signals=26 entries=26 exits=26 test_trades=26 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=28 entries=28 exits=28 test_trades=28 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=20 entries=20 exits=20 test_trades=20 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=3201699408569177000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=2096193469216287000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=10 entries=10 exits=10 test_trades=10  -> 2018-08
+[FOLD 1] bars=2874 signals=7 entries=7 exits=7 test_trades=7 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=20 entries=20 exits=20 test_trades=20 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=6 entries=6 exits=6 test_trades=6 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=1551923888551790000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=3094089286040060000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=8739917088532809000 FeeBps=1.00 SlippageBps=1.00
+[TRAIN_SCORE_INVALID] reason=ret=597.9%_exceeds_300% | ret=5.9793 dd=0.5034 exp=0.0054 trades=434 tested=0
+[FEE_DEBUG] Seed=8604708765008536000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1586695469780296000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=27 entries=27 exits=27 test_trades=27  -> 2018-08
+[FOLD 1] bars=2874 signals=27 entries=27 exits=27 test_trades=27 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=26 entries=26 exits=26 test_trades=26 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=30 entries=30 exits=30 test_trades=30 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=4801518903956454000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=5907813579934207000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=2242051018170345000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1314238542628778000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6461048871530069000 FeeBps=1.00 SlippageBps=1.00
+Tested: 35,328 | Rate: 243/s | Best: 0.6577 | Elites: 9 | Gen: 4
+gen=147389 rej_sur=0(0.0%) rej_seen=13326/160703(8.3%) rerolled=13314(9.0%) rej_novelty=0(0.0%) prefilter=82677[dead=64599,sparse=3188,regime=14890](56.1%) sent=41599(28.2%)[FOLD 0] bars=2869 signals=15 entries=15 exits=15 test_trades=15  -> 2018-08
+[FOLD 1] bars=2874 signals=9 entries=9 exits=9 test_trades=9 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=28 entries=28 exits=28 test_trades=28 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=33 entries=33 exits=33 test_trades=33 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=2565066051746004000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=666695147040166000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=3131756311168694000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=1224127528979857000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=1 entries=1 exits=1 test_trades=1  -> 2018-08
+[FOLD 1] bars=2874 signals=1 entries=1 exits=1 test_trades=1 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=11 entries=11 exits=11 test_trades=11 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=15 entries=15 exits=15 test_trades=15 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=8471397998021736000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=7411686520129371000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6452543459174863000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=4027940163853134000 FeeBps=1.00 SlippageBps=1.00
+[FOLD 0] bars=2869 signals=8 entries=8 exits=8 test_trades=8  -> 2018-08
+[FOLD 1] bars=2874 signals=12 entries=12 exits=12 test_trades=12 2017-12 -> 2018-12
+[FOLD 2] bars=2868 signals=12 entries=12 exits=12 test_trades=12 2018-04 -> 2019-04
+[FOLD 15] bars=2880 signals=9 entries=9 exits=9 test_trades=9 2022-07 -> 2023-07
+[FEE_DEBUG] Seed=4699908976922509000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=3886243408816920000 FeeBps=1.00 SlippageBps=1.00
+[FEE_DEBUG] Seed=6830864438488623000 FeeBps=1.00 SlippageBps=1.00

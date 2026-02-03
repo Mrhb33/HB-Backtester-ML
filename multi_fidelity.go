@@ -50,6 +50,11 @@ var (
 	oosRejectGeoMonthlyFail    int64 // Rejected: geo avg monthly return too low
 	oosRejectMedianMonthlyFail int64 // Rejected: median monthly return too low
 	oosRejectTooComplex        int64 // Rejected: complexity too high
+	// CRITICAL C FIX: Dead strategy counters for tracking reroll candidates
+	deadEntryCount   int64 // Entry rule never triggers (entry_true=0)
+	sparseEntryCount int64 // Entry rate too low (< 0.08% of bars)
+	deadRegimeCount  int64 // Regime filter blocks all (regime_ok=0)
+	rerollCount      int64 // Strategies that were rerolled due to being dead/sparse
 )
 
 // Global screen relax level (0=strict, 1=normal, 2=relaxed, 3=very_relaxed)
@@ -65,15 +70,55 @@ var globalQuiet int32 = 0
 // Global edge minimum multiplier (default 2, can be lowered to 1 during recovery)
 var globalEdgeMinMult int32 = 2
 
-// PROBLEM A & B FIX: Updated entry rate thresholds
-// During discovery: use 30-60 edges/year to avoid killing promising edges early
+// PROBLEM A FIX: Further relaxed entry rate thresholds for discovery
+// During discovery: use 15-30 edges/year to avoid killing promising edges early
 // Can be raised back to 120+ after finding good candidates
-var globalMinEdgesPerYear int32 = 40 // Default: 40 edges/year (relaxed for discovery)
-var wfDiscoveryEdgesPerYear float64 = 30.0 // FIX B: Increased from 0.5 to 30.0 to prevent zero-trade OOS
+var globalMinEdgesPerYear int32 = 20 // Default: 20 edges/year (further relaxed for discovery)
+var wfDiscoveryEdgesPerYear float64 = 15.0 // PROBLEM A FIX: Lowered from 30.0 to 15.0 to let borderline strategies through
 
 // DEBUG: Disable entry rate gate entirely for diagnosis (set to true to allow all strategies through)
 // FIX B: Set to false so entry rate gate is enabled by default
 var debugDisableEntryRateGate bool = false
+
+// CRITICAL FIX: Shared constants for overlap bands - use these everywhere to prevent split behavior
+// DISCOVERY MODE: Relaxed bands to avoid killing near-miss strategies early
+const (
+	OverlapMinEntryRate   = 0.1  // 0.1% minimum entry rate
+	OverlapMaxEntryRate   = 30.0 // 30% maximum entry rate
+	OverlapMinRegimeRate  = 1.0  // 1% minimum regime rate (DISCOVERY: relaxed from 5% to allow always-true regimes)
+	OverlapMaxRegimeRate  = 99.0 // 99% maximum regime rate (DISCOVERY: relaxed from 95% to allow nearly-always-true regimes)
+	OverlapMinCount       = 10   // Minimum overlap count (PROBLEM A FIX: reduced from 20)
+	OverlapMinRate        = 0.03 // 0.03% minimum overlap rate (PROBLEM A FIX: reduced from 0.05%)
+
+	// CRITICAL FIX: Epsilon tolerance for entry rate band - allows small numerical/sampling variance
+	// Prevents false negatives when entry_rate is just above the boundary (e.g., 30.68% vs 30.0%)
+	OverlapEntryRateEpsilon = 1.0 // 1.0% tolerance on max entry rate (allows up to 31% when max is 30%)
+
+	// CRITICAL FIX: Epsilon tolerance for regime rate band - allows near-100% regimes
+	// Prevents false negatives when regime_rate is just above 99% (e.g., 99.95%)
+	OverlapRegimeRateEpsilon = 0.7 // 0.7% tolerance on max regime rate (allows up to 99.7% when max is 99%)
+)
+
+// PROBLEM E FIX: Global sentinel max DD threshold for hard rejection in computeScore()
+// This allows the sentinel to use the same DD threshold as max_val_dd or WF max dd
+// Default: 0.60 (can be configured to match validation thresholds)
+var globalSentinelMaxDD float32 = 0.60
+var sentinelMaxDDMu sync.RWMutex
+
+// getSentinelMaxDD returns the sentinel max DD threshold (thread-safe)
+func getSentinelMaxDD() float32 {
+	sentinelMaxDDMu.RLock()
+	defer sentinelMaxDDMu.RUnlock()
+	return globalSentinelMaxDD
+}
+
+// setSentinelMaxDD sets the sentinel max DD threshold (thread-safe)
+// Use this to match the threshold with max_val_dd or WF max dd
+func setSentinelMaxDD(val float32) {
+	sentinelMaxDDMu.Lock()
+	defer sentinelMaxDDMu.Unlock()
+	globalSentinelMaxDD = val
+}
 
 // setDebugDisableEntryRateGate sets the debug flag for disabling entry rate gate
 func setDebugDisableEntryRateGate(disable bool) {
@@ -97,6 +142,152 @@ func getMinEdgesPerYear() int {
 // Use 120 for swing style, 240 for active strategies
 func setMinEdgesPerYear(val int) {
 	atomic.StoreInt32(&globalMinEdgesPerYear, int32(val))
+}
+
+// CRITICAL C FIX: Helper functions for dead strategy reroll mechanism
+
+// IsRerollCandidate checks if a rejection reason indicates the strategy should be rerolled
+// instead of counted as a normal rejection. Returns true for dead entry/regime strategies.
+func IsRerollCandidate(reason string) bool {
+	return strings.HasPrefix(reason, "REROLL_")
+}
+
+// IncrementRerollCount increments the reroll counter (thread-safe)
+func IncrementRerollCount() {
+	atomic.AddInt64(&rerollCount, 1)
+}
+
+// GetDeadStrategyCounts returns (deadEntry, deadRegime, rerolled) counts for statistics
+// GetDeadStrategyCounts returns (deadEntry, sparseEntry, deadRegime, rerolled) counts for statistics
+func GetDeadStrategyCounts() (int64, int64, int64, int64) {
+	return atomic.LoadInt64(&deadEntryCount), atomic.LoadInt64(&sparseEntryCount), atomic.LoadInt64(&deadRegimeCount), atomic.LoadInt64(&rerollCount)
+}
+
+// CheapDeadPrefilter performs a fast check to detect dead/sparse strategies BEFORE expensive WF
+// This runs on a small sample window to quickly reject strategies where:
+//   - entry_true=0 (dead)
+//   - entry_true < 3 (still too dead - will fail entry rate gates)
+//   - entry_rate < 0.1% (too sparse - will fail wf_entry_rate_too_sparse anyway)
+//   - regime_ok=0 (regime blocks everything)
+//   - overlap=0 (entry and regime never coincide - zero trades guaranteed)
+//
+// Returns: (isAlive bool, reason string)
+//   - isAlive=true: strategy may be viable, proceed to full evaluation
+//   - isAlive=false: strategy is dead/sparse, should be rerolled immediately
+//
+// NOTE: This is a CHEAP prefilter that runs in the generator loop, not the worker.
+// It must be fast - no allocations, simple loop, small window.
+func CheapDeadPrefilter(f *Features, st *Strategy, windowStart, windowEnd int) (bool, string) {
+	// Use a larger sample for better detection
+	// Use last 3000 bars or full window, whichever is smaller
+	const sampleSize = 3000
+	start := windowEnd - sampleSize
+	if start < windowStart {
+		start = windowStart
+	}
+
+	windowBars := windowEnd - start
+	if windowBars <= 0 {
+		return true, "" // Can't check, let it through
+	}
+
+	// Count entry_true, regime_ok, and overlap (entry AND regime both true)
+	entryTrueCount := 0
+	regimeOKCount := 0
+	overlapCount := 0
+
+	// Get active feature index (if exists)
+	activeIdx, okActive := f.Index["Active"]
+
+	for t := start; t < windowEnd; t++ {
+		// Check if active
+		isActive := true
+		if okActive && activeIdx >= 0 && activeIdx < len(f.F) && t < len(f.F[activeIdx]) {
+			isActive = f.F[activeIdx][t] > 0
+		}
+
+		// Check entry
+		entryNow := false
+		if st.EntryCompiled.Code != nil && evaluateCompiled(st.EntryCompiled.Code, f.F, t) && isActive {
+			entryTrueCount++
+			entryNow = true
+		}
+
+		// Check regime (nil regime filter means always OK)
+		regimeOK := true
+		if st.RegimeFilter.Root != nil && st.RegimeCompiled.Code != nil {
+			regimeOK = evaluateCompiled(st.RegimeCompiled.Code, f.F, t)
+		}
+		if regimeOK {
+			regimeOKCount++
+		}
+
+		// Count overlap: both entry AND regime are true
+		if entryNow && regimeOK && isActive {
+			overlapCount++
+		}
+	}
+
+	// CRITICAL: Dead entry - entry never triggers
+	if entryTrueCount == 0 {
+		atomic.AddInt64(&deadEntryCount, 1)
+		return false, "REROLL_prefilter_dead_entry"
+	}
+
+	// CRITICAL: Entry too sparse - less than 3 triggers means it's practically dead
+	// This catches strategies that will fail entry rate gates later
+	if entryTrueCount < 3 {
+		atomic.AddInt64(&sparseEntryCount, 1)
+		return false, "REROLL_prefilter_entry_too_sparse"
+	}
+
+	// Entry rate too low: will fail wf_entry_rate_too_sparse anyway
+	// Use 0.1% as threshold (stricter than the 0.05% WF gate)
+	minEntryCount := float64(windowBars) * 0.001 // 0.1% minimum
+	if float64(entryTrueCount) < minEntryCount {
+		atomic.AddInt64(&sparseEntryCount, 1)
+		return false, "REROLL_prefilter_entry_too_sparse"
+	}
+
+	// PROBLEM 2 FIX: Entry rate too high - always-trading noise
+	// Reject early to avoid wasted compute at WF overlap gate
+	maxEntryCount := float64(windowBars) * 0.35 // 35% max (slightly above 31% gate for epsilon)
+	if float64(entryTrueCount) > maxEntryCount {
+		atomic.AddInt64(&screenFailEntryRateHigh, 1)
+		return false, "REROLL_prefilter_entry_too_high"
+	}
+
+	// Dead regime: regime blocks everything (only if regime filter is set)
+	if st.RegimeFilter.Root != nil && regimeOKCount == 0 {
+		atomic.AddInt64(&deadRegimeCount, 1)
+		return false, "REROLL_prefilter_dead_regime"
+	}
+
+	// Regime too restrictive: less than 2% of bars pass regime filter
+	// This catches regimes that will fail later overlap checks
+	if st.RegimeFilter.Root != nil {
+		regimeRate := float64(regimeOKCount) / float64(windowBars) * 100
+		if regimeRate < 2.0 {
+			atomic.AddInt64(&deadRegimeCount, 1)
+			return false, "REROLL_prefilter_regime_too_restrictive"
+		}
+	}
+
+	// CRITICAL: Zero overlap - entry and regime never coincide
+	// This guarantees zero trades in OOS, so reject immediately
+	if st.RegimeFilter.Root != nil && overlapCount == 0 {
+		atomic.AddInt64(&deadEntryCount, 1)
+		return false, "REROLL_prefilter_zero_overlap"
+	}
+
+	// Overlap too sparse: less than 2 overlapping bars means almost no trades
+	// This is a strong predictor of failure in WF folds
+	if st.RegimeFilter.Root != nil && overlapCount < 2 {
+		atomic.AddInt64(&sparseEntryCount, 1)
+		return false, "REROLL_prefilter_overlap_too_sparse"
+	}
+
+	return true, ""
 }
 
 // Global flag to track if DD thresholds have been logged
@@ -161,10 +352,13 @@ func logDDThresholdsOnce(maxScreenDD, maxTrainDD float32, minScreenTrades, minTr
 
 // checkEntryRateResult contains the result of entry rate checking with soft scoring
 type checkEntryRateResult struct {
-	EntryCount    int     // Number of entry edges detected
-	TooLow        bool    // Entry rate too low (dead strategy)
-	TooHigh       bool    // Entry rate too high (spam strategy)
-	PenaltyFactor float32 // Soft penalty factor: 1.0 = no penalty, <1.0 = penalized
+	EntryCount     int     // Number of entry edges detected
+	EntryTrueCount int     // PROBLEM C FIX: Number of bars where entry is TRUE
+	EntryTruePct   float64 // PROBLEM C FIX: Percentage of bars where entry is TRUE
+	TooLow         bool    // Entry rate too low (dead strategy)
+	TooHigh        bool    // Entry rate too high (spam strategy)
+	TooHighPct     bool    // PROBLEM C FIX: Entry TRUE % too high (always-on strategy)
+	PenaltyFactor  float32 // Soft penalty factor: 1.0 = no penalty, <1.0 = penalized
 }
 
 // checkEntryRate quickly scans the window to count entry signals
@@ -210,10 +404,13 @@ func checkEntryRate(full Series, fullF Features, st Strategy, w Window) checkEnt
 	}
 
 	entryEdgeCount := 0
+	entryTrueCount := 0 // PROBLEM C FIX: Count bars where entry is TRUE
 
-	// Quick scan: count entry EDGES (when entry becomes true), not "true bars"
-	// This is because you can only take one trade while in-position
+	// Quick scan: count entry EDGES and TRUE bars
+	// Edges = transitions from false to true (one trade per edge)
+	// TRUE bars = bars where entry is true (used for % calculation)
 	var entryPrev bool
+	barsAfterWarmup := 0
 	for t := i0; t < i1; t++ {
 		// Skip warmup period for entry evaluation
 		if t < w.Start {
@@ -223,6 +420,12 @@ func checkEntryRate(full Series, fullF Features, st Strategy, w Window) checkEnt
 		}
 
 		entryNow := evaluateCompiled(st.EntryCompiled.Code, fullF.F, t)
+		barsAfterWarmup++
+
+		// PROBLEM C FIX: Count TRUE bars for percentage calculation
+		if entryNow {
+			entryTrueCount++
+		}
 
 		// Count only when entry transitions from false to true (rising edge)
 		if entryNow && !entryPrev {
@@ -231,6 +434,16 @@ func checkEntryRate(full Series, fullF Features, st Strategy, w Window) checkEnt
 
 		entryPrev = entryNow
 	}
+
+	// PROBLEM C FIX: Compute entry TRUE percentage
+	entryTruePct := 0.0
+	if barsAfterWarmup > 0 {
+		entryTruePct = float64(entryTrueCount) / float64(barsAfterWarmup) * 100
+	}
+
+	// PROBLEM C FIX: Check if entry TRUE % exceeds max allowed (35% to give some slack before 31% overlap gate)
+	const maxEntryTruePct = 30.0 // PROBLEM C FIX: Lowered from 35% to 30% to match overlap gate
+	tooHighPct := entryTruePct > maxEntryTruePct
 
 	// SOFT SCORING: Instead of hard reject, apply penalty factor
 	// This preserves exploration and reduces wasted generation
@@ -265,12 +478,306 @@ func checkEntryRate(full Series, fullF Features, st Strategy, w Window) checkEnt
 		}
 	}
 
-	return checkEntryRateResult{
-		EntryCount:    entryEdgeCount,
-		TooLow:        tooLow,
-		TooHigh:       tooHigh,
-		PenaltyFactor: penaltyFactor,
+	// PROBLEM C FIX: Also penalize if entry TRUE % is too high
+	if tooHighPct {
+		// Penalize always-on strategies more heavily
+		pctPenalty := float32(maxEntryTruePct / entryTruePct)
+		if pctPenalty < penaltyFactor {
+			penaltyFactor = pctPenalty
+		}
 	}
+
+	return checkEntryRateResult{
+		EntryCount:     entryEdgeCount,
+		EntryTrueCount: entryTrueCount,
+		EntryTruePct:   entryTruePct,
+		TooLow:         tooLow,
+		TooHigh:        tooHigh,
+		TooHighPct:     tooHighPct,
+		PenaltyFactor:  penaltyFactor,
+	}
+}
+
+// Problem C FIX: validateRegimeRate checks that regime filter has reasonable pass rate
+// Prevents "all-blocking" regimes (rate < 1%) and "always true" noise (rate > 99%)
+// Returns: (passed, reason) where reason is empty if passed
+func validateRegimeRate(full Series, fullF Features, st Strategy, w Window) (bool, string) {
+	// Skip if no regime filter (always active is OK)
+	if st.RegimeFilter.Root == nil {
+		return true, ""
+	}
+
+	// Skip if regime rule doesn't compile
+	if st.RegimeCompiled.Code == nil || len(st.RegimeCompiled.Code) == 0 {
+		return false, "regime_not_compiled"
+	}
+
+	i0 := w.Start - w.Warmup
+	if i0 < 0 {
+		i0 = 0
+	}
+	i1 := w.End
+	if i1 > full.T {
+		i1 = full.T
+	}
+
+	windowBars := i1 - i0
+	if windowBars <= 0 {
+		return false, "empty_window"
+	}
+
+	regimeOKCount := 0
+	for t := i0; t < i1; t++ {
+		if evaluateCompiled(st.RegimeCompiled.Code, fullF.F, t) {
+			regimeOKCount++
+		}
+	}
+
+	regimeRate := float64(regimeOKCount) / float64(windowBars) * 100
+
+	// CRITICAL B FIX: Use shared constants for regime rate bands
+	if regimeRate < OverlapMinRegimeRate || regimeRate > OverlapMaxRegimeRate {
+		return false, fmt.Sprintf("regime_rate_out_of_band: %.2f%% not in [%.1f%%, %.1f%%]",
+			regimeRate, OverlapMinRegimeRate, OverlapMaxRegimeRate)
+	}
+
+	return true, ""
+}
+
+// Problem A FIX: checkEntryRegimeOverlap validates that entry signals and regime filters overlap
+// This prevents strategies where entry and regime never coincide (resulting in 0 trades)
+// Returns: (passed, reason) where reason is empty if passed
+func checkEntryRegimeOverlap(full Series, fullF Features, st Strategy, w Window) (bool, string) {
+	i0 := w.Start - w.Warmup
+	if i0 < 0 {
+		i0 = 0
+	}
+	i1 := w.End
+	if i1 > full.T {
+		i1 = full.T
+	}
+
+	// Check if entry rule compiles
+	if st.EntryCompiled.Code == nil {
+		return false, "no_entry_rule"
+	}
+
+	// Get active filter index
+	activeIdx, okActive := fullF.Index["Active"]
+
+	windowBars := i1 - i0
+	if windowBars <= 0 {
+		return false, "empty_window"
+	}
+
+	// Count entry true, regime OK, and overlap
+	entryTrueCount := 0
+	regimeOKCount := 0
+	overlapCount := 0 // Count of bars where BOTH entry AND regime are true
+
+	for t := i0; t < i1; t++ {
+		// Check isActive (active feature filter)
+		isActive := true
+		if okActive && activeIdx >= 0 && activeIdx < len(fullF.F) && t < len(fullF.F[activeIdx]) {
+			isActive = fullF.F[activeIdx][t] > 0
+		}
+
+		// Check regime filter
+		regimeOK := true // No regime filter means always OK
+		if st.RegimeFilter.Root != nil && st.RegimeCompiled.Code != nil {
+			regimeOK = evaluateCompiled(st.RegimeCompiled.Code, fullF.F, t)
+		}
+
+		// Check entry signal
+		entryNow := false
+		if st.EntryCompiled.Code != nil {
+			entryNow = evaluateCompiled(st.EntryCompiled.Code, fullF.F, t)
+		}
+
+		if entryNow && isActive {
+			entryTrueCount++
+		}
+		if regimeOK {
+			regimeOKCount++
+		}
+		if entryNow && regimeOK && isActive {
+			overlapCount++
+		}
+	}
+
+	// Compute rates
+	entryRate := float64(entryTrueCount) / float64(windowBars) * 100 // As percentage
+	regimeRate := float64(regimeOKCount) / float64(windowBars) * 100
+	overlapRate := float64(overlapCount) / float64(windowBars) * 100
+
+	// CRITICAL B FIX: Use shared constants for overlap bands to prevent split behavior
+	// These constants are defined at package level to ensure consistency across all checks
+	minEntryRate := OverlapMinEntryRate
+	maxEntryRate := OverlapMaxEntryRate
+	minRegimeRate := OverlapMinRegimeRate
+	maxRegimeRate := OverlapMaxRegimeRate
+	minOverlapCount := OverlapMinCount
+	minOverlapRate := OverlapMinRate
+
+	// CRITICAL FIX: Apply epsilon tolerance to max entry rate band
+	// This prevents false negatives from small numerical/sampling variance (e.g., 30.68% vs 30.0%)
+	maxEntryRateWithTolerance := maxEntryRate + OverlapEntryRateEpsilon
+
+	// Check entry rate band (with tolerance on max bound)
+	if entryRate < minEntryRate || entryRate > maxEntryRateWithTolerance {
+		return false, fmt.Sprintf("entry_rate_out_of_band: %.2f%% not in [%.1f%%, %.1f%%] (eps=%.1f%%)",
+			entryRate, minEntryRate, maxEntryRateWithTolerance, OverlapEntryRateEpsilon)
+	}
+
+	// Check regime rate band (with tolerance on max bound)
+	// Only check if regime filter is active
+	if st.RegimeFilter.Root != nil {
+		maxRegimeRateWithTolerance := maxRegimeRate + OverlapRegimeRateEpsilon
+		if regimeRate < minRegimeRate || regimeRate > maxRegimeRateWithTolerance {
+			return false, fmt.Sprintf("regime_rate_out_of_band: %.2f%% not in [%.1f%%, %.1f%%] (eps=%.1f%%)",
+				regimeRate, minRegimeRate, maxRegimeRateWithTolerance, OverlapRegimeRateEpsilon)
+		}
+	}
+
+	// Check overlap (most critical check - prevents zero-trade strategies)
+	if overlapCount < minOverlapCount && overlapRate < minOverlapRate {
+		return false, fmt.Sprintf("entry_regime_no_overlap: entry_true=%d (%.2f%%), regime_ok=%d (%.2f%%), overlap=%d (%.2f%%), need count>=%d or rate>=%.2f%%",
+			entryTrueCount, entryRate, regimeOKCount, regimeRate, overlapCount, overlapRate, minOverlapCount, minOverlapRate)
+	}
+
+	return true, ""
+}
+
+// checkOOSEntryRegimeOverlap validates entry/regime overlap in OOS test windows
+// Catches strategies that pass train overlap but fail in OOS
+func checkOOSEntryRegimeOverlap(f Features, st Strategy, folds []Fold, minOverlapPerFold int) (bool, string, int, int) {
+	if st.EntryCompiled.Code == nil {
+		return false, "no_entry_rule", 0, 0
+	}
+
+	activeIdx, okActive := f.Index["Active"]
+	totalOOSBars := 0
+	totalOverlap := 0
+	foldsWithLowOverlap := 0
+
+	for _, fold := range folds {
+		foldOverlap := 0
+		foldBars := fold.TestEnd - fold.TestStart
+		totalOOSBars += foldBars
+
+		for t := fold.TestStart; t < fold.TestEnd; t++ {
+			isActive := true
+			if okActive && activeIdx >= 0 && activeIdx < len(f.F) && t < len(f.F[activeIdx]) {
+				isActive = f.F[activeIdx][t] > 0
+			}
+
+			regimeOK := (st.RegimeFilter.Root == nil)
+			if !regimeOK && st.RegimeCompiled.Code != nil {
+				regimeOK = evaluateCompiled(st.RegimeCompiled.Code, f.F, t)
+			}
+
+			entryNow := st.EntryCompiled.Code != nil && evaluateCompiled(st.EntryCompiled.Code, f.F, t)
+
+			if entryNow && regimeOK && isActive {
+				foldOverlap++
+			}
+		}
+
+		totalOverlap += foldOverlap
+		if foldOverlap < minOverlapPerFold {
+			foldsWithLowOverlap++
+		}
+	}
+
+	// Reject if >50% of folds have insufficient overlap
+	zeroFoldThreshold := (len(folds) + 1) / 2
+	if foldsWithLowOverlap >= zeroFoldThreshold {
+		return false, fmt.Sprintf("oos_overlap_dead_folds: %d/%d folds have overlap<%d",
+			foldsWithLowOverlap, len(folds), minOverlapPerFold), totalOverlap, totalOOSBars
+	}
+
+	// Reject if total OOS overlap is too low
+	minTotalOverlap := len(folds) * minOverlapPerFold / 2
+	if totalOverlap < minTotalOverlap {
+		return false, fmt.Sprintf("oos_overlap_too_low: total=%d < %d",
+			totalOverlap, minTotalOverlap), totalOverlap, totalOOSBars
+	}
+
+	return true, "", totalOverlap, totalOOSBars
+}
+
+// PROBLEM 4 FIX: validateRegimeAcrossFolds checks regime viability across WF folds BEFORE expensive WF
+// This prevents "regime works in train, dead in fold" scenarios
+func validateRegimeAcrossFolds(full Features, st Strategy, folds []Fold) (bool, string) {
+	if st.RegimeFilter.Root == nil || len(st.RegimeCompiled.Code) == 0 {
+		return true, "" // No regime filter = always OK
+	}
+
+	foldsBelowMin := 0
+	for _, fold := range folds {
+		regimeOKCount := 0
+		foldBars := fold.TestEnd - fold.TestStart
+		if foldBars <= 0 {
+			continue
+		}
+
+		for t := fold.TestStart; t < fold.TestEnd; t++ {
+			if evaluateCompiled(st.RegimeCompiled.Code, full.F, t) {
+				regimeOKCount++
+			}
+		}
+		foldRate := float64(regimeOKCount) / float64(foldBars) * 100
+		if foldRate < OverlapMinRegimeRate { // 1%
+			foldsBelowMin++
+		}
+	}
+
+	// Reject if >50% of folds have dead regime
+	if foldsBelowMin > len(folds)/2 {
+		return false, fmt.Sprintf("regime_dead_folds: %d/%d folds below %.1f%%",
+			foldsBelowMin, len(folds), OverlapMinRegimeRate)
+	}
+	return true, ""
+}
+
+// Problem B FIX: clampHoldCooldownByWFWindow clamps MaxHoldBars and CooldownBars
+// based on the WF test window size to prevent values that are too large for short folds
+// With wf_test_days=90, testBars≈2160 (for 1H), so these caps are generous
+// Returns: (clampedHold, clampedCooldown)
+func clampHoldCooldownByWFWindow(holdBars, cooldownBars, testBars int) (int, int) {
+	// Cap hold_bars to prevent one trade from consuming most of the fold
+	// Formula: hold_bars <= min(120, testBars/6)
+	maxHoldBars := 120
+	testBasedMaxHold := testBars / 6
+	if testBasedMaxHold < maxHoldBars {
+		maxHoldBars = testBasedMaxHold
+	}
+	if maxHoldBars < 20 {
+		maxHoldBars = 20 // Absolute minimum
+	}
+
+	clampedHold := holdBars
+	if clampedHold > maxHoldBars {
+		clampedHold = maxHoldBars
+	}
+
+	// Cap cooldown_bars to prevent blocking all signals in short folds
+	// Formula: cooldown_bars <= min(48, testBars/20)
+	maxCooldownBars := 48
+	testBasedMaxCooldown := testBars / 20
+	if testBasedMaxCooldown < maxCooldownBars {
+		maxCooldownBars = testBasedMaxCooldown
+	}
+	if maxCooldownBars < 10 {
+		maxCooldownBars = 10 // Absolute minimum
+	}
+
+	clampedCooldown := cooldownBars
+	if clampedCooldown > maxCooldownBars {
+		clampedCooldown = maxCooldownBars
+	}
+
+	return clampedHold, clampedCooldown
 }
 
 // FidelityLevel represents evaluation depth
@@ -385,6 +892,15 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		atomic.AddInt64(&screenFailEntryRateLow, 1)
 		maybeLogSampledRejection("screen_entry_rate_dead", Result{Trades: 0}, st.Seed)
 		return false, false, false, Result{}, Result{}, "screen_entry_rate_dead"
+	}
+
+	// PROBLEM C FIX: Early rejection for "always-on" entry rules (entry TRUE % > 35%)
+	// This catches high entry rate strategies BEFORE expensive WF evaluation
+	// The overlap gate rejects at 31%, so we prefilter at 35% to save cycles
+	if entryRateResult.TooHighPct {
+		atomic.AddInt64(&screenFailEntryRateLow, 1) // Reuse counter for tracking
+		maybeLogSampledRejection(fmt.Sprintf("screen_entry_pct_too_high(%.1f%%>35%%)", entryRateResult.EntryTruePct), Result{Trades: entryRateResult.EntryCount}, st.Seed)
+		return false, false, false, Result{}, Result{}, fmt.Sprintf("screen_entry_pct_too_high: %.1f%% > 35%%", entryRateResult.EntryTruePct)
 	}
 
 	// For 1H: reject if entry rate is too low (< 10 trades/year for discovery)
@@ -543,7 +1059,7 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 	valResult := evaluateStrategyWindow(full, fullF, st, valW)
 
 	// Compute DSR-lite score for validation with smoothness (WITH deflation penalty)
-	valScore := computeScoreWithSmoothness(
+	valScoreResult := computeScoreWithSmoothness(
 		valResult.Return,
 		valResult.MaxDD,
 		valResult.Expectancy,
@@ -552,6 +1068,11 @@ func evaluateMultiFidelity(full Series, fullF Features, st Strategy, screenW, tr
 		valResult.Trades,
 		testedCount, // Apply DSR-lite penalty here!
 	)
+	valScore := valScoreResult.Score
+	// Store invalid reason if present
+	if valScoreResult.Reason != "" {
+		valResult.InvalidScoreReason = valScoreResult.Reason
+	}
 
 	// Part A1: Score sanity check for validation result
 	if !IsValidScore(valScore) {
@@ -682,6 +1203,18 @@ func evaluateWithWalkForward(full Series, fullF Features, st Strategy, screenW, 
 	if !wfConfig.Enable {
 		// Fall back to standard evaluation
 		return evaluateMultiFidelity(full, fullF, st, screenW, trainW, valW, testedCount)
+	}
+
+	// PROBLEM E FIX: Set sentinel max DD threshold to match WF config + 5% margin
+	// This ensures the sentinel rejection in computeScore() uses the same DD threshold as WF validation
+	// Only increase sentinel if WF config value + margin is higher than current sentinel
+	wfSentinelDD := float32(wfConfig.MaxDrawdown) + 0.05
+	if wfSentinelDD > 0.95 {
+		wfSentinelDD = 0.95
+	}
+	currentSentinel := getSentinelMaxDD()
+	if wfSentinelDD > currentSentinel {
+		setSentinelMaxDD(wfSentinelDD)
 	}
 
 	// Walk-forward validation enabled
@@ -893,6 +1426,57 @@ func evaluateWithWalkForward(full Series, fullF Features, st Strategy, screenW, 
 	s := SliceSeries(full, i0, combinedEnd)
 	f := SliceFeatures(fullF, i0, combinedEnd)
 
+	// PRE-SCREEN: Quick rejection of completely dead strategies BEFORE building folds
+	// This is cheaper than running the fold-based edge count on strategies with 0 entry signals
+	{
+		activeIdxPre, okActivePre := f.Index["Active"]
+		entryTrueCount := 0
+		regimeOKCount := 0
+		totalBars := len(s.Close)
+
+		for t := 0; t < totalBars; t++ {
+			isActive := true
+			if okActivePre && activeIdxPre >= 0 && activeIdxPre < len(f.F) && t < len(f.F[activeIdxPre]) {
+				isActive = f.F[activeIdxPre][t] > 0
+			}
+
+			if st.EntryCompiled.Code != nil && evaluateCompiled(st.EntryCompiled.Code, f.F, t) && isActive {
+				entryTrueCount++
+			}
+
+			if st.RegimeFilter.Root == nil || (st.RegimeCompiled.Code != nil && evaluateCompiled(st.RegimeCompiled.Code, f.F, t)) {
+				regimeOKCount++
+			}
+		}
+
+		// CRITICAL C FIX: Dead strategy detection with REROLL_ prefix
+		// The caller should detect REROLL_ prefix and immediately regenerate instead of counting as normal reject
+		if entryTrueCount == 0 {
+			atomic.AddInt64(&deadEntryCount, 1)
+			reason := "REROLL_dead_entry: entry_true=0 on combined window"
+			maybeLogSampledRejection(reason, Result{Trades: 0}, st.Seed)
+			return false, false, false, Result{}, Result{}, reason
+		}
+
+		// CRITICAL C FIX: Dead regime detection with REROLL_ prefix
+		if st.RegimeFilter.Root != nil && regimeOKCount == 0 {
+			atomic.AddInt64(&deadRegimeCount, 1)
+			reason := "REROLL_dead_regime: regime_ok=0 on combined window"
+			maybeLogSampledRejection(reason, Result{Trades: 0}, st.Seed)
+			return false, false, false, Result{}, Result{}, reason
+		}
+
+		// Reject if entry rate is absurdly low (< 0.05% of bars)
+		entryRate := float64(entryTrueCount) / float64(totalBars) * 100
+		if entryRate < 0.05 {
+			atomic.AddInt64(&screenFailEntryRateLow, 1)
+			reason := fmt.Sprintf("wf_entry_rate_too_sparse: %.4f%% < 0.05%% (entry_true=%d/%d)",
+				entryRate, entryTrueCount, totalBars)
+			maybeLogSampledRejection(reason, Result{Trades: 0}, st.Seed)
+			return false, false, false, Result{}, Result{}, reason
+		}
+	}
+
 	// FIX #7: Validate minimum required history before building folds
 	// Minimum required: (TrainDays + TestDays) for first fold, plus MinFolds-1 additional steps
 	// Approximate check: ensure we have at least MinFolds worth of data
@@ -914,6 +1498,46 @@ func evaluateWithWalkForward(full Series, fullF Features, st Strategy, screenW, 
 		reason += fmt.Sprintf(" [series_bars=%d, series_days=%.0f]", len(s.Close), float64(len(s.Close))/barsPerDay)
 		maybeLogSampledRejection(reason, Result{Trades: 0}, st.Seed)
 		return false, false, false, Result{}, Result{}, reason
+	}
+
+	// PROBLEM 4 FIX: Pre-validate regime across folds BEFORE expensive WF evaluation
+	if regimeOK, regimeReason := validateRegimeAcrossFolds(f, st, folds); !regimeOK {
+		atomic.AddInt64(&screenFailEntryRateLow, 1)
+		maybeLogSampledRejection("wf_regime_prefail: "+regimeReason, Result{Trades: 0}, st.Seed)
+		return false, false, false, Result{}, Result{}, "wf_regime_prefail: " + regimeReason
+	}
+
+	// PROBLEM A FIX: Check entry/regime overlap BEFORE running expensive WF evaluation
+	// This catches strategies where entry signals and regime filters don't overlap (zero trades)
+	// Use first fold's train period as the validation window
+	overlapWindow := Window{
+		Start:  folds[0].TrainStart,
+		End:    folds[0].TrainEnd,
+		Warmup: warmup,
+	}
+	overlapOK, overlapReason := checkEntryRegimeOverlap(s, f, st, overlapWindow)
+	if !overlapOK {
+		atomic.AddInt64(&screenFailEntryRateLow, 1)
+		maybeLogSampledRejection("wf_overlap_gate: "+overlapReason, Result{Trades: 0}, st.Seed)
+		return false, false, false, Result{}, Result{}, "wf_overlap_gate: " + overlapReason
+	}
+
+	// PROBLEM C FIX: Validate regime rate is within sane band [1%, 99%]
+	// Prevents "all-blocking" regimes (rate < 1%) and "always true" noise (rate > 99%)
+	regimeOK, regimeReason := validateRegimeRate(s, f, st, overlapWindow)
+	if !regimeOK {
+		atomic.AddInt64(&screenFailEntryRateLow, 1)
+		maybeLogSampledRejection("wf_regime_rate_gate: "+regimeReason, Result{Trades: 0}, st.Seed)
+		return false, false, false, Result{}, Result{}, "wf_regime_rate_gate: " + regimeReason
+	}
+
+	// NEW: OOS-specific overlap check (catches train-OK but OOS-dead strategies)
+	minOverlapPerFold := 2
+	oosOverlapOK, oosOverlapReason, _, _ := checkOOSEntryRegimeOverlap(f, st, folds, minOverlapPerFold)
+	if !oosOverlapOK {
+		atomic.AddInt64(&screenFailEntryRateLow, 1)
+		maybeLogSampledRejection("wf_oos_overlap_gate: "+oosOverlapReason, Result{Trades: 0}, st.Seed)
+		return false, false, false, Result{}, Result{}, "wf_oos_overlap_gate: " + oosOverlapReason
 	}
 
 	// FIX #B: Fold-based entry viability gate (count edges in TEST windows, not combined window)
@@ -1113,6 +1737,16 @@ func evaluateWithWalkForward(full Series, fullF Features, st Strategy, screenW, 
 			tradableEdgesPerYear, displayThreshold)
 		fmt.Printf("  Per-fold edge counts: %v\n", perFoldEdgeCounts)
 
+		// Print the actual rule strings for diagnosis
+		entryRuleStr := ruleTreeToStringWithNames(st.EntryRule.Root, f)
+		regimeRuleStr := ruleTreeToStringWithNames(st.RegimeFilter.Root, f)
+		fmt.Printf("  entry_rule: %s\n", entryRuleStr)
+		if regimeRuleStr != "" {
+			fmt.Printf("  regime_filter: %s\n", regimeRuleStr)
+		} else {
+			fmt.Printf("  regime_filter: (Always Active - No Filter)\n")
+		}
+
 		// Sample first fold to diagnose WHY edges are 0
 		if len(folds) > 0 && len(perFoldEdgeCounts) > 0 {
 			sampleFold := folds[0]
@@ -1160,8 +1794,26 @@ func evaluateWithWalkForward(full Series, fullF Features, st Strategy, screenW, 
 			sumTestEdges, zeroTradeFolds, len(folds), tradableEdgesPerYear)
 	}
 
+	// PROBLEM B FIX: Clamp hold/cooldown by WF test window size
+	// Prevents hold=583, cd=118 on 60m bars from consuming entire 90-day fold
+	// Use first fold's test window as the reference (all folds have same size)
+	firstFoldTestBars := folds[0].TestEnd - folds[0].TestStart
+	clampedHold, clampedCooldown := clampHoldCooldownByWFWindow(st.MaxHoldBars, st.CooldownBars, firstFoldTestBars)
+	wfStrategy := st
+	if clampedHold != st.MaxHoldBars || clampedCooldown != st.CooldownBars {
+		// Create a modified strategy with clamped values
+		wfStrategy = st
+		wfStrategy.MaxHoldBars = clampedHold
+		wfStrategy.CooldownBars = clampedCooldown
+		// Log clamping for diagnosis (sampled 1 in 1000)
+		if st.Seed % 1000 == 1 {
+			fmt.Printf("[WF_CLAMP] seed=%d: hold_bars %d->%d, cooldown_bars %d->%d (test_bars=%d)\n",
+				st.Seed, st.MaxHoldBars, clampedHold, st.CooldownBars, clampedCooldown, firstFoldTestBars)
+		}
+	}
+
 	// Evaluate strategy across all folds
-	oosStats, _, _ := EvaluateWalkForward(s, f, st, folds, wfConfig)
+	oosStats, _, _ := EvaluateWalkForward(s, f, wfStrategy, folds, wfConfig)
 
 	// CRITICAL DEBUG: If we have many folds but get few OOS months, there's a stitching bug
 	if len(folds) >= 10 && oosStats.TotalMonths < 3 {

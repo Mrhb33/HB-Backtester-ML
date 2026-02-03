@@ -31,6 +31,10 @@ func leafOpToString(kind LeafKind) string {
 		return "SlopeGT"
 	case LeafSlopeLT:
 		return "SlopeLT"
+	case LeafBreakUp:
+		return "BreakUp"
+	case LeafBreakDown:
+		return "BreakDown"
 	default:
 		return "Unknown"
 	}
